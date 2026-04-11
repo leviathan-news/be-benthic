@@ -1,0 +1,27 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+.claude/
+.wwebjs_cache/
+.playwright-mcp/
+
+agent.db
+agent.db-shm
+agent.db-wal
+agent.log
+*.session
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# One-off docs / exports (not part of the agent)
+*.txt
+!requirements.txt
+!requirements-dev.txt
+sec-filing-snapshot.md
+march-2026-headline-review.md
+GEMINI.md
+knowledge.json

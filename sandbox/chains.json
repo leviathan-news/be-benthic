@@ -1,0 +1,41 @@
+{
+  "ethereum": {
+    "chain_id": 1,
+    "rpcs": ["https://rpc.ankr.com/eth", "https://cloudflare-eth.com", "https://eth-mainnet.g.alchemy.com/v2/demo"],
+    "native": "ETH",
+    "aliases": ["eth", "mainnet"]
+  },
+  "fraxtal": {
+    "chain_id": 252,
+    "rpcs": ["https://rpc.frax.com", "https://fraxtal-rpc.publicnode.com"],
+    "native": "frxETH",
+    "aliases": ["frax"],
+    "tokens": {
+      "SQUID": {"address": "0x6e58089d8E8f664823d26454f49A5A0f2fF697Fe", "deploy_block": 2336461}
+    }
+  },
+  "arbitrum": {
+    "chain_id": 42161,
+    "rpcs": ["https://arb1.arbitrum.io/rpc"],
+    "native": "ETH",
+    "aliases": ["arb"]
+  },
+  "base": {
+    "chain_id": 8453,
+    "rpcs": ["https://mainnet.base.org"],
+    "native": "ETH",
+    "aliases": []
+  },
+  "optimism": {
+    "chain_id": 10,
+    "rpcs": ["https://mainnet.optimism.io"],
+    "native": "ETH",
+    "aliases": ["op"]
+  },
+  "linea": {
+    "chain_id": 59144,
+    "rpcs": ["https://rpc.linea.build"],
+    "native": "ETH",
+    "aliases": []
+  }
+}

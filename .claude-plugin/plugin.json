@@ -1,0 +1,8 @@
+{
+  "name": "leviathan-news",
+  "version": "0.2.0",
+  "description": "Leviathan News agent toolkit — headline crafting, Telegram integration, and editorial validation",
+  "author": {
+    "name": "leviathan-news"
+  }
+}

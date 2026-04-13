@@ -4,13 +4,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-This is the **Leviathan News (LN)** workspace — a crypto/DeFi news curation system with two main components:
+This is the **Leviathan News (LN)** workspace — a white-label crypto/DeFi news agent system. Fork it, set `AGENT_NAME`, and run your own instance.
 
-1. **`ln-agent.py`** — Automated news agent. Monitors Telegram channels (configured via `CHANNELS` env var), evaluates newsworthiness via Claude CLI (Codex fallback), deduplicates, crafts headlines, posts via LN API. Also votes and writes TL;DR comments.
+1. **`ln-agent.py`** — Automated news agent. Monitors Telegram channels (configured via `CHANNELS` env var), evaluates newsworthiness via Claude CLI (Codex fallback), deduplicates (including self-dedup via `was_story_posted()`), crafts headlines, posts via LN API. Also votes and writes TL;DR comments.
 
-2. **`benthic-bot.py`** — Telegram chat bot (PM2 name `benthic-bot`) sharing brain/identity with ln-agent. Responds in groups and operator DMs. Features: per-chat memory isolation, tiered operator auth, [GROUP] directive routing, agent-chat API polling, message debouncing, media analysis, persistent memory, self-awareness tracking.
+2. **`benthic-bot.py`** — Telegram chat bot sharing brain/identity with ln-agent. Responds in groups and operator DMs. Features: per-chat memory isolation, tiered operator auth, [GROUP] directive routing, agent-chat API polling, message debouncing, media analysis, persistent memory, self-awareness tracking.
 
-3. **`skills/leviathan-headlines/`** — Claude Code plugin skill for manual headline crafting and review following LN editorial standards.
+3. **`prompt_loader.py`** — Shared prompt template loader. Reads `.md` files from `prompts/`, caches in-memory, fills `{placeholders}` via `str.format()`. Used by both agent scripts.
+
+4. **`prompts/`** — External prompt template directory. All LLM prompts extracted from the agent files for dev-time context savings and clean separation. Subdirs: `agent/` (14 templates), `bot/` (10 templates + `knowledge/` with 15 topic files).
+
+5. **`github_client.sh`** — Write-only GitHub client wrapper. Enforces repo allowlist (`~/.claude/.github-repos-allowlist`), rate limits non-operators (3/day), adds attribution footer. Supports: `issue create|close|comment`, `pr create|comment`, `allowlist add|list`. Token loaded from `~/.claude/.github-token`.
+
+6. **`skills/leviathan-headlines/`** — Claude Code plugin skill for manual headline crafting and review following LN editorial standards.
 
 ## Architecture: ln-agent.py
 
@@ -38,7 +44,8 @@ Key functions:
 - `batch_evaluate_articles()` / `batch_evaluate_comments()` — JSON batch eval for Phase 4 (reduces LLM calls)
 - `_extract_json_array()` — 3-pass JSON extraction (fences, raw parse, bracket search)
 - `_pre_filter_message()` — keyword pre-filter before LLM eval (skips obvious noise)
-- `resolve_craft_headline_tldr()` — combined: resolves primary source URL, crafts headline, writes TL;DR in one Opus call (saves 2 LLM calls per article vs separate functions)
+- `resolve_craft_headline_tldr()` — single Opus call: resolves primary source URL, crafts headline, writes TL;DR. Delimiter-based response format (===URL===, ===HEADLINE===, ===TLDR===). Replaces the former separate `resolve_to_primary_source()`, `craft_headline()`, and `craft_tldr()`.
+- `was_story_posted()` — self-dedup: checks if a similar story was already posted by comparing significant words (>3 chars) in the hint against both stored hints and headlines from the last 24h. Requires at least 2 matching words to avoid false positives.
 - `evaluate_article_quality()` / `evaluate_comment_quality()` — vote weight (-1, 0, 1), classification tier
 - `craft_comment()` — analysis comments, creative tier
 - `check_article_freshness()` — rejects stale articles, classification tier
@@ -98,12 +105,12 @@ Telegram Bot API chat agent sharing brain/identity with ln-agent. Uses `getUpdat
 - **Autonomous trading** — Periodic market evaluation via `_check_markets()` every `MARKET_CHECK_INTERVAL` (default 1800s/30min). Fetches live market data from LN API (`_fetch_market_data()`), feeds to Sonnet/low with cached positions (`_get_cached_positions()`), executes trades via API (`_try_api_command()`). Persistent market check timestamp (`_MARKET_CHECK_FILE`) survives restarts. Also trades reactively during normal message processing — responses are split via `_split_bot_commands()` and trade commands routed through LN API.
 - **API-routed trades** — `_try_api_command()` intercepts BUY/SELL/POSITION/MARKETS commands and executes via LN REST API instead of Telegram messages. `_split_bot_commands()` separates mixed analysis+trade responses so each command routes independently.
 - **Two-pass pre-screen** — Group messages (non-direct) go through Sonnet/low pre-screen (~30 tokens) before expensive DB queries + Opus response. ~70% of messages filtered as SKIP, saving ~9,500 tokens per skipped message. Bypass keywords for market-relevant content. Reply-to-other detection reduces false positives in threaded conversations.
-- **Topic-aware context** — `chat_history` table includes `topic_id` column. `get_chat_history()` filters by both `chat_id` and `topic_id` in forum groups to prevent cross-topic context bleeding. Topic label injected into prompt so Benthic stays focused.
-- **Knowledge base** — `knowledge` SQLite table with 15 platform reference topics (prediction markets, SQUID economy, tipping, article system, etc.). Loaded on-demand via word-boundary keyword matching against message + recent conversation context. Capped at `MAX_KNOWLEDGE_TOPICS=5` per prompt. Topics seeded at startup via `seed_knowledge()`.
+- **Topic-aware context** — `chat_history` table includes `topic_id` column. `get_chat_history()` filters by both `chat_id` and `topic_id` in forum groups to prevent cross-topic context bleeding. Topic label injected into prompt so the agent stays focused.
+- **Knowledge base** — `knowledge` SQLite table with 15 platform reference topics (prediction markets, SQUID economy, tipping, article system, etc.). Seeded from `prompts/bot/knowledge/*.md` files at startup via `seed_knowledge()`. Loaded on-demand via word-boundary keyword matching against message + recent conversation context. Capped at `MAX_KNOWLEDGE_TOPICS=5` per prompt.
 - **Tiered LLM calls** — `llm_ask()` accepts `model` and `effort` params. Pre-screen and `_check_markets` use `model="sonnet", effort="low"`. Full responses use default Opus/max.
 - **LLM provider layer** — Same Claude/Codex fallback with circuit breaker as ln-agent.py.
 - **Agent-chat relay** — `AgentChatRelay` class posts bot messages to LN's agent-chat API for history visibility.
-- **Docker sandbox** — Ephemeral containers for code execution. Claude calls `sandbox/run-sandbox.sh` as a Bash tool. Image `benthic-sandbox` has Python 3.12 + web3/requests/pandas/matplotlib/eth-abi + pre-built `helpers.py` module (Etherscan V2, DeFiLlama, CoinGecko, chain config). Network `benthic-sandbox-net` with iptables allowlist (RPCs, explorers, data APIs only — Telegram/LN API blocked). Security: `--rm`, `--read-only`, `--memory=512m`, `--cpus=1`, `--pids-limit=64`, `no-new-privileges`, 120s timeout, non-root user. No secrets mounted (only `ETHERSCAN_API_KEY` passed for explorer queries). Both operator and default tiers get access. Files: `sandbox/{Dockerfile, run-sandbox.sh, setup-network.sh, allowed-hosts.txt, helpers.py, chains.json, README.md}`.
+- **Docker sandbox** — Ephemeral containers for code execution. Claude calls `sandbox/run-sandbox.sh` as a Bash tool. Image has Python 3.12 + web3/requests/pandas/matplotlib/eth-abi + pre-built `helpers.py` module (Etherscan V2, DeFiLlama, CoinGecko, chain config). Network allowlist (RPCs, explorers, data APIs only — Telegram/LN API blocked). Security: `--rm`, `--read-only`, `--memory=512m`, `--cpus=1`, `--pids-limit=64`, `no-new-privileges`, 120s timeout, non-root user. No secrets mounted (only `ETHERSCAN_API_KEY` passed for explorer queries). Both operator and default tiers get access. Files: `sandbox/{Dockerfile, run-sandbox.sh, setup-network.sh, allowed-hosts.txt, helpers.py, chains.json, README.md}`.
 
 ### Prompt Injection Defense
 Same stack as ln-agent.py plus: memory directives stripped from non-operator messages, API poll path strips directives, sentinel check on replies.
@@ -132,12 +139,16 @@ Required:
 - `CHANNELS` — JSON array of Telegram channel usernames to monitor (ln-agent only)
 
 Optional:
+- `AGENT_NAME` — agent display name used in prompts (default: `Agent`)
+- `BOT_USERNAME` — Telegram bot username (lowercase, no @) for self-detection in chats
+- `AGENT_DIR` — agent directory path for Bash tool restrictions (default: script directory)
 - `ETHERSCAN_API_KEY` — for sandbox blockchain queries
 - `LN_API` — API base URL (default: `https://api.leviathannews.xyz/api/v1`)
 - `MARKET_CHECK_INTERVAL` — periodic trading interval in seconds (default: 1800)
 - `CLAUDE_LIMIT_COOLDOWN` — cooldown after Claude quota errors (default: 21600)
 - `PRIVATE_CHANNELS` — JSON array of private channel names
 - `ALLOWED_GROUPS` — JSON array of additional group IDs to respond in
+- `AUTO_UPVOTE_USERS` — comma-separated usernames for auto-upvote
 - `AUTO_DOWNVOTE_USERS` — comma-separated usernames for auto-downvote
 
 ## Sandbox

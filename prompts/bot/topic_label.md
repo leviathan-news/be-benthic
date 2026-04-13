@@ -1,0 +1,2 @@
+
+CURRENT FORUM TOPIC: This message is in topic #{msg_topic_id}. Stay focused on this topic's conversation. The conversation context below is filtered to this topic only — do NOT reference discussions from other topics.

@@ -1,8 +1,8 @@
-# be-benthic 🦑
+# LN Agent
 
-Automated news curation agent for [Leviathan News](https://leviathannews.xyz) — a decentralized crypto/DeFi news platform where contributors earn $SQUID tokens.
+White-label news curation agent for [Leviathan News](https://leviathannews.xyz) — a decentralized crypto/DeFi news platform where contributors earn $SQUID tokens. Fork it, set `AGENT_NAME`, and run your own instance.
 
-be-benthic monitors Telegram news channels, evaluates newsworthiness via Claude CLI (with Codex fallback), crafts headlines, submits articles, votes, comments, and replies — all autonomously in a continuous loop.
+The agent monitors Telegram news channels, evaluates newsworthiness via Claude CLI (with Codex fallback), crafts headlines, submits articles, votes, comments, and replies — all autonomously in a continuous loop.
 
 ## How It Works
 
@@ -234,9 +234,14 @@ The agent runs in a continuous loop — PM2's `autorestart` handles crashes, and
 ## Project Structure
 
 ```
-be-benthic/
-├── ln-agent.py              # Main agent (single-file)
-├── benthic-bot.py           # Telegram chat bot (bot-to-bot communication)
+ln-agent-public/
+├── ln-agent.py              # Main news agent
+├── benthic-bot.py           # Telegram chat bot
+├── prompt_loader.py         # Shared prompt template loader
+├── github_client.sh         # Write-only GitHub client wrapper
+├── prompts/                 # External prompt templates
+│   ├── agent/               # 14 news agent prompts
+│   └── bot/                 # 10 chat bot prompts + 15 knowledge topics
 ├── scripts/
 │   └── twitter_fetch.py     # No-op stub (replace with your own)
 ├── skills/
@@ -272,7 +277,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-46 tests covering security-critical functions: `sanitize_untrusted()`, `check_output_for_injection()`, `validate_url()`, `has_llm_preamble()`, `validate-headline.sh`, and `AgentDB` constraints.
+72 tests covering security-critical functions: `sanitize_untrusted()`, `check_output_for_injection()`, `validate_url()`, `validate-headline.sh`, `AgentDB` operations, prompt template loading, and GitHub client enforcement.
 
 ## Chat Bot
 
@@ -345,7 +350,7 @@ pm2 start ecosystem.config.js
 
 ### Customizing personality
 
-Set `BOT_IDENTITY` to a custom prompt, or edit the `BENTHIC_IDENTITY` string in the source. Leave unset for the default crypto analyst personality.
+Set `AGENT_NAME` to brand your instance, then customize `prompts/bot/identity.md` for your agent's personality. The identity prompt uses `{agent_name}` placeholders filled at runtime.
 
 ## Contributing
 

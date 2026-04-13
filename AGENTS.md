@@ -4,6 +4,7 @@
 
 - `ln-agent.py` is the automated Leviathan News worker. It runs as a PM2 process and always sleeps a configurable interval after each completed cycle.
 - The runtime loop has five phases: read Telegram, evaluate/deduplicate, post, vote/comment, and reply detection.
+- Self-dedup via `was_story_posted()` — rejects same story from different sources by comparing significant words in hints and headlines.
 - LLM routing is now provider-based:
   - Claude CLI is the primary provider.
   - Codex CLI is the automatic fallback when Claude fails or hits quota/rate-limit style errors.
@@ -14,9 +15,15 @@
   - `CODEX_BIN`
   - `CODEX_MODEL`
   - `CLAUDE_LIMIT_COOLDOWN`
+- All LLM prompts are externalized in `prompts/` and loaded via `prompt_loader.py`.
+- Agent identity is configurable via `AGENT_NAME` env var (default: `Agent`).
 
 ## Operational Notes
 
 - Bot HQ (configured via `BOT_HQ_GROUP_ID`) remains the ground truth for duplicate detection.
 - User-generated content is always sanitized before entering any LLM prompt.
 - Reply generation still uses injection checks plus an independent sentinel decision before posting.
+- All `llm_ask()` call sites guard against `None` returns (added 2026-04-12).
+- `check_article_freshness()` fails open on WebFetch errors (403, paywall, etc.) — unknown = allow.
+- Telegram API HTTP errors are caught in `tg_request()` instead of crashing the poll loop.
+- `PASS` is filtered as a control token in chat response paths.

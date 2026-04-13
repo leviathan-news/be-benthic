@@ -10,6 +10,7 @@ agent.db
 agent.db-shm
 agent.db-wal
 agent.log
+bot.log
 *.session
 
 # Environment files

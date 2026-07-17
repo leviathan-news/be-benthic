@@ -16,7 +16,7 @@ module.exports = {
       // }
     },
     {
-      name: "chat-bot",
+      name: "benthic-bot",
       cwd: __dirname,
       interpreter: ".venv/bin/python3",
       script: "benthic-bot.py",
@@ -30,7 +30,7 @@ module.exports = {
       // }
     },
     {
-      name: "news-api",
+      name: "benthic-api",
       cwd: __dirname,
       interpreter: ".venv/bin/python3",
       script: "benthic_api.py",
@@ -43,7 +43,7 @@ module.exports = {
       // }
     },
     {
-      name: "builder",
+      name: "benthic-builder",
       cwd: __dirname,
       interpreter: ".venv/bin/python3",
       script: "benthic-builder.py",

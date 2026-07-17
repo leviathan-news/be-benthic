@@ -30,7 +30,9 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-DB_FILE = os.environ.get("BENTHIC_DB", str(Path.home() / "server/ln-agent/agent.db"))
+# Default matches benthic-bot.py / benthic-builder.py: agent.db beside the
+# checkout (this script lives in bin/). BENTHIC_DB overrides all three together.
+DB_FILE = os.environ.get("BENTHIC_DB", str(Path(__file__).resolve().parent.parent / "agent.db"))
 ROUTE_FILE = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), ".build-route.json")
 ROUTE_MAX_AGE = 900  # seconds; stale files cannot hijack much-later manual CLI runs.
 

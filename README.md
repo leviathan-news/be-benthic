@@ -454,7 +454,9 @@ service with read-only access to `agent.db`:
   (rate limited via `API_RATE_LIMIT`, default 10 req/min)
 
 All endpoints (except `/health`) require a static bearer token. Set `API_KEY`
-and have your gateway/marketplace send `Authorization: Bearer <key>`:
+and have your gateway/marketplace send `Authorization: Bearer <key>`. Without
+`API_KEY` the service refuses to start/serve unless you explicitly set
+`API_ALLOW_UNAUTHENTICATED=1` (local development only):
 
 ```bash
 export API_KEY=your-static-token

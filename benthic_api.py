@@ -47,6 +47,10 @@ API_RATE_LIMIT = int(os.environ.get("API_RATE_LIMIT", "10"))  # analyze reqs/min
 # when proxying requests so we know they came through the billing gateway.
 # Without this, anyone could bypass SerenDB and call the API for free.
 API_KEY = os.environ.get("API_KEY", "").strip()
+# Explicit opt-out for local development ONLY: runs the API with no auth.
+# Without this flag an unset API_KEY refuses requests instead of serving an
+# open paid endpoint by accident.
+API_ALLOW_UNAUTHENTICATED = os.environ.get("API_ALLOW_UNAUTHENTICATED", "0") == "1"
 
 # ─── Logging ─────────────────────────────────────────────────────────────────
 
@@ -310,9 +314,16 @@ def _verify_api_key(request: Request):
     """Verify the bearer token matches our static API key.
     SerenDB sends this header when proxying requests through the billing gateway.
     Without this check, anyone could bypass SerenDB and call the API for free.
-    If API_KEY env var is not set, auth is disabled (dev/testing mode)."""
+    If API_KEY is unset, requests are refused (fail closed) unless the operator
+    explicitly opted into unauthenticated mode via API_ALLOW_UNAUTHENTICATED=1."""
     if not API_KEY:
-        return  # No key configured — open access (dev mode)
+        if API_ALLOW_UNAUTHENTICATED:
+            return  # Explicit local-dev opt-in — open access
+        raise HTTPException(
+            status_code=503,
+            detail="API_KEY not configured. Set API_KEY, or "
+                   "API_ALLOW_UNAUTHENTICATED=1 for local development only.",
+        )
     auth = request.headers.get("authorization", "")
     if auth.startswith("Bearer "):
         token = auth[7:].strip()
@@ -371,13 +382,17 @@ def get_news(
         if since:
             # Validate by actually parsing — rejects nonsense like "2026-04-11T:::ZZZ"
             try:
-                _parsed = since.replace("Z", "+00:00")
-                from datetime import datetime as _dt
-                _dt.fromisoformat(_parsed)
+                from datetime import datetime as _dt, timezone as _tz
+                _dt_since = _dt.fromisoformat(since.replace("Z", "+00:00"))
             except (ValueError, TypeError):
                 raise HTTPException(status_code=400, detail="Invalid since format. Use ISO 8601 (e.g. 2026-04-11T00:00:00Z)")
+            # The DB stores datetime.now(timezone.utc).isoformat() strings, so
+            # normalize the caller's offset to UTC before the lexicographic
+            # compare; naive input is treated as UTC.
+            if _dt_since.tzinfo is None:
+                _dt_since = _dt_since.replace(tzinfo=_tz.utc)
             conditions.append("posted_at > ?")
-            params.append(since)
+            params.append(_dt_since.astimezone(_tz.utc).isoformat())
         where = "WHERE " + " AND ".join(conditions)
 
         # Gracefully handle missing table (agent.db exists but ln-agent hasn't run yet)
@@ -534,6 +549,11 @@ def analyze_url(req: AnalyzeRequest):
 
 if __name__ == "__main__":
     import uvicorn
+    if not API_KEY and not API_ALLOW_UNAUTHENTICATED:
+        raise SystemExit(
+            "ERROR: API_KEY is required — set it to the static bearer token your "
+            "gateway sends, or set API_ALLOW_UNAUTHENTICATED=1 to run an open "
+            "instance for local development only.")
     log.info(f"Starting Benthic API on port {API_PORT}")
     # Single worker — circuit breaker and rate limiter are module-level globals,
     # not safe with multiple workers. host="0.0.0.0" for container reachability.

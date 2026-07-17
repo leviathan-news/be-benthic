@@ -478,10 +478,23 @@ def test_auth_accepts_correct_key(tmp_db, monkeypatch):
     assert resp.status_code == 200
 
 
-def test_auth_disabled_when_no_key(tmp_db, monkeypatch):
-    """When API_KEY is empty, all requests pass without auth (dev mode)."""
+def test_auth_fails_closed_when_no_key(tmp_db, monkeypatch):
+    """When API_KEY is empty and no explicit opt-out, requests get 503."""
     import benthic_api
     monkeypatch.setattr(benthic_api, "API_KEY", "")
+    monkeypatch.setattr(benthic_api, "API_ALLOW_UNAUTHENTICATED", False)
+    monkeypatch.setattr(benthic_api, "API_DB_PATH", tmp_db)
+    client = TestClient(benthic_api.app)
+    resp = client.get("/news")
+    assert resp.status_code == 503
+    assert "API_KEY not configured" in resp.json()["detail"]
+
+
+def test_auth_disabled_only_with_explicit_optout(tmp_db, monkeypatch):
+    """API_ALLOW_UNAUTHENTICATED=1 restores open access for local dev."""
+    import benthic_api
+    monkeypatch.setattr(benthic_api, "API_KEY", "")
+    monkeypatch.setattr(benthic_api, "API_ALLOW_UNAUTHENTICATED", True)
     monkeypatch.setattr(benthic_api, "API_DB_PATH", tmp_db)
     client = TestClient(benthic_api.app)
     resp = client.get("/news")

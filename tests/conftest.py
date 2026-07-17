@@ -38,6 +38,9 @@ os.environ.setdefault("WALLET_PRIVATE_KEY", "")
 os.environ.setdefault("AGENT_NAME", "Benthic")
 os.environ.setdefault("BOT_USERNAME", "benthic_bot")
 os.environ.setdefault("OPERATOR_IDS", "[111000111]")
+# The API tests exercise endpoints without configuring a bearer token; the
+# explicit fail-closed behavior has its own dedicated tests.
+os.environ.setdefault("API_ALLOW_UNAUTHENTICATED", "1")
 
 
 def _apply_ram_cap() -> None:

@@ -780,7 +780,10 @@ def _run_task_exec_fallback(task: dict) -> bool:
         error = parsed_error
 
     if repo_url and not error:
-        finish_task(tid, "done", repo_url=repo_url)
+        if not finish_task(tid, "done", repo_url=repo_url):
+            # Already cancelled mid-build — respect it, no "done" ping.
+            log.info("#%s already cancelled; suppressing completion notification", tid)
+            return True
         try:
             notify_done(task, repo_url)
         except Exception:
@@ -789,7 +792,10 @@ def _run_task_exec_fallback(task: dict) -> bool:
     else:
         if not error:
             error = "no RESULT.txt produced; check log"
-        finish_task(tid, "failed", error=error)
+        if not finish_task(tid, "failed", error=error):
+            # Cancel SIGTERMed the child; its death is not a build failure.
+            log.info("#%s already cancelled; suppressing failure notification", tid)
+            return True
         try:
             notify_failed(task, error, log_path)
         except Exception:

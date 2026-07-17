@@ -1,12 +1,10 @@
-# Agent Sandbox — allowed outbound hosts
+# Benthic Sandbox — allowed outbound hosts
 # One hostname per line. setup-network.sh resolves these to IPs for iptables rules.
 # Re-run setup-network.sh after editing.
 
 # Ethereum RPCs
-mainnet.infura.io
-eth-mainnet.g.alchemy.com
-rpc.ankr.com
-cloudflare-eth.com
+ethereum-rpc.publicnode.com
+public.1rpc.io
 
 # L2 RPCs
 arb1.arbitrum.io

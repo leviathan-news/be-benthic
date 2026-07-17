@@ -1,0 +1,96 @@
+# Codex permission profiles for the Benthic system — append these [permissions.*]
+# blocks to the SERVER's ~/.codex/config.toml. Replace /path/to/agent-dir with
+# your agent install directory (Telethon session files are covered by the
+# *.session* wildcard deny). Do NOT set a global
+# default_permissions; providers.py selects a profile per Codex call via
+# `-c default_permissions=<name>` (+ `-c approval_policy=never`).
+#
+# DESIGN (validated empirically):
+# - A `deny` ALWAYS beats a `read` regardless of path specificity, and a denied
+#   file is unreadable to any command running INSIDE the sandbox.
+# - execpolicy `allow` (see rules/benthic.rules) runs the matched wrapper script
+#   OUTSIDE the sandbox, where the deny does not apply — so github_client.sh /
+#   telegram_client.py / twitter_fetch.py / run-sandbox.sh read the creds they
+#   need and Telethon writes its session. An injected in-sandbox `cat`/`curl`
+#   cannot read those creds, so it cannot exfiltrate them.
+# - `curl` is deliberately NOT execpolicy-allowed: it runs in-sandbox, so it can
+#   still fetch arbitrary URLs (grounding, network enabled) but cannot read any
+#   denied secret. The Codex env is also secret-stripped in providers.py.
+# Net: EVERY sensitive ~/.claude file is denied in-sandbox in EVERY profile; the
+# three profiles are filesystem-identical. ~/.claude/plugins stays readable so the
+# tool scripts there can be located. benthic-builder is excluded (codex app-server).
+#
+# KNOWN RESIDUAL: github_client.sh write subcommands run outside the sandbox and
+# take a content body, so a successful injection could in principle embed a
+# command-substitution read of a denied file in the body. Mitigated by the
+# identity prompt's injection defenses; a true fix is a cred broker (follow-up).
+
+[permissions.benthic_bot]
+extends = ":workspace"
+[permissions.benthic_bot.filesystem]
+":minimal" = "read"
+"/path/to/agent-dir" = "read"
+"/tmp" = "write"
+"~/.claude/.ln-wallet-key" = "deny"
+"~/.claude/.ln-bot-token" = "deny"
+"~/.claude/.credentials.json" = "deny"
+"~/.claude/session-env" = "deny"
+"~/.claude/*.session*" = "deny"
+"~/.claude/.github-token" = "deny"
+"~/.claude/.github-repos-allowlist" = "deny"
+"~/.claude/.github-rate-limit" = "deny"
+"~/.claude/telegram-creds.json" = "deny"
+"~/.claude/twitter-cookies.txt" = "deny"
+"~/.ssh" = "deny"
+"~/.aws" = "deny"
+"~/.gnupg" = "deny"
+"~/.netrc" = "deny"
+[permissions.benthic_bot.network]
+enabled = true
+
+[permissions.benthic_bot_operator]
+extends = ":workspace"
+[permissions.benthic_bot_operator.filesystem]
+":minimal" = "read"
+"/path/to/agent-dir" = "read"
+"/tmp" = "write"
+"~/.claude/.ln-wallet-key" = "deny"
+"~/.claude/.ln-bot-token" = "deny"
+"~/.claude/.credentials.json" = "deny"
+"~/.claude/session-env" = "deny"
+"~/.claude/*.session*" = "deny"
+"~/.claude/.github-token" = "deny"
+"~/.claude/.github-repos-allowlist" = "deny"
+"~/.claude/.github-rate-limit" = "deny"
+"~/.claude/telegram-creds.json" = "deny"
+"~/.claude/twitter-cookies.txt" = "deny"
+"~/.ssh" = "deny"
+"~/.aws" = "deny"
+"~/.gnupg" = "deny"
+"~/.netrc" = "deny"
+[permissions.benthic_bot_operator.network]
+enabled = true
+
+[permissions.benthic_agent]
+extends = ":workspace"
+[permissions.benthic_agent.filesystem]
+":minimal" = "read"
+"/path/to/agent-dir" = "read"
+"/tmp" = "write"
+"~/.claude/.ln-wallet-key" = "deny"
+"~/.claude/.ln-bot-token" = "deny"
+"~/.claude/.credentials.json" = "deny"
+"~/.claude/session-env" = "deny"
+"~/.claude/*.session*" = "deny"
+"~/.claude/.github-token" = "deny"
+"~/.claude/.github-repos-allowlist" = "deny"
+"~/.claude/.github-rate-limit" = "deny"
+"~/.claude/telegram-creds.json" = "deny"
+"~/.claude/twitter-cookies.txt" = "deny"
+"~/.ssh" = "deny"
+"~/.aws" = "deny"
+"~/.gnupg" = "deny"
+"~/.netrc" = "deny"
+[permissions.benthic_agent.network]
+enabled = true
+

@@ -46,14 +46,22 @@ fi
 iptables -D FORWARD -i "$BRIDGE" -j "$CHAIN_NAME" 2>/dev/null || true
 iptables -I FORWARD -i "$BRIDGE" -j "$CHAIN_NAME"
 
-# Allow DNS (required for hostname resolution inside container)
-iptables -A "$CHAIN_NAME" -p udp --dport 53 -j ACCEPT
-iptables -A "$CHAIN_NAME" -p tcp --dport 53 -j ACCEPT
+# DNS egress is intentionally NOT opened. Sandbox containers resolve the allowlisted
+# hosts via static /etc/hosts entries (run-sandbox.sh injects --add-host from the
+# .resolved-hosts file written below) and point at a black-hole resolver for
+# everything else, so model-supplied code cannot exfiltrate data via DNS lookups
+# like <secret>.attacker.com. Any direct external port-53 attempt falls through to
+# the default DROP at the end of this chain — PR #1 finding.
 
 # Allow established/related connections (return traffic)
 iptables -A "$CHAIN_NAME" -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-# Resolve each allowed host and add iptables rules
+# Resolve each allowed host and add iptables rules. Also record host->IP pairs to
+# .resolved-hosts so run-sandbox.sh can inject them as static /etc/hosts entries
+# (--add-host): the container reaches allowlisted hosts WITHOUT DNS, letting us
+# black-hole all other DNS and close the exfil channel.
+RESOLVED_HOSTS_FILE="$(dirname "$0")/.resolved-hosts"
+: > "$RESOLVED_HOSTS_FILE"
 while IFS= read -r line; do
     # Skip comments and blank lines
     line=$(echo "$line" | sed 's/#.*//' | xargs)
@@ -69,6 +77,7 @@ while IFS= read -r line; do
     for ip in $ips; do
         echo "  Allowing $ip (443/tcp)"
         iptables -A "$CHAIN_NAME" -p tcp -d "$ip" --dport 443 -j ACCEPT
+        echo "$line $ip" >> "$RESOLVED_HOSTS_FILE"
     done
 done < "$HOSTS_FILE"
 

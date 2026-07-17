@@ -1,4 +1,4 @@
-"""Agent Sandbox Helpers — pre-built patterns for common onchain and data queries.
+"""Benthic Sandbox Helpers — pre-built patterns for common onchain and data queries.
 
 Usage from sandbox:
     from helpers import get_web3, get_chain, explorer, defi_llama, coingecko

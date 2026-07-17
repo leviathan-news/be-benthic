@@ -2,3 +2,4 @@ telethon
 requests
 eth-account
 Pillow
+websockets

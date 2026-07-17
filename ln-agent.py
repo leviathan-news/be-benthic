@@ -17,6 +17,7 @@ import json
 import logging
 import logging.handlers
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -83,7 +84,7 @@ def load_credentials() -> tuple:
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN",
     shutil.which("claude") or str(Path("~/.local/bin/claude").expanduser()))
 CODEX_BIN = os.environ.get("CODEX_BIN", _resolve_codex_bin())
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.5")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
 CODEX_EFFORT = os.environ.get("CODEX_EFFORT", "xhigh")
 # OpenCode CLI — additional fallback provider.
 OPENCODE_BIN = os.environ.get("OPENCODE_BIN", shutil.which("opencode") or "opencode")
@@ -94,19 +95,30 @@ CLAUDE_LIMIT_COOLDOWN = int(os.environ.get("CLAUDE_LIMIT_COOLDOWN", str(6 * 60 *
 # Default: codex primary, claude as fallback (Claude CLI -p flag removal on the
 # subscription tier made codex more reliable for this project).
 # Example: PROVIDER_ORDER=claude,codex  (legacy ordering, claude first)
-PROVIDER_ORDER = [p.strip() for p in os.environ.get("PROVIDER_ORDER", "codex,claude,opencode").split(",") if p.strip()]
+PROVIDER_ORDER = [p.strip() for p in os.environ.get("PROVIDER_ORDER", "codex,claude").split(",") if p.strip()]
 if not PROVIDER_ORDER:
-    PROVIDER_ORDER = ["codex", "claude", "opencode"]
-    print("WARNING: PROVIDER_ORDER was empty — falling back to default: codex,claude,opencode", file=sys.stderr)
-TELEGRAM_CLIENT_SCRIPT = Path(
-    "~/.claude/plugins/cache/local/telegram-explorer/1.0.0/skills/"
-    "telegram-explorer/scripts/telegram_client.py"
-).expanduser()
-TELEGRAM_CLIENT_PYTHON = TELEGRAM_CLIENT_SCRIPT.parent / ".venv/bin/python3"
-TWITTER_FETCH_SCRIPT = Path(
-    "~/.claude/plugins/cache/local/twitter-explorer/1.1.0/skills/"
-    "twitter-explorer/scripts/twitter_fetch.py"
-).expanduser()
+    PROVIDER_ORDER = ["codex", "claude"]
+    print("WARNING: PROVIDER_ORDER was empty — falling back to default: codex,claude", file=sys.stderr)
+# Telegram CLI wrapper — bundled copy by default; override via env if you run
+# it from somewhere else (e.g. a plugin install).
+TELEGRAM_CLIENT_SCRIPT = Path(os.environ.get(
+    "TELEGRAM_CLIENT_SCRIPT",
+    str(BASE_DIR / "skills/telegram-explorer/scripts/telegram_client.py"),
+)).expanduser()
+TELEGRAM_CLIENT_PYTHON = Path(os.environ.get(
+    "TELEGRAM_CLIENT_PYTHON", str(BASE_DIR / ".venv/bin/python3"),
+)).expanduser()
+# Twitter/X research script — not bundled (see README); the default stub returns [].
+TWITTER_FETCH_SCRIPT = Path(os.environ.get(
+    "TWITTER_FETCH_SCRIPT", str(BASE_DIR / "scripts/twitter_fetch.py"),
+)).expanduser()
+# If your implementation ships its own venv (e.g. bs4), a sibling .venv is
+# auto-used; override TWITTER_FETCH_PYTHON to pin a different interpreter.
+_TW_VENV_PY = TWITTER_FETCH_SCRIPT.parent / ".venv/bin/python3"
+TWITTER_FETCH_PYTHON = Path(os.environ.get(
+    "TWITTER_FETCH_PYTHON",
+    str(_TW_VENV_PY if _TW_VENV_PY.exists() else Path(sys.executable)),
+))
 HEADLINE_VALIDATOR = BASE_DIR / "skills/leviathan-headlines/scripts/validate-headline.sh"
 SOUL_FILE = BASE_DIR / "SOUL.md"
 
@@ -118,6 +130,10 @@ AGENT_NAME = os.environ.get("AGENT_NAME", "Agent")
 AGENT_SOUL = ""
 if SOUL_FILE.exists():
     AGENT_SOUL = SOUL_FILE.read_text().strip()
+
+# Shared anti-slop voice rules are loaded once and injected into creative prompts
+# so both Claude and Codex receive the same public-output constraints.
+NO_AI_SLOP = load_prompt("_shared/no_ai_slop")
 
 # Tool allowlist for Claude CLI — restricts what Claude can do when processing untrusted input.
 # Permits research tools + specific skill script paths. Blocks arbitrary Bash, Write, Edit.
@@ -189,6 +205,99 @@ INJECTION_OUTPUT_PATTERNS = [
 # Users to always upvote (no Claude evaluation needed).
 # Comma-separated list of LN usernames.
 AUTO_UPVOTE_USERS = [u.strip().lower() for u in os.environ.get("AUTO_UPVOTE_USERS", "").split(",") if u.strip()]
+
+# Source domains we never accept as a news primary source. Defense-in-depth
+# against eval-time prompt slippage that lets content-farm or low-trust outlets
+# through. Matched by suffix on the URL's netloc (e.g. "zine.live" blocks
+# "www.zine.live" and "zine.live/path"). Env override:
+# BLOCKED_SOURCE_DOMAINS="domain1,domain2,..." replaces the list entirely;
+# EXTRA_BLOCKED_SOURCE_DOMAINS="domain1,domain2,..." appends to it.
+_DEFAULT_BLOCKED_SOURCE_DOMAINS = [
+    "zine.live",            # Wilder-World affiliated content farm (May 2026 incident)
+    "einnews.com",          # Auto-press-release aggregator, no editorial standards
+    "globenewswire.com",    # Press-release wire — mostly paid promo
+    "prnewswire.com",       # Same
+    "businesswire.com",     # Same
+    "u.today",              # Low-quality crypto aggregator
+    "cryptopotato.com",     # SEO-driven aggregator
+    "cryptonews.com",       # Aggregator, frequently reposts without verification
+    "ambcrypto.com",        # SEO/affiliate-driven
+    "bitcoinist.com",       # SEO/affiliate-driven
+    "newsbtc.com",          # SEO/affiliate-driven
+    "cryptodaily.co.uk",    # SEO/affiliate-driven
+    "cryptoslate.com",      # Aggregator with sponsored content blending
+    "beincrypto.com",       # Aggregator, mixed editorial quality
+    "finbold.com",          # SEO-driven, frequent inaccuracies
+    "coingape.com",         # SEO-driven aggregator
+    "watcher.guru",         # Twitter-screenshot aggregator
+    "thecryptobasic.com",   # SEO/affiliate-driven
+    "cryptoglobe.com",      # Aggregator
+    "fxstreet.com",         # FX-focused, weak crypto editorial
+]
+
+
+def _load_blocked_source_domains() -> list[str]:
+    """Build the active blocklist from defaults + env overrides at import time."""
+    override = os.environ.get("BLOCKED_SOURCE_DOMAINS", "").strip()
+    if override:
+        domains = [d.strip().lower() for d in override.split(",") if d.strip()]
+    else:
+        domains = list(_DEFAULT_BLOCKED_SOURCE_DOMAINS)
+    extra = os.environ.get("EXTRA_BLOCKED_SOURCE_DOMAINS", "").strip()
+    if extra:
+        domains.extend(d.strip().lower() for d in extra.split(",") if d.strip())
+    # Dedup while preserving order, dropping empties
+    return list(dict.fromkeys(d for d in domains if d))
+
+
+BLOCKED_SOURCE_DOMAINS = _load_blocked_source_domains()
+
+
+def _env_int(name: str, default: int) -> int:
+    """Read an int env var, falling back to `default` (and logging) on parse
+    failure. Used for env-tunable knobs that must not crash the agent cycle on
+    a fat-fingered value like `168h`."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return int(raw.strip())
+    except (ValueError, TypeError):
+        log.warning(f"Invalid {name}={raw!r}, using default {default}")
+        return default
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var, falling back to `default` (and logging) on parse
+    failure. Mirrors _env_int, for fractional knobs (e.g. confidence thresholds)."""
+    raw = os.environ.get(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        return float(raw.strip())
+    except (ValueError, TypeError):
+        log.warning(f"Invalid {name}={raw!r}, using default {default}")
+        return default
+
+
+def is_blocked_source(url: str | None) -> bool:
+    """Return True if the URL's host is on (or under) any blocked domain.
+    Matches by suffix so 'zine.live' blocks 'www.zine.live' and any subdomain.
+    Defense-in-depth: the eval prompt should already reject these, but the
+    LLM occasionally lets one through and a hard guard here is cheap."""
+    if not url or not BLOCKED_SOURCE_DOMAINS:
+        return False
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except Exception:
+        return False
+    if not host:
+        return False
+    for domain in BLOCKED_SOURCE_DOMAINS:
+        if host == domain or host.endswith("." + domain):
+            return True
+    return False
+
 
 # Users to always downvote (no Claude evaluation needed).
 # Comma-separated list of LN usernames.
@@ -433,6 +542,18 @@ class AgentDB:
             replied_at TEXT NOT NULL
         )""")
 
+        # Phase 6 market-matching dedup — one row per article we've decided on.
+        # The squid-bot server (PR #380) is the authoritative dedup (409/noop);
+        # this local table just avoids re-paying the LLM for an already-decided
+        # article. Mirrors voted_articles. market_id is NULL for skip/propose.
+        c.execute("""CREATE TABLE IF NOT EXISTS market_decisions (
+            news_id INTEGER PRIMARY KEY,
+            decision TEXT,
+            market_id INTEGER,
+            confidence REAL,
+            ts TEXT NOT NULL
+        )""")
+
         # Agent run log — one row per execution
         c.execute("""CREATE TABLE IF NOT EXISTS runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -443,6 +564,25 @@ class AgentDB:
             articles_posted INTEGER DEFAULT 0,
             articles_voted INTEGER DEFAULT 0,
             articles_commented INTEGER DEFAULT 0
+        )""")
+
+        # Live-news WebSocket event queue. The listener task (see
+        # _ws_listener_supervisor) INSERTs filtered events; two independent
+        # consumers drain it: ln-agent's mini-pass / Phase 4 (consumed_by_agent)
+        # and benthic-bot's breaking-news reaction (consumed_by_bot).
+        c.execute("""CREATE TABLE IF NOT EXISTS ws_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_type TEXT NOT NULL,
+            news_id INTEGER NOT NULL,
+            slug TEXT,
+            headline TEXT,
+            date_posted TEXT,
+            origin TEXT,
+            raw TEXT,
+            received_at TEXT NOT NULL,
+            consumed_by_agent INTEGER NOT NULL DEFAULT 0,
+            consumed_by_bot INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(news_id, event_type)
         )""")
 
         self._commit()
@@ -611,6 +751,53 @@ class AgentDB:
         )
         self._commit()
 
+    # ── ws_events queue (live-news WebSocket) ──
+    # consumer column names are interpolated into SQL, so they are strictly
+    # allowlisted — never derived from external input.
+    _WS_CONSUMERS = {"agent": "consumed_by_agent", "bot": "consumed_by_bot"}
+
+    def _ws_consumer_col(self, consumer: str) -> str:
+        col = self._WS_CONSUMERS.get(consumer)
+        if not col:
+            raise ValueError(f"unknown ws_events consumer: {consumer!r}")
+        return col
+
+    def add_ws_event(self, event_type: str, news_id: int, slug: str | None,
+                     headline: str | None, date_posted: str | None,
+                     origin: str | None, raw: str | None) -> bool:
+        """Insert a WS event; returns True only when a NEW row was created."""
+        cur = self._execute_commit(
+            """INSERT OR IGNORE INTO ws_events
+               (event_type, news_id, slug, headline, date_posted, origin, raw, received_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (event_type, news_id, slug, headline, date_posted, origin, raw,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        return cur.rowcount > 0
+
+    def get_unconsumed_ws_events(self, consumer: str, limit: int = 50) -> list:
+        col = self._ws_consumer_col(consumer)
+        return self._execute(
+            f"SELECT * FROM ws_events WHERE {col} = 0 ORDER BY id ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+
+    def mark_ws_events_consumed(self, consumer: str, event_ids: list) -> None:
+        col = self._ws_consumer_col(consumer)
+        if not event_ids:
+            return
+        placeholders = ",".join("?" for _ in event_ids)
+        self._execute_commit(
+            f"UPDATE ws_events SET {col} = 1 WHERE id IN ({placeholders})",
+            tuple(event_ids),
+        )
+
+    def prune_ws_events(self, days: int = 7) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cur = self._execute_commit(
+            "DELETE FROM ws_events WHERE received_at < ?", (cutoff,))
+        return cur.rowcount
+
     # ── Yap/comment votes ──
 
     def was_yap_voted(self, yap_id: int) -> bool:
@@ -669,6 +856,25 @@ class AgentDB:
             (yap_id, article_id, reply_text, now))
         self._commit()
 
+    # ── Market-match decisions (Phase 6) ──
+
+    def was_market_decided(self, news_id: int) -> bool:
+        row = self._execute(
+            "SELECT 1 FROM market_decisions WHERE news_id = ?", (news_id,)
+        ).fetchone()
+        return row is not None
+
+    def save_market_decision(self, news_id: int, decision: str,
+                             market_id: int | None = None,
+                             confidence: float | None = None):
+        now = datetime.now(timezone.utc).isoformat()
+        self._execute(
+            "INSERT OR IGNORE INTO market_decisions "
+            "(news_id, decision, market_id, confidence, ts) VALUES (?, ?, ?, ?, ?)",
+            (news_id, decision, market_id, confidence, now),
+        )
+        self._commit()
+
     def close(self):
         self.conn.close()
 
@@ -725,13 +931,22 @@ class LNClient:
             self.session.headers.update({"Connection": "close"})
             self.authenticate()
 
-    def submit_article(self, url: str, headline: str) -> dict | None:
-        """Submit article via LN API (posts as the agent wallet). Thread-safe."""
+    def submit_article(self, url: str, headline: str, market_id: int | None = None) -> dict | None:
+        """Submit article via LN API (posts as the agent wallet). Thread-safe.
+
+        market_id (optional): pre-attach an existing OPEN prediction market at
+        creation (squid-bot PR #380). Only honored server-side for staff
+        submitters; invalid/non-open ids are non-fatal there. Omitted from the
+        body when None, so behaviour is unchanged for normal posts.
+        """
         with self._lock:
             self._refresh_if_stale()
+            body = {"url": url, "headline": headline}
+            if market_id is not None:
+                body["market_id"] = market_id
             r = self.session.post(
                 f"{LN_API}/news/post",
-                json={"url": url, "headline": headline},
+                json=body,
                 headers={"Content-Type": "application/json"},
                 timeout=300,
             )
@@ -746,6 +961,75 @@ class LNClient:
             else:
                 log.error(f"Submit failed: {r.status_code} {r.text[:200]}")
                 return None
+
+    def get_market_queue(self, limit: int = 20) -> list:
+        """Approved articles needing a market. GET /agent/queue/?needs_market=true.
+        Staff-gated server-side. Returns the `articles` list, or [] on failure."""
+        try:
+            with self._lock:
+                self._refresh_if_stale()
+                r = self.session.get(
+                    f"{LN_API}/agent/queue/",
+                    params={"needs_market": "true", "limit": limit},
+                    timeout=300,
+                )
+                if r.ok:
+                    return r.json().get("articles", [])
+                log.error(f"Market queue fetch failed: {r.status_code}")
+        except Exception as e:
+            log.warning(f"Market queue fetch error: {e}")
+        return []
+
+    def get_open_markets(self, sort: str = "expiring_soon", limit: int = 50) -> list:
+        """Candidate open markets. GET /predictions/markets/?status=open.
+        Public endpoint. Returns the `results` list (first page), or [] on failure."""
+        try:
+            with self._lock:
+                self._refresh_if_stale()
+                r = self.session.get(
+                    f"{LN_API}/predictions/markets/",
+                    params={"status": "open", "sort": sort, "limit": limit},
+                    timeout=300,
+                )
+                if r.ok:
+                    return r.json().get("results", [])
+                log.error(f"Open markets fetch failed: {r.status_code}")
+        except Exception as e:
+            log.warning(f"Open markets fetch error: {e}")
+        return []
+
+    def submit_market_decision(self, news_id: int, payload: dict) -> dict:
+        """POST a market decision. /agent/market-match/<news_id>/ (staff-gated).
+
+        Returns {ok, status, result, benign}. `benign` is True for outcomes that
+        mean "already handled" (a 409 already-decided / not-eligible, or a 200
+        noop). The caller then records locally and moves on. Never raises.
+        """
+        try:
+            with self._lock:
+                self._refresh_if_stale()
+                r = self.session.post(
+                    f"{LN_API}/agent/market-match/{news_id}/",
+                    json=payload,
+                    headers={"Content-Type": "application/json"},
+                    timeout=300,
+                )
+            status = r.status_code
+            try:
+                data = r.json()
+            except Exception:
+                data = {}
+            if r.ok:
+                # A 200 may be an outright success, or a {"result": "noop"} (already has a market).
+                return {"ok": True, "status": status,
+                        "result": data.get("result"), "benign": data.get("result") == "noop"}
+            # A 409 means already-decided / not-eligible — benign; record locally.
+            benign = status == 409
+            log.warning(f"Market decision {news_id} -> {status}: {str(data)[:200]}")
+            return {"ok": False, "status": status, "result": data.get("error"), "benign": benign}
+        except Exception as e:
+            log.warning(f"Market decision POST error for {news_id}: {e}")
+            return {"ok": False, "status": 0, "result": str(e), "benign": False}
 
     def get_recent_articles(self, per_page: int = 20, status: str = "approved") -> list:
         with self._lock:
@@ -824,11 +1108,12 @@ from providers import ClaudeProvider, CodexProvider, OpenCodeProvider, ProviderC
 def _build_codex_prompt(prompt: str) -> str:
     """Translate Claude-oriented task instructions into a Codex-compatible wrapper."""
     return load_prompt("agent/codex_wrapper",
+        BOT_HQ_ID=BOT_HQ if BOT_HQ is not None else "(unset)",
         TWITTER_FETCH_SCRIPT=TWITTER_FETCH_SCRIPT,
+        TWITTER_FETCH_PYTHON=TWITTER_FETCH_PYTHON,
         TELEGRAM_CLIENT_PYTHON=TELEGRAM_CLIENT_PYTHON,
         TELEGRAM_CLIENT_SCRIPT=TELEGRAM_CLIENT_SCRIPT,
         HEADLINE_VALIDATOR=HEADLINE_VALIDATOR,
-        BOT_HQ_ID=BOT_HQ if BOT_HQ is not None else "(unset)",
         prompt=prompt)
 
 
@@ -845,6 +1130,7 @@ _codex_provider = CodexProvider(
     effort=CODEX_EFFORT,
     cwd=str(BASE_DIR),
     sandbox_bypass=True,
+    permission_profile="benthic_agent",
     add_dirs=["~/.claude"],
     wrapper=_build_codex_prompt,
 )
@@ -855,7 +1141,7 @@ _opencode_provider = OpenCodeProvider(
     wrapper=_build_codex_prompt,
 )
 _provider_chain = ProviderChain.from_env_order(
-    "PROVIDER_ORDER", default="codex,claude,opencode",
+    "PROVIDER_ORDER", default="codex,claude",
     providers={
         "claude": _claude_provider,
         "codex": _codex_provider,
@@ -863,6 +1149,54 @@ _provider_chain = ProviderChain.from_env_order(
     },
 )
 log.info(f"LLM provider chain: {','.join(_provider_chain.names())}")
+
+
+# ─── Market matching (Phase 6 + pre-attach) — see docs/superpowers/specs/2026-05-30 ──
+# All gated by ENABLE_MARKET_MATCH (default off). Depends on squid-bot PR #380.
+# Placed here (after `log`, and the _env_* helpers) because _env_int/_env_float
+# touch `log` on their parse-failure path, and `log` is defined above at module scope.
+ENABLE_MARKET_MATCH = os.environ.get("ENABLE_MARKET_MATCH", "0") == "1"
+MARKET_MATCH_MAX_PER_CYCLE = _env_int("MARKET_MATCH_MAX_PER_CYCLE", 10)
+MARKET_MATCH_MAX_B = _env_int("MARKET_MATCH_MAX_B", 1000)
+
+# ─── Live-news WebSocket (see docs/superpowers/specs/2026-07-02-leviathan-ws-events-design.md) ───
+ENABLE_WS_EVENTS = os.environ.get("ENABLE_WS_EVENTS", "1") == "1"
+ENABLE_WS_MINI_PASS = os.environ.get("ENABLE_WS_MINI_PASS", "1") == "1"
+WS_NEWS_URL = os.environ.get("WS_NEWS_URL", "wss://api.leviathannews.xyz/ws/news/")
+# Handshake is rejected with HTTP 403 without a browser-like Origin header
+# (empirically verified 2026-07-02; mirrors the REST CSRF rule).
+WS_NEWS_ORIGIN = os.environ.get("WS_NEWS_ORIGIN", "https://leviathannews.xyz")
+WS_EVENT_TYPES = {t.strip() for t in os.environ.get(
+    "WS_EVENT_TYPES", "news.approved").split(",") if t.strip()}
+# Liveness is protocol ping/pong ONLY. The 300s app-level stall backstop this
+# replaced was killing provably-healthy connections: the server's documented
+# 25s heartbeats pause in practice, so quiet-but-alive links (pongs flowing,
+# no app frames) got executed every ~5-10 min (observed 2026-07-02). A dead
+# link surfaces as ConnectionClosed within ping_interval+ping_timeout; a quiet
+# link is just a quiet news day. ping_interval also keeps middlebox idle
+# timers fed. ping_timeout is deliberately generous — a transiently-stalled
+# origin event loop shouldn't count as dead (reconnect costs a gap; the hourly
+# cycle backfills, but every drop is still lost real-time coverage).
+WS_PING_INTERVAL = _env_int("WS_PING_INTERVAL", 20)
+WS_PING_TIMEOUT = _env_int("WS_PING_TIMEOUT", 45)
+WS_BACKOFF_BASE = _env_int("WS_BACKOFF_BASE", 5)
+WS_BACKOFF_CAP = _env_int("WS_BACKOFF_CAP", 300)
+# A connection that survived this long counts as "stable": the next failure
+# restarts backoff from base instead of continuing the exponential ratchet —
+# a flaky-but-working stream must not decay to permanent WS_BACKOFF_CAP gaps.
+WS_STABLE_SECONDS = _env_int("WS_STABLE_SECONDS", 60)
+MINI_PASS_MIN_INTERVAL = _env_int("MINI_PASS_MIN_INTERVAL", 600)
+MINI_PASS_DEADLINE = _env_int("MINI_PASS_DEADLINE", 900)
+MINI_PASS_MAX_ARTICLES = _env_int("MINI_PASS_MAX_ARTICLES", 5)
+
+# Provenance-first dedup — LN's free POST /provenance/check replaces the
+# ~8k-token classify-tier HQ dup prompt for the common case (measured 2026-07-02:
+# ~460k input tokens/day across ~56 checks). Verdicts map to reject/proceed;
+# anything inconclusive falls back to the classify-tier HQ path unchanged.
+ENABLE_PROVENANCE_DEDUP = os.environ.get("ENABLE_PROVENANCE_DEDUP", "1") == "1"
+PROVENANCE_CHECK_URL = os.environ.get(
+    "PROVENANCE_CHECK_URL", "https://api.leviathannews.xyz/api/v1/provenance/check")
+MARKET_MATCH_ATTACH_MIN_CONFIDENCE = _env_float("MARKET_MATCH_ATTACH_MIN_CONFIDENCE", 0.75)
 
 
 
@@ -899,11 +1233,13 @@ def claude_ask(prompt: str, timeout: int = 3600) -> str:
 
 
 def _sentinel_check_sync(text: str, context: str, timeout: int = 120) -> bool:
-    """Sentinel check via Sonnet — verifies public-facing output is safe before posting.
+    """Sentinel check — verifies public-facing output is safe before posting.
 
-    Uses a DIFFERENT model (Sonnet) as a second opinion to catch semantic injection
-    that pattern matching can't detect. If the primary model (Opus) was fooled by a
-    sophisticated injection, Sonnet provides an independent verification.
+    Routes through the provider chain at classification tier: with the default
+    codex,claude order that means gpt-5.6-luna giving a second opinion on the
+    creative model's (gpt-5.6-sol) output — a different model from the one that
+    wrote the reply, to catch semantic injection that pattern matching can't
+    detect. On Claude fallback the check runs Sonnet/low instead.
 
     Only called for high-risk outputs (replies to adversarial user comments).
     Returns True if the text is safe to post, False if it should be rejected.
@@ -1203,7 +1539,7 @@ def resolve_craft_headline_tldr(url: str, original_text: str) -> tuple[str, str,
     safe_text = sanitize_untrusted(original_text, max_len=1200).replace("===", "—-—")
 
     prompt = load_prompt("agent/resolve_craft_headline_tldr",
-        url=url, safe_text=safe_text)
+        no_slop=NO_AI_SLOP, url=url, safe_text=safe_text)
 
     # Generous timeout — this call does URL resolution + headline + TL;DR with multiple
     # tool invocations (WebFetch, WebSearch, Twitter). Inherits the 3600s default from
@@ -1301,6 +1637,7 @@ def craft_reply(our_comment: str, reply_text: str, reply_author: str, headline: 
     safe_headline = sanitize_untrusted(headline, max_len=200)
 
     prompt = load_prompt("agent/craft_reply",
+        no_slop=NO_AI_SLOP,
         safe_headline=safe_headline, our_comment_truncated=our_comment[:500],
         safe_author=safe_author, safe_reply=safe_reply)
 
@@ -1413,6 +1750,283 @@ def _extract_json_array(text: str) -> list | None:
     return None
 
 
+def _extract_json_object(text: str) -> dict | None:
+    """Extract a single JSON object from model output that may contain prose, or
+    markdown fences. Returns the parsed dict, or None on failure.
+
+    Mirrors _extract_json_array, but targets a `{...}` object (the market
+    decision). Three passes: fenced block; whole-string parse; first-'{'..last-'}'."""
+    if not text:
+        return None
+    text = text.strip()
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts[1::2]:  # odd-indexed parts are inside fences
+            part = part.strip()
+            if part.startswith("json"):
+                part = part[4:].strip()
+            if part.startswith("{"):
+                try:
+                    return json.loads(part)
+                except json.JSONDecodeError:
+                    continue
+    if text.startswith("{"):
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            pass
+    start = text.find("{")
+    end = text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            return json.loads(text[start:end + 1])
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def _clamp_confidence(raw) -> float:
+    """Coerce confidence to a float in [0, 1]; unparseable or non-finite -> 0.0.
+
+    Non-finite values (NaN, +/-inf) fail CLOSED to 0.0 — a NaN confidence must
+    never read as max and slip past the attach threshold."""
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return 0.0
+    if v != v or v in (float("inf"), float("-inf")):  # NaN (v != v) or infinity
+        return 0.0
+    return max(0.0, min(1.0, v))
+
+
+def _is_future_iso(value) -> bool:
+    """True iff `value` is an ISO-8601 datetime string, strictly in the future."""
+    if not value or not isinstance(value, str):
+        return False
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return False
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt > datetime.now(timezone.utc)
+
+
+def _skip_decision(reason: str, confidence: float = 0.0) -> dict:
+    """The canonical, fail-closed result."""
+    return {"decision": "skip", "reason": reason, "confidence": confidence}
+
+
+def _validate_market_decision(raw: dict | None, candidate_markets: list,
+                              allowed_decisions: list) -> dict:
+    """Normalize raw LLM output into a safe POST payload. Always fail-closed to
+    `skip`; never let a malformed attach/propose through.
+
+    Returns a dict carrying exactly the keys the decision-endpoint needs, for the
+    chosen decision, plus `confidence` (used for local dedup storage)."""
+    if not isinstance(raw, dict):
+        return _skip_decision("parse failure: no JSON object")
+
+    confidence = _clamp_confidence(raw.get("confidence"))
+    decision = raw.get("decision")
+    _reason = raw.get("reason")
+    reason = (_reason if isinstance(_reason, str) else "").strip()
+
+    if decision not in ("attach", "propose", "skip"):
+        return _skip_decision(f"invalid decision {decision!r}", confidence)
+    if decision not in allowed_decisions:
+        return _skip_decision(f"decision {decision!r} not allowed here", confidence)
+    if not reason:
+        reason = "no reason supplied by matcher"
+
+    if decision == "skip":
+        return {"decision": "skip", "reason": reason, "confidence": confidence}
+
+    if decision == "attach":
+        valid_ids = {m.get("id") for m in candidate_markets}
+        raw_market_id = raw.get("market_id")
+        if isinstance(raw_market_id, bool):
+            return _skip_decision("attach with bool market_id", confidence)
+        try:
+            market_id = int(raw_market_id)
+        except (TypeError, ValueError):
+            return _skip_decision("attach with non-int market_id", confidence)
+        if market_id not in valid_ids:
+            return _skip_decision(f"attach market_id {market_id} not in candidates", confidence)
+        if confidence < MARKET_MATCH_ATTACH_MIN_CONFIDENCE:
+            return _skip_decision(
+                f"attach confidence {confidence} < {MARKET_MATCH_ATTACH_MIN_CONFIDENCE}", confidence)
+        return {"decision": "attach", "market_id": market_id,
+                "reason": reason, "confidence": confidence}
+
+    # decision == "propose"
+    _question = raw.get("proposed_question")
+    question = (_question if isinstance(_question, str) else "").strip()
+    if not question:
+        return _skip_decision("propose with blank question", confidence)
+    if len(question) > 200:
+        return _skip_decision("propose question exceeds 200 chars", confidence)
+
+    expires_at = raw.get("suggested_expires_at")
+    if not _is_future_iso(expires_at):
+        return _skip_decision("propose without a valid future resolution date", confidence)
+
+    # suggested_b is a tuning param, capped server-side regardless: clamp, don't skip.
+    raw_b = raw.get("suggested_b")
+    default_b = min(1000, MARKET_MATCH_MAX_B)
+    try:
+        b = int(float(raw_b)) if raw_b is not None else default_b
+    except (TypeError, ValueError, OverflowError):
+        b = default_b
+    b = max(1, min(b, MARKET_MATCH_MAX_B))
+
+    return {"decision": "propose", "proposed_question": question,
+            "suggested_b": b, "suggested_expires_at": expires_at,
+            "reason": reason, "confidence": confidence}
+
+
+def _format_markets_block(candidate_markets: list) -> str:
+    """One sanitized line per candidate market, for the matcher prompt."""
+    if not candidate_markets:
+        return "(none)"
+    lines = []
+    for m in candidate_markets:
+        q = sanitize_untrusted(str(m.get("question", "")), max_len=200)
+        exp = sanitize_untrusted(str(m.get("expires_at", "") or "no expiry"), max_len=40)
+        lines.append(f"{m.get('id')} — {q} — {exp}")
+    return "\n".join(lines)
+
+
+def _format_article_block(article: dict) -> str:
+    """Sanitized article facts for the matcher prompt: headline, tags, source, url."""
+    headline = sanitize_untrusted(str(article.get("headline", "")), max_len=300)
+    tags_raw = article.get("tags") or []
+    tag_names = []
+    for t in tags_raw:
+        name = t.get("name") if isinstance(t, dict) else t
+        if name:
+            tag_names.append(sanitize_untrusted(str(name), max_len=30))
+    tags = ", ".join(tag_names) or "none"
+    source = sanitize_untrusted(str(article.get("source", "") or "unknown"), max_len=80)
+    url = sanitize_untrusted(str(article.get("url", "") or ""), max_len=300)
+    return f"headline: {headline}\ntags: {tags}\nsource: {source}\nurl: {url}"
+
+
+def match_market_for_article(article: dict, candidate_markets: list,
+                             allowed_decisions: list) -> dict:
+    """Ask the provider chain to attach/propose/skip a market for one article.
+
+    Creative tier, tools OFF (candidates are supplied; no web grounding needed).
+    Untrusted inputs are sanitized, then wrapped; output runs the injection gate.
+    Always returns a validated, fail-closed decision dict (never raises)."""
+    try:
+        prompt = load_prompt(
+            "agent/market_match",
+            allowed_decisions=", ".join(allowed_decisions),
+            article_block=_format_article_block(article),
+            markets_block=_format_markets_block(candidate_markets),
+            attach_min_confidence=MARKET_MATCH_ATTACH_MIN_CONFIDENCE,
+        )
+        raw = llm_ask(prompt, timeout=300, tier="creative", tools="")
+    except Exception as e:
+        log.warning(f"market matcher prompt/call failed: {e}")
+        return _skip_decision("matcher call failed")
+    if not raw or not raw.strip():
+        return _skip_decision("matcher returned empty")
+    if check_output_for_injection(raw, context="market_match"):
+        return _skip_decision("matcher output tripped injection gate")
+    obj = _extract_json_object(raw)
+    return _validate_market_decision(obj, candidate_markets, allowed_decisions)
+
+
+def _market_prefilter(article: dict) -> bool:
+    """Cheap classification-tier gate: could this article plausibly support a
+    binary prediction market? Returns False, to skip the expensive matcher call.
+
+    Fail-OPEN: empty/garbage output returns True, so the full matcher still gets
+    a chance; the gate must never silently suppress a real market."""
+    headline = sanitize_untrusted(str(article.get("headline", "")), max_len=300)
+    if not headline:
+        return False
+    try:
+        prompt = load_prompt("agent/market_prefilter", headline=headline)
+        raw = llm_ask(prompt, timeout=120, tier="classification", skip_soul=True, tools="")
+    except Exception as e:
+        log.warning(f"market pre-filter failed ({e}); failing open")
+        return True
+    ans = (raw or "").strip().lower()
+    if not ans:
+        return True  # fail open
+    return not ans.startswith("no")
+
+
+def run_market_match_phase(client, db):
+    """Phase 6: sweep the needs_market queue; attach/propose/skip a market per
+    approved article. Flag-gated, per-cycle-capped, isolated per article."""
+    if not ENABLE_MARKET_MATCH:
+        return
+    articles = client.get_market_queue(limit=MARKET_MATCH_MAX_PER_CYCLE)
+    if not articles:
+        log.info("Market match: queue empty")
+        return
+    markets = client.get_open_markets()
+    log.info(f"Market match: {len(articles)} queued, {len(markets)} open-market candidates")
+
+    processed = 0
+    for idx, article in enumerate(articles):
+        news_id = article.get("id")
+        if news_id is None:
+            continue
+        if processed >= MARKET_MATCH_MAX_PER_CYCLE:
+            deferred = len(articles) - idx
+            log.info(f"Market match: hit per-cycle cap {MARKET_MATCH_MAX_PER_CYCLE}; "
+                     f"{deferred} article(s) deferred to next cycle")
+            break
+        if db.was_market_decided(news_id):
+            continue
+        try:
+            if not _market_prefilter(article):
+                decision = _skip_decision("pre-filter: not plausibly market-worthy")
+            else:
+                decision = match_market_for_article(
+                    article, markets, ["attach", "propose", "skip"])
+            res = client.submit_market_decision(news_id, decision)
+            # Record locally so we don't re-pay the LLM next cycle — UNLESS the
+            # submit was a transient transport failure (status 0: timeout/network/
+            # exception). A transient miss should retry next cycle; a real server
+            # response (2xx, benign 409/noop, or a deterministic 4xx) is durable.
+            if res.get("status") != 0:
+                db.save_market_decision(news_id, decision["decision"],
+                                        decision.get("market_id"), decision.get("confidence"))
+            log.info(f"Market match: article {news_id} -> {decision['decision']} "
+                     f"(server: {res.get('status')})")
+            processed += 1
+        except Exception as e:
+            log.error(f"Market match: article {news_id} failed: {e}", exc_info=True)
+            continue
+    log.info(f"Market match: processed {processed} article(s)")
+
+
+def _preattach_market_id(headline: str, tags, source: str, url: str,
+                         open_markets: list) -> int | None:
+    """Return an open market id to pre-attach to a brand-new post, or None.
+
+    Used by Phase 3 (the post path) when ENABLE_MARKET_MATCH is on. Attach-or-skip
+    only; proposals require the queue/approval flow, and an existing article.
+    Never raises (a matching failure must never block a post)."""
+    if not open_markets:
+        return None
+    article = {"headline": headline, "tags": tags, "source": source, "url": url}
+    try:
+        decision = match_market_for_article(article, open_markets, ["attach", "skip"])
+    except Exception as e:
+        log.warning(f"pre-attach market match failed: {e}")
+        return None
+    if decision.get("decision") == "attach":
+        return decision.get("market_id")
+    return None
+
+
 def batch_evaluate_articles(articles: list[dict]) -> dict[int, int]:
     """Batch-evaluate multiple articles in one LLM call. Returns {article_id: vote}.
     Saves ~N-1 LLM calls compared to evaluating each article individually.
@@ -1431,7 +2045,7 @@ def batch_evaluate_articles(articles: list[dict]) -> dict[int, int]:
         batch_text=batch_text)
 
     # Sonnet + low effort + no tools + no soul — batch classification
-    response = llm_ask(prompt, timeout=180, tier="classification", skip_soul=True, tools="")
+    response = llm_ask(prompt, timeout=300, tier="classification", skip_soul=True, tools="")
     if not response or not response.strip():
         log.warning("Batch article vote returned empty — falling back to individual")
         return {}
@@ -1475,7 +2089,7 @@ def batch_evaluate_comments(comments: list[dict]) -> dict[int, int]:
     prompt = load_prompt("agent/batch_evaluate_comments",
         batch_text=batch_text)
 
-    response = llm_ask(prompt, timeout=180, tier="classification", skip_soul=True, tools="")
+    response = llm_ask(prompt, timeout=300, tier="classification", skip_soul=True, tools="")
     if not response or not response.strip():
         log.warning("Batch comment vote returned empty — falling back to individual")
         return {}
@@ -1538,6 +2152,7 @@ def craft_comment(headline: str, tags: list[str], article_url: str = "") -> str:
     safe_url = validate_url(article_url) if article_url else ""
     url_line = f"\nARTICLE URL: {safe_url}" if safe_url else ""
     prompt = load_prompt("agent/craft_comment",
+        no_slop=NO_AI_SLOP,
         safe_headline=safe_headline, tags_str=tags_str, url_line=url_line)
 
     result = claude_ask(prompt)
@@ -1698,6 +2313,62 @@ async def fetch_channel_messages(
 LNN_HEADLINE_BOT_ID = int(os.environ.get("HEADLINE_BOT_USER_ID", "0"))
 
 
+def _provenance_dedup_check(url: str, hint: str, recent_hours: int = 168) -> str:
+    """Stage-1 dedup via LN's provenance API. Returns "reject", "proceed", or
+    "fallback" (= run the classify-tier HQ dup check exactly as before).
+
+    TRUST BOUNDARY: only POSITIVE matches are trusted. Live validation
+    (2026-07-02) showed the index returns 'new' for our own approved articles
+    (exact URL + exact headline of #267269, approved 10h earlier, 0 matches;
+    /provenance/search equally blind) while other authors' articles match fine
+    — so absence-of-match is NOT evidence of newness and must still pay for
+    the classify-tier HQ check. Reported upstream; revisit if the index gap is fixed.
+
+    Verdict mapping:
+      duplicate            -> reject (>=2 fresh matches — real, trusted)
+      known + recent match -> reject (it exists on LN within our dedup window)
+      known + old match    -> proceed (real match, outside window; freshness gates it)
+      new / stale          -> fallback (index misses proven — run the HQ check)
+      anything else        -> fallback (API error, non-200, weird body)
+    """
+    if not ENABLE_PROVENANCE_DEDUP:
+        return "fallback"
+    payload = {}
+    if url:
+        payload["url"] = url
+    if hint:
+        payload["text"] = hint[:300]
+    if not payload:
+        return "fallback"
+    try:
+        resp = requests.post(PROVENANCE_CHECK_URL, json=payload, timeout=15)
+        if resp.status_code != 200:
+            log.warning(f"Provenance check HTTP {resp.status_code} — falling back to HQ LLM dedup")
+            return "fallback"
+        data = resp.json()
+    except Exception as e:
+        log.warning(f"Provenance check failed ({type(e).__name__}: {e}) — falling back to HQ LLM dedup")
+        return "fallback"
+    if not isinstance(data, dict):
+        return "fallback"
+    verdict = str(data.get("verdict", "")).lower()
+    if verdict == "duplicate":
+        return "reject"
+    if verdict in ("new", "stale"):
+        return "fallback"  # absence-of-match untrusted — see docstring
+    if verdict == "known":
+        latest = data.get("latest_seen")
+        try:
+            seen_at = datetime.fromisoformat(str(latest).replace("Z", "+00:00"))
+            age_h = (datetime.now(timezone.utc) - seen_at).total_seconds() / 3600
+            return "reject" if age_h <= recent_hours else "proceed"
+        except (ValueError, TypeError):
+            # Known match but unusable recency — conservative reject, matching
+            # the fail-closed posture of the dup pipeline.
+            return "reject"
+    return "fallback"
+
+
 def fetch_bot_hq_recent_headlines(limit: int = 80, hours: int = 6) -> list[str] | None:
     """Fetch recent headline-bot posts from Leviathan News Bot HQ.
 
@@ -1777,6 +2448,340 @@ def fetch_bot_hq_recent_headlines(limit: int = 80, hours: int = 6) -> list[str] 
 
 # ─── Main Agent Loop ────────────────────────────────────────────────────────
 
+# ─── Live-news WS plumbing ───────────────────────────────────────────────────
+# _ws_wake: set by the listener when NEW events land (or on reconcile) so the
+# run_loop sleep can cut short and run a mini-pass. _ws_gap: the queue may be
+# incomplete (reconcile frame, reconnect, process start) — the hourly full
+# cycle is the backfill of record and clears the flag after its feed poll.
+_ws_wake = asyncio.Event()
+_ws_gap = True  # start pessimistic: anything before process start is unseen
+_ws_connected_at = None  # set on WS connect; supervisor uses it for backoff reset
+
+
+def _set_ws_gap() -> None:
+    global _ws_gap
+    _ws_gap = True
+
+
+def _clear_ws_gap() -> None:
+    global _ws_gap
+    _ws_gap = False
+
+
+def ws_gap_set() -> bool:
+    return _ws_gap
+
+
+def _handle_ws_frame(raw: str, db) -> int:
+    """Parse one WS frame and enqueue relevant events. Returns new-event count.
+
+    Never raises on malformed input — the stream is external and must not be
+    able to kill the listener with a weird frame.
+    """
+    try:
+        frame = json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        log.warning("WS: unparseable frame (%.80s)", str(raw))
+        return 0
+    if not isinstance(frame, dict):
+        return 0
+    ftype = frame.get("type")
+    if ftype == "heartbeat":
+        return 0
+    if ftype == "reconcile":
+        log.warning("WS: reconcile frame (%s) — flagging gap for REST backfill",
+                    frame.get("reason"))
+        _set_ws_gap()
+        _ws_wake.set()
+        return 0
+    events = frame.get("events")
+    if not isinstance(events, list):
+        return 0
+    new = 0
+    for evt in events:
+        if not isinstance(evt, dict):
+            continue
+        etype = evt.get("type")
+        nid = evt.get("id")
+        if etype not in WS_EVENT_TYPES or not isinstance(nid, int):
+            continue
+        try:
+            raw_json = json.dumps(evt)[:2000]
+        except (TypeError, ValueError):
+            raw_json = None
+        if db.add_ws_event(etype, nid, evt.get("slug"), evt.get("headline"),
+                           evt.get("date_posted"), evt.get("origin"), raw_json):
+            new += 1
+            log.info(f"WS: queued {etype} #{nid}: {str(evt.get('headline'))[:80]}")
+    if new:
+        _ws_wake.set()
+    return new
+
+
+async def _ws_listen_once() -> None:
+    """One connection lifetime: connect, stream frames into the queue.
+
+    Raises on any disconnect/error — the supervisor owns retry policy.
+    `websockets` is imported lazily so ln-agent still runs (poll-only mode)
+    when the dependency is missing.
+    """
+    import websockets  # lazy: optional dependency
+
+    global _ws_connected_at
+    db = AgentDB()
+    try:
+        async with websockets.connect(
+            WS_NEWS_URL,
+            origin=WS_NEWS_ORIGIN,
+            open_timeout=15,
+            close_timeout=5,
+            max_size=2 ** 20,
+            # Sole liveness mechanism — see the WS_PING_* comment at the knobs.
+            ping_interval=WS_PING_INTERVAL,
+            ping_timeout=WS_PING_TIMEOUT,
+        ) as ws:
+            log.info(f"WS: connected to {WS_NEWS_URL}")
+            _ws_connected_at = time.time()
+            # No recv timeout: a quiet connection is healthy as long as pongs
+            # flow. Server close ends the iterator cleanly; a dead transport
+            # raises ConnectionClosed. Either way the supervisor reconnects.
+            async for raw in ws:
+                _handle_ws_frame(raw, db)
+    finally:
+        db.close()
+
+
+async def _ws_listener_supervisor() -> None:
+    """Keep the listener alive forever with exponential backoff + jitter.
+
+    Runs as a background task in run_loop, OUTSIDE the cycle watchdog. Close
+    code 4003 (server capacity) starts backoff at the cap per the WS docs.
+    """
+    global _ws_connected_at
+    backoff = WS_BACKOFF_BASE
+    while True:
+        try:
+            await _ws_listen_once()
+            backoff = WS_BACKOFF_BASE  # clean exit — reset
+            log.info("WS: server closed the connection cleanly — reconnecting")
+        except asyncio.CancelledError:
+            raise
+        except ImportError as e:
+            log.error(f"WS: websockets library unavailable ({e}) — "
+                      f"listener disabled, agent continues in poll-only mode")
+            return
+        except Exception as e:
+            lived = (time.time() - _ws_connected_at) if _ws_connected_at else 0.0
+            _ws_connected_at = None
+            code = getattr(e, "code", None) or getattr(
+                getattr(e, "rcvd", None), "code", None)
+            if code == 4003:
+                backoff = WS_BACKOFF_CAP  # server says capacity — go away longest
+            elif lived >= WS_STABLE_SECONDS:
+                backoff = WS_BACKOFF_BASE  # stream was working — don't ratchet
+            log.warning(f"WS: connection lost after {lived:.0f}s "
+                        f"({type(e).__name__}: {e}) — reconnecting in ~{backoff}s")
+        _set_ws_gap()  # whatever happened, we may have missed events
+        await asyncio.sleep(backoff + random.uniform(0, backoff / 4))
+        backoff = min(backoff * 2, WS_BACKOFF_CAP)
+
+
+async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
+    """Vote + comment + yap-vote + reply-walk over a supplied article list.
+
+    This is the former run_agent Phase 4 body, extracted so the WS mini-pass
+    can run the identical pipeline on queued articles between full cycles.
+    since=None disables the recency filter (mini-pass case — the caller has
+    already selected the articles; DB dedup tables make repeats idempotent).
+    Returns (voted, commented, processed_article_ids).
+    """
+    voted = 0
+    commented = 0
+    phase4_processed = set()
+    # ── Batch pre-evaluation: collect unvoted articles/yap-articles ──
+    # Evaluate all in one LLM call instead of N individual calls
+    articles_to_vote = []
+    for a in articles:
+        aid = a["id"]
+        h = a.get("headline", "")
+        ct = a.get("content_type", "news")
+        created = a.get("created_at") or a.get("posted_at", "")
+        if created:
+            try:
+                at = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                if since is not None and at < since:
+                    continue
+            except (ValueError, TypeError):
+                pass
+        author = a.get("author", {}) or a.get("submitted_by", {}) or {}
+        author_name = (author.get("username") or author.get("display_name") or "").lower()
+        if author_name in AUTO_DOWNVOTE_USERS:
+            continue  # blacklisted — hardcoded -1, no LLM needed
+        if author_name in AUTO_UPVOTE_USERS:
+            continue  # whitelisted — hardcoded +1, no LLM needed
+        if ct == "yap":
+            if not db.was_yap_voted(aid):
+                articles_to_vote.append({"id": aid, "headline": h,
+                    "tags": [], "type": "yap"})
+        elif not db.was_article_voted(aid):
+            tags = [t.get("name", "") for t in a.get("tags", [])]
+            articles_to_vote.append({"id": aid, "headline": h,
+                "tags": tags, "type": "article"})
+
+    # Split by type and batch-evaluate
+    news_to_vote = [a for a in articles_to_vote if a["type"] == "article"]
+    yaps_to_vote = [a for a in articles_to_vote if a["type"] == "yap"]
+    cached_article_votes = batch_evaluate_articles(news_to_vote) if news_to_vote else {}
+    cached_yap_votes = batch_evaluate_comments(
+        [{"id": y["id"], "text": y["headline"], "headline": ""} for y in yaps_to_vote]
+    ) if yaps_to_vote else {}
+    log.info(f"Batch pre-evaluation: {len(cached_article_votes)} articles, "
+             f"{len(cached_yap_votes)} yaps evaluated in 2 calls")
+
+    for article in articles:
+        article_id = article["id"]
+        headline = article.get("headline", "")
+        tags = [t.get("name", "") for t in article.get("tags", [])]
+
+        # Only process articles posted since last run
+        created = article.get("created_at") or article.get("posted_at", "")
+        if created:
+            try:
+                article_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                if since is not None and article_time < since:
+                    continue
+            except (ValueError, TypeError):
+                pass
+
+        # Check if author is in auto-downvote blacklist
+        author = article.get("author", {}) or article.get("submitted_by", {}) or {}
+        author_name = (author.get("username") or author.get("display_name") or "").lower()
+        is_blacklisted = author_name in AUTO_DOWNVOTE_USERS
+        is_whitelisted = author_name in AUTO_UPVOTE_USERS
+
+        # Route votes to the correct table based on content type
+        content_type = article.get("content_type", "news")
+
+        if content_type == "yap":
+            if not db.was_yap_voted(article_id):
+                if is_blacklisted:
+                    yap_vote = -1
+                elif is_whitelisted:
+                    yap_vote = 1
+                else:
+                    # Use batch result, fall back to individual call
+                    yap_vote = cached_yap_votes.get(article_id)
+                    if yap_vote is None:
+                        yap_text = article.get("headline") or article.get("text", "")
+                        yap_vote = evaluate_comment_quality(yap_text, "")
+                if yap_vote != 0:
+                    ln.vote(article_id, weight=yap_vote, label="yap")
+                    db.save_yap_vote(article_id, 0, yap_vote, is_own=False)
+                    voted += 1
+                await asyncio.sleep(1)
+            continue
+
+        # It's a news article
+        if not db.was_article_voted(article_id):
+            if is_blacklisted:
+                vote_weight = -1
+            elif is_whitelisted:
+                vote_weight = 1
+            else:
+                # Use batch result, fall back to individual call
+                vote_weight = cached_article_votes.get(article_id)
+                if vote_weight is None:
+                    vote_weight = evaluate_article_quality(headline, tags)
+            if vote_weight != 0:
+                ln.vote(article_id, weight=vote_weight)
+                db.save_article_vote(article_id, vote_weight)
+                voted += 1
+            await asyncio.sleep(1)
+
+        # Comment (check DB first, then LN API as fallback)
+        if not db.was_commented(article_id):
+            if ln.has_our_comment(article_id):
+                log.info(f"Already commented on {article_id} (found on LN)")
+                db.save_comment(article_id, "[existing]")
+            else:
+                article_url = article.get("url", "")
+                comment = craft_comment(headline, tags, article_url)
+                if comment and len(comment) > 20:
+                    ln.post_yap(article_id, comment, ["analysis"])
+                    db.save_comment(article_id, comment)
+                    commented += 1
+            await asyncio.sleep(2)
+
+        # Fetch yaps once for both voting and reply detection.
+        # Collect unvoted non-own non-blacklisted yaps for batch evaluation.
+        try:
+            yaps = ln.get_yaps(article_id)
+            # Immediate votes: own yaps and blacklisted authors (no LLM needed)
+            yaps_to_batch = []
+            for yap in yaps:
+                yap_id = yap.get("id")
+                if not yap_id or db.was_yap_voted(yap_id):
+                    continue
+                author = yap.get("author", {}) or {}
+                is_ours = author.get("id") == ln.user_id
+                if is_ours:
+                    ln.vote(yap_id, weight=1, label="own yap")
+                    db.save_yap_vote(yap_id, article_id, 1, is_own=True)
+                    await asyncio.sleep(1)
+                else:
+                    yap_author = (author.get("username") or author.get("display_name") or "").lower()
+                    if yap_author in AUTO_DOWNVOTE_USERS:
+                        ln.vote(yap_id, weight=-1, label="yap")
+                        db.save_yap_vote(yap_id, article_id, -1, is_own=False)
+                        await asyncio.sleep(1)
+                    elif yap_author in AUTO_UPVOTE_USERS:
+                        ln.vote(yap_id, weight=1, label="yap")
+                        db.save_yap_vote(yap_id, article_id, 1, is_own=False)
+                        await asyncio.sleep(1)
+                    else:
+                        yaps_to_batch.append({
+                            "id": yap_id,
+                            "text": yap.get("text", ""),
+                            "headline": headline,
+                            "article_id": article_id,
+                        })
+            # Batch-evaluate collected yaps in one call instead of N
+            if yaps_to_batch:
+                batch_yap_votes = batch_evaluate_comments(yaps_to_batch)
+                for yb in yaps_to_batch:
+                    yap_vote = batch_yap_votes.get(yb["id"])
+                    if yap_vote is None:
+                        # Fallback to individual call if batch missed it
+                        yap_vote = evaluate_comment_quality(yb["text"], headline)
+                    if yap_vote != 0:
+                        ln.vote(yb["id"], weight=yap_vote, label="yap")
+                        db.save_yap_vote(yb["id"], yb["article_id"], yap_vote, is_own=False)
+                    await asyncio.sleep(1)
+        except Exception as e:
+            log.warning(f"Comment voting failed on {article_id}: {e}")
+
+        # Reply to responses on our own comments (reuse yaps from above)
+        try:
+            our_yap_ids = set()
+            our_yap_texts = {}
+            for yap in yaps:
+                author = yap.get("author", {}) or {}
+                if author.get("id") == ln.user_id:
+                    our_yap_ids.add(yap["id"])
+                    our_yap_texts[yap["id"]] = yap.get("text", "")
+
+            walk_replies_and_respond(yaps, our_yap_ids, our_yap_texts,
+                                    headline, article_id, db, ln)
+            await asyncio.sleep(2)
+        except Exception as e:
+            log.warning(f"Reply phase failed on {article_id}: {e}")
+
+        # Track that Phase 4 already processed this article's replies
+        phase4_processed.add(article_id)
+
+    return voted, commented, phase4_processed
+
+
 async def run_agent():
     # Reset transient failure counts on every provider at cycle start so a
     # previous cycle's hiccup doesn't keep a provider sidelined indefinitely.
@@ -1790,6 +2795,12 @@ async def run_agent():
     client = None
     now = datetime.now(timezone.utc)
     run_id = db.start_run()
+    try:
+        pruned = db.prune_ws_events(days=7)
+        if pruned:
+            log.info(f"Pruned {pruned} old ws_events rows")
+    except Exception:
+        pass  # table create races / legacy DBs must not kill the cycle
     all_messages = []
     relevant = []
     posted_count = 0
@@ -1808,7 +2819,7 @@ async def run_agent():
         # ─── Phase 1: Read Telegram channels ─────────────────────────────────
 
         client = TelegramClient(TELEGRAM_SESSION, api_id, api_hash)
-        await client.start()
+        await asyncio.wait_for(client.start(), timeout=CONNECT_TIMEOUT)
         log.info("Telegram connected")
 
         # One-time migration: detect group vs channel for all cached entries
@@ -1897,13 +2908,31 @@ async def run_agent():
         # dup check (below) is more reliable than asking Sonnet-with-tools to search
         # Telegram itself — the latter skipped searches under load and let semantic
         # duplicates through.
-        hq_dedup_hours = 6
-        hq_fetch = fetch_bot_hq_recent_headlines(limit=80, hours=hq_dedup_hours)
-        if hq_fetch is None:
-            # Fetch failed — distinct from "HQ quiet". Log loudly so monitors can alert.
+        # 7-day window catches stories re-posted days later (the 6h cap missed
+        # these). Env override exists for tuning without redeploy. Fetch limit
+        # raised in step so the time window is the binding constraint, not the
+        # message count. `_env_int` falls back on parse failure so a malformed
+        # env value doesn't kill every cycle.
+        hq_dedup_hours = _env_int("HQ_DEDUP_HOURS", 168)
+        hq_fetch_limit = _env_int("HQ_DEDUP_FETCH_LIMIT", 300)
+        # Retry before giving up — Bot HQ is the ground-truth dedup source, so a
+        # transient Telethon/timeout/parse error must not silently disable it.
+        hq_fetch = None
+        for _hq_attempt in range(3):
+            hq_fetch = fetch_bot_hq_recent_headlines(limit=hq_fetch_limit, hours=hq_dedup_hours)
+            if hq_fetch is not None:
+                break
+            if _hq_attempt < 2:
+                await asyncio.sleep(2 * (2 ** _hq_attempt))  # 2s, 4s backoff
+        hq_fetch_failed = hq_fetch is None
+        if hq_fetch_failed:
+            # FAIL CLOSED: without ground truth we can't dedup, so HOLD all posting
+            # this cycle rather than risk duplicates (the LLM dup-check also fails
+            # closed). Candidates are re-evaluated next cycle once Bot HQ is reachable.
+            # Previously this failed OPEN (empty list -> every candidate posted) — PR #1 finding.
             hq_recent_headlines: list[str] = []
-            log.warning(f"Bot HQ fetch FAILED — dedup will fail open for this cycle "
-                        f"(last {hq_dedup_hours}h window)")
+            log.warning(f"Bot HQ fetch FAILED after 3 attempts — HOLDING all posts this cycle "
+                        f"to avoid duplicates (last {hq_dedup_hours}h window)")
         else:
             hq_recent_headlines = hq_fetch
             log.info(f"Bot HQ dedup context: {len(hq_recent_headlines)} recent headlines "
@@ -1920,6 +2949,16 @@ async def run_agent():
                 log.info(f"Already posted by us (DB): {url}")
                 return False
 
+            # Source-trust gate: reject content farms / SEO aggregators before
+            # spending any LLM tokens. The eval prompt should already filter
+            # these but the model occasionally lets one through (the zine.live
+            # Wilder-World incident on 2026-05-17 was the trigger for this).
+            if is_blocked_source(url):
+                log.info(f"Rejected blocked source: {url}")
+                db.save_posted(url=url, headline="[blocked source]", story_hint=hint,
+                               source_channel=item.get("channel"))
+                return False
+
             # Self-dedup: check if we already posted the same story from a different source.
             # Uses word overlap on story_hint AND headline against last 24h of our posts.
             # Catches "Bhutan Bitcoin" from DL News when we already posted it from Coindesk.
@@ -1928,13 +2967,25 @@ async def run_agent():
                                source_channel=item.get("channel"))
                 return False
 
-            # Bot HQ dup check — Sonnet classifies the candidate against a deterministic
-            # list of recent HQ headlines fetched up front. No Telegram tool access: the
-            # search is already done, we just need the semantic "same event?" judgment.
-            # Headlines and hint are wrapped with sanitize_untrusted for injection defense
-            # (headlines are bot-generated but pass through untrusted user submissions).
+            # Provenance dedup (stage 1, zero tokens) — LN's own /provenance/check.
+            # duplicate / recently-known -> reject here; new / stale / old-known ->
+            # proceed and SKIP the classify-tier HQ prompt below. "fallback" (API error,
+            # kill-switch off, unexpected body) -> the classify-tier HQ path runs unchanged.
+            prov = _provenance_dedup_check(url, hint, recent_hours=hq_dedup_hours)
+            if prov == "reject":
+                log.info(f"Provenance dup check rejected: {hint or url}")
+                db.save_posted(url=url, headline="[duplicate: provenance]", story_hint=hint,
+                               source_channel=item.get("channel"))
+                return False
+
+            # Bot HQ dup check (fallback path) — the classify tier judges the candidate
+            # against recent HQ headlines fetched up front. Only runs when the
+            # provenance API was inconclusive. Headlines and hint are wrapped with
+            # sanitize_untrusted for injection defense.
             safe_hint = sanitize_untrusted(hint, max_len=200) if hint else ""
-            if not hq_recent_headlines:
+            if prov == "proceed":
+                log.info(f"Provenance cleared candidate — skipping HQ LLM dup check: {url}")
+            elif not hq_recent_headlines:
                 log.warning(f"Bot HQ dedup context empty — proceeding without HQ check: {url}")
             elif not safe_hint:
                 # Upstream evaluator didn't produce a headline_hint. HQ dedup relies on
@@ -1990,6 +3041,13 @@ async def run_agent():
                 if db.was_url_posted(resolved_url):
                     log.info(f"Already posted by us (resolved URL in DB): {resolved_url}")
                     return False
+                # Re-check the blocklist against the resolved canonical URL —
+                # a shortlink could redirect into a content farm we never saw.
+                if is_blocked_source(resolved_url):
+                    log.info(f"Rejected blocked source after resolve: {resolved_url}")
+                    db.save_posted(url=resolved_url, headline="[blocked source]",
+                                   story_hint=hint, source_channel=item.get("channel"))
+                    return False
                 url = resolved_url
                 item["url"] = url
 
@@ -1997,9 +3055,15 @@ async def run_agent():
                 log.warning(f"No valid headline for {url} — skipping")
                 return False
 
-            # Submit via LN API
+            # Submit via LN API. Pre-attach an open market when one strongly fits
+            # (flag-gated; attach-or-skip; never blocks the post on a failure).
             from_tsunami = item.get("channel") == "@LeviathanTsunami"
-            result = ln.submit_article(url, headline)
+            market_id = None
+            if ENABLE_MARKET_MATCH and preattach_markets:
+                market_id = _preattach_market_id(
+                    headline, item.get("tags") or [], item.get("source", ""),
+                    url, preattach_markets)
+            result = ln.submit_article(url, headline, market_id=market_id)
             if not result:
                 return False
 
@@ -2031,8 +3095,18 @@ async def run_agent():
 
             return True
 
+        # Fetch open-market candidates once, for Phase 3 pre-attach (flag-gated).
+        # Bind to [] at minimum BEFORE the gather, so the closure in
+        # process_article_sync always resolves preattach_markets.
+        preattach_markets = []
+        if ENABLE_MARKET_MATCH and relevant:
+            try:
+                preattach_markets = ln.get_open_markets()
+            except Exception as e:
+                log.warning(f"pre-attach: open-market fetch failed: {e}")
+
         # Run all articles in parallel threads
-        if relevant:
+        if relevant and not hq_fetch_failed:
             results = await asyncio.gather(
                 *[asyncio.to_thread(process_article_sync, item) for item in relevant],
                 return_exceptions=True,
@@ -2042,6 +3116,11 @@ async def run_agent():
             if errors:
                 for e in errors:
                     log.error(f"Article processing error: {e}")
+        elif hq_fetch_failed:
+            # Fail closed (see Bot HQ fetch above): hold posting when the dedup
+            # ground truth is unavailable, rather than risk duplicate posts.
+            posted_count = 0
+            log.warning(f"HELD posting of {len(relevant)} candidate(s) — Bot HQ dedup unavailable this cycle")
         else:
             posted_count = 0
         log.info(f"Posted {posted_count} articles")
@@ -2059,189 +3138,14 @@ async def run_agent():
 
         try:
             articles = ln.get_recent_articles(per_page=20)
-
-            # ── Batch pre-evaluation: collect unvoted articles/yap-articles ──
-            # Evaluate all in one LLM call instead of N individual calls
-            articles_to_vote = []
-            for a in articles:
-                aid = a["id"]
-                h = a.get("headline", "")
-                ct = a.get("content_type", "news")
-                created = a.get("created_at") or a.get("posted_at", "")
-                if created:
-                    try:
-                        at = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                        if at < since:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-                author = a.get("author", {}) or a.get("submitted_by", {}) or {}
-                author_name = (author.get("username") or author.get("display_name") or "").lower()
-                if author_name in AUTO_DOWNVOTE_USERS:
-                    continue  # blacklisted — hardcoded -1, no LLM needed
-                if author_name in AUTO_UPVOTE_USERS:
-                    continue  # whitelisted — hardcoded +1, no LLM needed
-                if ct == "yap":
-                    if not db.was_yap_voted(aid):
-                        articles_to_vote.append({"id": aid, "headline": h,
-                            "tags": [], "type": "yap"})
-                elif not db.was_article_voted(aid):
-                    tags = [t.get("name", "") for t in a.get("tags", [])]
-                    articles_to_vote.append({"id": aid, "headline": h,
-                        "tags": tags, "type": "article"})
-
-            # Split by type and batch-evaluate
-            news_to_vote = [a for a in articles_to_vote if a["type"] == "article"]
-            yaps_to_vote = [a for a in articles_to_vote if a["type"] == "yap"]
-            cached_article_votes = batch_evaluate_articles(news_to_vote) if news_to_vote else {}
-            cached_yap_votes = batch_evaluate_comments(
-                [{"id": y["id"], "text": y["headline"], "headline": ""} for y in yaps_to_vote]
-            ) if yaps_to_vote else {}
-            log.info(f"Batch pre-evaluation: {len(cached_article_votes)} articles, "
-                     f"{len(cached_yap_votes)} yaps evaluated in 2 calls")
-
-            for article in articles:
-                article_id = article["id"]
-                headline = article.get("headline", "")
-                tags = [t.get("name", "") for t in article.get("tags", [])]
-
-                # Only process articles posted since last run
-                created = article.get("created_at") or article.get("posted_at", "")
-                if created:
-                    try:
-                        article_time = datetime.fromisoformat(created.replace("Z", "+00:00"))
-                        if article_time < since:
-                            continue
-                    except (ValueError, TypeError):
-                        pass
-
-                # Check if author is in auto-downvote blacklist
-                author = article.get("author", {}) or article.get("submitted_by", {}) or {}
-                author_name = (author.get("username") or author.get("display_name") or "").lower()
-                is_blacklisted = author_name in AUTO_DOWNVOTE_USERS
-                is_whitelisted = author_name in AUTO_UPVOTE_USERS
-
-                # Route votes to the correct table based on content type
-                content_type = article.get("content_type", "news")
-
-                if content_type == "yap":
-                    if not db.was_yap_voted(article_id):
-                        if is_blacklisted:
-                            yap_vote = -1
-                        elif is_whitelisted:
-                            yap_vote = 1
-                        else:
-                            # Use batch result, fall back to individual call
-                            yap_vote = cached_yap_votes.get(article_id)
-                            if yap_vote is None:
-                                yap_text = article.get("headline") or article.get("text", "")
-                                yap_vote = evaluate_comment_quality(yap_text, "")
-                        if yap_vote != 0:
-                            ln.vote(article_id, weight=yap_vote, label="yap")
-                            db.save_yap_vote(article_id, 0, yap_vote, is_own=False)
-                            voted += 1
-                        await asyncio.sleep(1)
-                    continue
-
-                # It's a news article
-                if not db.was_article_voted(article_id):
-                    if is_blacklisted:
-                        vote_weight = -1
-                    elif is_whitelisted:
-                        vote_weight = 1
-                    else:
-                        # Use batch result, fall back to individual call
-                        vote_weight = cached_article_votes.get(article_id)
-                        if vote_weight is None:
-                            vote_weight = evaluate_article_quality(headline, tags)
-                    if vote_weight != 0:
-                        ln.vote(article_id, weight=vote_weight)
-                        db.save_article_vote(article_id, vote_weight)
-                        voted += 1
-                    await asyncio.sleep(1)
-
-                # Comment (check DB first, then LN API as fallback)
-                if not db.was_commented(article_id):
-                    if ln.has_our_comment(article_id):
-                        log.info(f"Already commented on {article_id} (found on LN)")
-                        db.save_comment(article_id, "[existing]")
-                    else:
-                        article_url = article.get("url", "")
-                        comment = craft_comment(headline, tags, article_url)
-                        if comment and len(comment) > 20:
-                            ln.post_yap(article_id, comment, ["analysis"])
-                            db.save_comment(article_id, comment)
-                            commented += 1
-                    await asyncio.sleep(2)
-
-                # Fetch yaps once for both voting and reply detection.
-                # Collect unvoted non-own non-blacklisted yaps for batch evaluation.
-                try:
-                    yaps = ln.get_yaps(article_id)
-                    # Immediate votes: own yaps and blacklisted authors (no LLM needed)
-                    yaps_to_batch = []
-                    for yap in yaps:
-                        yap_id = yap.get("id")
-                        if not yap_id or db.was_yap_voted(yap_id):
-                            continue
-                        author = yap.get("author", {}) or {}
-                        is_ours = author.get("id") == ln.user_id
-                        if is_ours:
-                            ln.vote(yap_id, weight=1, label="own yap")
-                            db.save_yap_vote(yap_id, article_id, 1, is_own=True)
-                            await asyncio.sleep(1)
-                        else:
-                            yap_author = (author.get("username") or author.get("display_name") or "").lower()
-                            if yap_author in AUTO_DOWNVOTE_USERS:
-                                ln.vote(yap_id, weight=-1, label="yap")
-                                db.save_yap_vote(yap_id, article_id, -1, is_own=False)
-                                await asyncio.sleep(1)
-                            elif yap_author in AUTO_UPVOTE_USERS:
-                                ln.vote(yap_id, weight=1, label="yap")
-                                db.save_yap_vote(yap_id, article_id, 1, is_own=False)
-                                await asyncio.sleep(1)
-                            else:
-                                yaps_to_batch.append({
-                                    "id": yap_id,
-                                    "text": yap.get("text", ""),
-                                    "headline": headline,
-                                    "article_id": article_id,
-                                })
-                    # Batch-evaluate collected yaps in one call instead of N
-                    if yaps_to_batch:
-                        batch_yap_votes = batch_evaluate_comments(yaps_to_batch)
-                        for yb in yaps_to_batch:
-                            yap_vote = batch_yap_votes.get(yb["id"])
-                            if yap_vote is None:
-                                # Fallback to individual call if batch missed it
-                                yap_vote = evaluate_comment_quality(yb["text"], headline)
-                            if yap_vote != 0:
-                                ln.vote(yb["id"], weight=yap_vote, label="yap")
-                                db.save_yap_vote(yb["id"], yb["article_id"], yap_vote, is_own=False)
-                            await asyncio.sleep(1)
-                except Exception as e:
-                    log.warning(f"Comment voting failed on {article_id}: {e}")
-
-                # Reply to responses on our own comments (reuse yaps from above)
-                try:
-                    our_yap_ids = set()
-                    our_yap_texts = {}
-                    for yap in yaps:
-                        author = yap.get("author", {}) or {}
-                        if author.get("id") == ln.user_id:
-                            our_yap_ids.add(yap["id"])
-                            our_yap_texts[yap["id"]] = yap.get("text", "")
-
-                    walk_replies_and_respond(yaps, our_yap_ids, our_yap_texts,
-                                            headline, article_id, db, ln)
-                    await asyncio.sleep(2)
-                except Exception as e:
-                    log.warning(f"Reply phase failed on {article_id}: {e}")
-
-                # Track that Phase 4 already processed this article's replies
-                phase4_processed.add(article_id)
-
+            voted, commented, phase4_processed = await vote_comment_pass(
+                ln, db, articles, since)
             log.info(f"Voted on {voted}, commented on {commented} articles")
+
+            # Full pass just covered the recent window — retire the WS queue.
+            stale = db.get_unconsumed_ws_events("agent", limit=1000)
+            db.mark_ws_events_consumed("agent", [e["id"] for e in stale])
+            _clear_ws_gap()
 
         except Exception as e:
             log.error(f"Vote/comment phase failed: {e}")
@@ -2297,6 +3201,15 @@ async def run_agent():
         except Exception as e:
             log.error(f"Reply detection phase failed: {e}")
 
+        # ─── Phase 6: Market matching (flag-gated) ───────────────────────────
+        # Sweep the needs_market queue; attach/propose/skip a market per
+        # approved article. Isolated, so a failure never wedges the cycle.
+        if ENABLE_MARKET_MATCH:
+            try:
+                run_market_match_phase(ln, db)
+            except Exception as e:
+                log.error(f"Market match phase failed: {e}", exc_info=True)
+
     finally:
         # Guaranteed cleanup regardless of how run_agent exits
         try:
@@ -2311,27 +3224,120 @@ async def run_agent():
             pass
         db.close()
         if client:
-            await client.disconnect()
+            try:
+                await asyncio.wait_for(client.disconnect(), timeout=10)
+            except Exception:
+                pass
     log.info(f"=== Done. Posted: {posted_count} | Voted: {voted} | Commented: {commented} ===\n")
 
 
 CYCLE_INTERVAL = 60 * 60  # 1 hour between cycles
+# 45 min: busy news days were hitting the old 1800s deadline back-to-back
+# (2026-07-02), aborting cycles before Phases 5/6 ran. Still well under the
+# 3600s cycle interval so a hung cycle can never overlap the next one.
+CYCLE_DEADLINE = _env_int("CYCLE_DEADLINE_SECONDS", 2700)
+CONNECT_TIMEOUT = _env_int("CONNECT_TIMEOUT_SECONDS", 60)
+
+
+async def _run_guarded_cycle():
+    """Run one agent cycle bounded by CYCLE_DEADLINE.
+
+    A hung await, such as a stalled Telegram connect, raises TimeoutError instead
+    of freezing the process forever, so the loop self-recovers without relying
+    on PM2 to restart a still-online process.
+    """
+    try:
+        await asyncio.wait_for(run_agent(), timeout=CYCLE_DEADLINE)
+    except asyncio.TimeoutError:
+        log.error(f"Agent cycle exceeded {CYCLE_DEADLINE}s deadline — aborted (likely a hung Telegram/network await). Recovering.")
+    except Exception as e:
+        log.error(f"Agent cycle failed: {e}", exc_info=True)
+
+
+_last_pass_ts = 0.0  # last full cycle OR mini-pass completion (rate-limit anchor)
+
+
+async def run_mini_pass() -> None:
+    """Between-cycle Phase-4 pass over WS-queued articles — strictly bounded.
+
+    Queued ids only, capped at MINI_PASS_MAX_ARTICLES, regardless of the gap
+    flag: gap backfill is the hourly full cycle's job (a gap-widened mini-pass
+    is full-Phase-4-sized work and blew its deadline in production 2026-07-02).
+    Events are marked consumed at drain time, BEFORE the LLM work, so a
+    deadline abort can't leave rows re-draining every pass — dedup tables plus
+    the hourly cycle cover anything an abort skipped.
+    """
+    db = AgentDB()
+    try:
+        events = db.get_unconsumed_ws_events("agent", limit=50)
+        if not events:
+            return
+        db.mark_ws_events_consumed("agent", [e["id"] for e in events])
+        _, _, wallet_key = load_credentials()
+        ln = LNClient(wallet_key)
+        ln.authenticate()
+        articles = ln.get_recent_articles(per_page=20)
+        queued_ids = {e["news_id"] for e in events}
+        targets = [a for a in articles if a.get("id") in queued_ids]
+        targets = targets[:MINI_PASS_MAX_ARTICLES]
+        if targets:
+            voted, commented, _ = await vote_comment_pass(ln, db, targets, since=None)
+            log.info(f"Mini-pass: {len(targets)} queued article(s) — "
+                     f"voted {voted}, commented {commented}")
+    finally:
+        db.close()
+
+
+async def _run_guarded_mini_pass() -> None:
+    """Deadline-bounded mini-pass; failures never propagate to run_loop."""
+    global _last_pass_ts
+    _last_pass_ts = time.time()
+    try:
+        await asyncio.wait_for(run_mini_pass(), timeout=MINI_PASS_DEADLINE)
+    except asyncio.TimeoutError:
+        log.error(f"Mini-pass exceeded {MINI_PASS_DEADLINE}s deadline — aborted.")
+    except Exception as e:
+        log.error(f"Mini-pass failed: {e}", exc_info=True)
 
 
 async def run_loop():
-    """Run the agent in a continuous loop instead of relying on PM2 cron.
-    This prevents cron from killing long-running cycles mid-work."""
-    while True:
-        cycle_start = time.time()
-        try:
-            await run_agent()
-        except Exception as e:
-            log.error(f"Agent cycle failed: {e}", exc_info=True)
+    """Continuous loop: full cycle every CYCLE_INTERVAL, with WS-triggered
+    mini-passes in between. The WS listener runs as a background task OUTSIDE
+    the cycle watchdog so a hung cycle never kills the stream."""
+    global _last_pass_ts
+    listener = None
+    if ENABLE_WS_EVENTS:
+        listener = asyncio.create_task(_ws_listener_supervisor())
+        log.info("WS: listener task started")
+    try:
+        while True:
+            cycle_start = time.time()
+            await _run_guarded_cycle()
+            _last_pass_ts = time.time()
 
-        # Always sleep CYCLE_INTERVAL (1 hour) after finishing a cycle, regardless of how long it took
-        elapsed = time.time() - cycle_start
-        log.info(f"Cycle took {elapsed:.0f}s. Sleeping {CYCLE_INTERVAL}s before next cycle.")
-        await asyncio.sleep(CYCLE_INTERVAL)
+            elapsed = time.time() - cycle_start
+            log.info(f"Cycle took {elapsed:.0f}s. Next full cycle in {CYCLE_INTERVAL}s "
+                     f"(WS mini-passes {'enabled' if ENABLE_WS_MINI_PASS else 'disabled'}).")
+            next_cycle_at = time.time() + CYCLE_INTERVAL
+
+            while (remaining := next_cycle_at - time.time()) > 0:
+                if not ENABLE_WS_MINI_PASS:
+                    await asyncio.sleep(remaining)
+                    break
+                # Rate limit first: sleep until a mini-pass would be allowed.
+                allowed_in = (_last_pass_ts + MINI_PASS_MIN_INTERVAL) - time.time()
+                if allowed_in > 0:
+                    await asyncio.sleep(min(allowed_in, remaining))
+                    continue
+                try:
+                    await asyncio.wait_for(_ws_wake.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    break  # full-cycle time
+                _ws_wake.clear()
+                await _run_guarded_mini_pass()
+    finally:
+        if listener:
+            listener.cancel()
 
 
 if __name__ == "__main__":

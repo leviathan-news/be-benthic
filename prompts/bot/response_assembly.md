@@ -1,5 +1,7 @@
 {soul_block}{identity}
 
+{no_slop}
+
 {security_block}
 {topic_label}
 YOUR RECENT ACTIVITY ON LEVIATHAN NEWS:

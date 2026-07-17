@@ -37,7 +37,7 @@ mkdir -p "$TMPDIR/claude"
 echo "ghp_mock_token_for_testing" > "$TMPDIR/claude/.github-token"
 
 # Mock allowlist with one repo
-echo "test-org/test-repo" > "$TMPDIR/claude/.github-repos-allowlist"
+echo "leviathan-news/be-benthic" > "$TMPDIR/claude/.github-repos-allowlist"
 
 # Override HOME so the script reads our mock files
 export HOME="$TMPDIR"
@@ -95,7 +95,7 @@ echo "=== Allowlist Tests ==="
 reset_state
 
 assert_pass "Operator can create issue on allowlisted repo" \
-    "$CLIENT" --operator issue create test-org/test-repo --title "test" --body "test body"
+    "$CLIENT" --operator issue create leviathan-news/be-benthic --title "test" --body "test body"
 
 assert_fail "Reject issue on non-allowlisted repo" \
     "$CLIENT" --operator issue create random-org/random-repo --title "test" --body "test body"
@@ -108,75 +108,79 @@ echo "=== Subcommand Whitelist Tests ==="
 reset_state
 
 assert_fail "Reject unknown subcommand" \
-    "$CLIENT" --operator clone test-org/test-repo
+    "$CLIENT" --operator clone leviathan-news/be-benthic
 
 assert_fail "Reject unknown issue action" \
-    "$CLIENT" --operator issue delete test-org/test-repo 1
+    "$CLIENT" --operator issue delete leviathan-news/be-benthic 1
 
 assert_fail "Reject unknown pr action" \
-    "$CLIENT" --operator pr merge test-org/test-repo 1
+    "$CLIENT" --operator pr merge leviathan-news/be-benthic 1
 
 echo ""
 echo "=== Flag Whitelist Tests ==="
 reset_state
 
 assert_fail "Reject unknown flag on issue create" \
-    "$CLIENT" --operator issue create test-org/test-repo --title "t" --body "b" --assignee "hacker"
+    "$CLIENT" --operator issue create leviathan-news/be-benthic --title "t" --body "b" --assignee "hacker"
 
 assert_fail "Reject unknown flag on pr create" \
-    "$CLIENT" --operator pr create test-org/test-repo --title "t" --body "b" --head "f" --base "m" --label "bug"
+    "$CLIENT" --operator pr create leviathan-news/be-benthic --title "t" --body "b" --head "f" --base "m" --label "bug"
 
 echo ""
 echo "=== Required Args Tests ==="
 reset_state
 
 assert_fail "issue create requires --title" \
-    "$CLIENT" --operator issue create test-org/test-repo --body "b"
+    "$CLIENT" --operator issue create leviathan-news/be-benthic --body "b"
 
 assert_fail "issue create requires --body" \
-    "$CLIENT" --operator issue create test-org/test-repo --title "t"
+    "$CLIENT" --operator issue create leviathan-news/be-benthic --title "t"
 
 assert_fail "pr create requires --head" \
-    "$CLIENT" --operator pr create test-org/test-repo --title "t" --body "b" --base "main"
+    "$CLIENT" --operator pr create leviathan-news/be-benthic --title "t" --body "b" --base "main"
 
 assert_fail "pr create requires --base" \
-    "$CLIENT" --operator pr create test-org/test-repo --title "t" --body "b" --head "feat"
+    "$CLIENT" --operator pr create leviathan-news/be-benthic --title "t" --body "b" --head "feat"
 
 echo ""
 echo "=== Non-Operator Attribution Tests ==="
 reset_state
 
 assert_pass "Non-operator can create issue with --user" \
-    "$CLIENT" --user testuser issue create test-org/test-repo --title "test" --body "test body"
+    "$CLIENT" --user testuser issue create leviathan-news/be-benthic --title "test" --body "test body"
 
 # Check that the gh call included attribution in the body
 assert_contains "Attribution footer appended to gh call" \
     "$MOCK_GH_LOG" "on behalf of"
 
 assert_fail "Non-operator without --user is rejected" \
-    "$CLIENT" issue create test-org/test-repo --title "test" --body "test body"
+    "$CLIENT" issue create leviathan-news/be-benthic --title "test" --body "test body"
 
 echo ""
 echo "=== Rate Limit Tests ==="
 reset_state
+# Temporarily lower the rate limit for the boundary test (production default is 30)
+export RATE_LIMIT_MAX=3
 
 assert_pass "Non-operator action 1/3" \
-    "$CLIENT" --user ratelimituser issue create test-org/test-repo --title "t1" --body "b1"
+    "$CLIENT" --user ratelimituser issue create leviathan-news/be-benthic --title "t1" --body "b1"
 
 assert_pass "Non-operator action 2/3" \
-    "$CLIENT" --user ratelimituser issue create test-org/test-repo --title "t2" --body "b2"
+    "$CLIENT" --user ratelimituser issue create leviathan-news/be-benthic --title "t2" --body "b2"
 
 assert_pass "Non-operator action 3/3" \
-    "$CLIENT" --user ratelimituser issue create test-org/test-repo --title "t3" --body "b3"
+    "$CLIENT" --user ratelimituser issue create leviathan-news/be-benthic --title "t3" --body "b3"
 
 assert_fail "Non-operator action 4/3 rejected (rate limit)" \
-    "$CLIENT" --user ratelimituser issue create test-org/test-repo --title "t4" --body "b4"
+    "$CLIENT" --user ratelimituser issue create leviathan-news/be-benthic --title "t4" --body "b4"
 
 assert_pass "Operator bypasses rate limit" \
-    "$CLIENT" --operator issue create test-org/test-repo --title "t5" --body "b5"
+    "$CLIENT" --operator issue create leviathan-news/be-benthic --title "t5" --body "b5"
 
 assert_pass "Different user has own limit" \
-    "$CLIENT" --user otheruser issue create test-org/test-repo --title "t6" --body "b6"
+    "$CLIENT" --user otheruser issue create leviathan-news/be-benthic --title "t6" --body "b6"
+
+unset RATE_LIMIT_MAX
 
 echo ""
 echo "=== Allowlist Management Tests ==="
@@ -198,11 +202,30 @@ assert_fail "allowlist add rejects invalid format" \
     "$CLIENT" --operator allowlist add "not-a-valid-repo"
 
 echo ""
+echo "=== Issue Edit Tests (operator-only) ==="
+reset_state
+
+assert_pass "Operator can edit issue body" \
+    "$CLIENT" --operator issue edit leviathan-news/be-benthic 42 --body "updated body"
+
+assert_fail "Non-operator cannot edit issue body (operator-only)" \
+    "$CLIENT" --user someuser issue edit leviathan-news/be-benthic 42 --body "attack body"
+
+assert_fail "Edit on non-allowlisted repo rejected" \
+    "$CLIENT" --operator issue edit forbidden/repo 42 --body "test"
+
+assert_fail "Edit requires --body" \
+    "$CLIENT" --operator issue edit leviathan-news/be-benthic 42
+
+assert_fail "Edit requires valid issue number" \
+    "$CLIENT" --operator issue edit leviathan-news/be-benthic abc --body "test"
+
+echo ""
 echo "=== Operator Flag Tests ==="
 reset_state
 
 assert_pass "Operator issue create skips rate limit and attribution" \
-    "$CLIENT" --operator issue create test-org/test-repo --title "operator test" --body "no footer"
+    "$CLIENT" --operator issue create leviathan-news/be-benthic --title "operator test" --body "no footer"
 
 # Verify no attribution in operator call
 if grep -q "on behalf of" "$MOCK_GH_LOG" 2>/dev/null; then

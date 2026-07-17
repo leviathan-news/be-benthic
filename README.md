@@ -23,6 +23,13 @@ Channels      Deduplicate       LN API        Comment          Responses
                                    └─ TL;DR comment
 ```
 
+Two additions run alongside the classic 5-phase cycle: a flag-gated **Phase 6
+market match** (`ENABLE_MARKET_MATCH`, default off) that attaches/proposes
+prediction markets for approved articles, and a **live-news WebSocket listener**
+(`ENABLE_WS_EVENTS`, default on) that queues `news.approved` events so a
+throttled between-cycle **mini-pass** votes/comments minutes after approval
+instead of up to an hour later.
+
 ## Features
 
 - **Provider-agnostic LLM dispatch** (`providers.py`): Codex / Claude / OpenCode interchangeably. `PROVIDER_ORDER` env picks the primary; the rest are fallbacks. Each provider has its own circuit breaker — failures in one don't penalize the others.
@@ -30,10 +37,15 @@ Channels      Deduplicate       LN API        Comment          Responses
 - **6-layer prompt injection defense**: input sanitization, XML boundary tags, output injection detection, NFKD Unicode normalization, URL validation, independent sentinel verification on replies
 - **Wallet-based auth**: EIP-191 signature flow with thread-safe session management (30-min refresh, RLock)
 - **Headline validation**: 10 automated checks (character count, sentence case, passive voice, articles, etc.) via bundled bash validator
-- **Story deduplication**: three layers — local DB URL check, self-dedup word-overlap against own last-24h posts, deterministic Bot HQ fetch + Sonnet semantic match
+- **Story deduplication**: four layers — local DB URL check, self-dedup word-overlap against own last-24h posts, provenance-API short-circuit (positive matches trusted, absence falls through), deterministic Bot HQ fetch + classification-tier semantic match
 - **Anti-AI-detection**: banned phrase filtering to avoid patterns that get content deprioritized
 - **Cursor-based Telegram pagination**: with numeric ID caching to avoid flood waits
-- **Optional async build daemon** (`benthic-builder.py`): operators queue project briefs; Codex builds + pushes them as public GitHub repos under `BUILD_GITHUB_ORG`. Hard-capped, isolated per-task workdirs.
+- **Evidence-grounded replies** (`reply_grounding.py`): the chat bot composes public replies from typed evidence bundles (focal URLs, bounded research, media observations), verifies every claim against evidence, repairs once, and re-verifies — no failure path may substitute stale context for missing evidence
+- **Runtime-mediated sandbox**: chat models emit a `[SANDBOX]` code block; trusted bot Python intent-gates and executes it in a locked-down Docker container (bounded output, credential-free env), then a tools-disabled pass synthesizes the answer
+- **Breaking-news reactions**: the bot drains the WS event queue and pings the group about genuinely notable stories (hard rate/freshness gates + classification notability gate before any creative call)
+- **News API service** (`benthic_api.py`): FastAPI app exposing the curated feed (`GET /news`) and on-demand article analysis (`POST /analyze`) behind a static bearer token — marketplace-ready
+- **Codex lockdown policy** (`codex-policy/`): permission profiles + execpolicy rules that deny every `~/.claude` secret inside the Codex sandbox while allowlisted wrapper scripts run outside it
+- **Optional async build daemon** (`benthic-builder.py`): operators queue project briefs; a goal-driven loop over `codex app-server` (exec fallback) builds, review-gates, and pushes them as public GitHub repos under `BUILD_GITHUB_ORG`. Hard-capped, isolated per-task workdirs. Operator CLI: `bin/benthic-build`.
 
 ## Current Limitations
 
@@ -49,12 +61,14 @@ Installed via `pip install -r requirements.txt`:
 - [requests](https://requests.readthedocs.io/) — HTTP client
 - [eth-account](https://eth-account.readthedocs.io/) — Ethereum wallet signing
 - [Pillow](https://pillow.readthedocs.io/) — image processing (media analysis in chat bot)
+- [FastAPI](https://fastapi.tiangolo.com/) + [uvicorn](https://www.uvicorn.org/) — news API service
+- [websockets](https://websockets.readthedocs.io/) — live-news WS listener
 
 ### External Runtime Dependencies
 
 You need **at least one** LLM provider. Configure the priority via `PROVIDER_ORDER`:
 
-- **[Codex CLI](https://github.com/openai/codex)** (`codex`) — primary by default. Auto-detected or set `CODEX_BIN`. Default model: `gpt-5.5` at `xhigh` reasoning effort.
+- **[Codex CLI](https://github.com/openai/codex)** (`codex`) — primary by default. Auto-detected or set `CODEX_BIN`. Default model: `gpt-5.6-sol` at `xhigh` reasoning effort.
 - **[Claude CLI](https://docs.anthropic.com/en/docs/claude-code)** (`claude`) — fallback by default. Must be on `$PATH` or set `CLAUDE_BIN`.
 - **[OpenCode CLI](https://opencode.ai/)** (optional) — additional fallback. Set `OPENCODE_BIN` and `OPENCODE_MODEL` to enable.
 - **Telegram API credentials** — `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org)
@@ -109,14 +123,12 @@ See [.env.example](.env.example) for a complete template with `export` lines you
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LN_API` | `https://api.leviathannews.xyz/api/v1` | Leviathan News API base URL |
-| `TELEGRAM_SESSION` | `~/.claude/agent_session.session` | Telethon session file path |
-| `TELEGRAM_CREDS_FILE` | `~/.claude/telegram-creds.json` | Telegram API credentials (JSON with `api_id`, `api_hash`) |
 | `WALLET_PRIVATE_KEY` | — | ETH wallet private key (takes priority over file) |
 | `WALLET_KEY_FILE` | `~/.claude/.ln-wallet-key` | Fallback: read wallet key from this file |
-| `BOT_HQ_GROUP_ID` | **(required)** | Telegram group ID used as ground truth for duplicate detection |
+| `BOT_HQ_GROUP_ID` | — (skip HQ dedup) | Telegram group ID used as ground truth for duplicate detection |
 | `CLAUDE_BIN` | auto-detected | Path to Claude CLI binary |
 | `CODEX_BIN` | auto-detected | Path to Codex CLI binary |
-| `CODEX_MODEL` | `gpt-5.5` | Model for Codex |
+| `CODEX_MODEL` | `gpt-5.6-sol` | Model for Codex |
 | `CODEX_EFFORT` | `xhigh` | Codex reasoning effort: `low` / `medium` / `high` / `xhigh` |
 | `OPENCODE_BIN` | auto-detected | Path to OpenCode CLI binary |
 | `OPENCODE_MODEL` | — (disabled) | OpenCode model (e.g. `anthropic/claude-sonnet-4-5`). Required to enable. |
@@ -130,7 +142,15 @@ See [.env.example](.env.example) for a complete template with `export` lines you
 | `TELEGRAM_CLIENT_SCRIPT` | `skills/telegram-explorer/scripts/telegram_client.py` | Path to Telegram CLI wrapper |
 | `TELEGRAM_CLIENT_PYTHON` | `.venv/bin/python3` | Python interpreter for Telegram script |
 | `TWITTER_FETCH_SCRIPT` | `scripts/twitter_fetch.py` | Path to Twitter/X script (not bundled) |
-| `ALERT_CHANNEL_ID` | — (disabled) | Telegram chat ID for cycle summary alerts |
+| `HQ_DEDUP_HOURS` / `HQ_DEDUP_FETCH_LIMIT` | `168` / `300` | Bot HQ duplicate-check window and fetch size |
+| `ENABLE_PROVENANCE_DEDUP` | `1` | Provenance-API dedup short-circuit before the HQ check |
+| `BLOCKED_SOURCE_DOMAINS` / `EXTRA_BLOCKED_SOURCE_DOMAINS` | built-in list | Replace / append the primary-source domain blocklist |
+| `AUTO_UPVOTE_USERS` / `AUTO_DOWNVOTE_USERS` | — | Comma-separated LN usernames auto-voted without LLM evaluation |
+| `ENABLE_WS_EVENTS` / `ENABLE_WS_MINI_PASS` | `1` / `1` | Live-news WS listener + between-cycle mini-pass |
+| `ENABLE_MARKET_MATCH` | `0` | Flag-gated market-match phase |
+| `CYCLE_DEADLINE_SECONDS` | `3300` | Watchdog deadline for one full cycle |
+
+Telegram user-session credentials live at fixed paths: `~/.claude/telegram-creds.json` and `~/.claude/agent_session.session`. Advanced tuning knobs (WS backoff, mini-pass caps, market-match confidence, grounding limits) are documented in [.env.example](.env.example).
 
 ## Headline Skill
 
@@ -200,7 +220,7 @@ Fail-safe defaults: freshness checks fail open (article already passed evaluatio
 
 ## Database
 
-Agent state lives in `agent.db` (SQLite, WAL mode). Tables: `channel_cursors`, `channel_ids`, `evaluated_messages`, `posted_articles`, `commented_articles`, `voted_articles`, `voted_yaps`, `replied_yaps`, `runs`, `chat_history`, `notes`, `own_actions`.
+Agent state lives in `agent.db` (SQLite, WAL mode). Tables: `channel_cursors`, `channel_ids`, `evaluated_messages`, `posted_articles`, `commented_articles`, `voted_articles`, `voted_yaps`, `replied_yaps`, `runs`, `chat_history`, `notes`, `own_actions`, `knowledge`, `market_decisions`, `ws_events`, `build_tasks`, `reply_grounding_traces`, `seen_photos`, `seen_documents`.
 
 ```bash
 # Inspect counts
@@ -238,17 +258,27 @@ The agent runs in a continuous loop — PM2's `autorestart` handles crashes, and
 
 ```
 be-benthic/
-├── ln-agent.py              # Automated news agent (Phase 1-5 loop)
+├── ln-agent.py              # Automated news agent (phase loop + WS listener)
 ├── benthic-bot.py           # Telegram chat bot (shared brain + memory)
+├── benthic_api.py           # FastAPI news API service (feed + analyze)
 ├── benthic-builder.py       # Optional Codex-powered build daemon
+├── reply_grounding.py       # Evidence-grounding contracts for bot replies
+├── appserver_client.py      # JSON-RPC client for `codex app-server`
 ├── providers.py             # Provider-agnostic LLM dispatch (Claude/Codex/OpenCode + chain)
 ├── prompt_loader.py         # Shared prompt template loader
 ├── github_client.sh         # Write-only GitHub client wrapper
+├── bin/
+│   └── benthic-build        # Operator CLI for the build queue
+├── codex-policy/            # Codex permission profiles + execpolicy rules
+├── sandbox/                 # Docker sandbox (image, wrapper, network allowlist)
 ├── prompts/                 # External prompt templates with {placeholders}
 │   ├── agent/               # News agent prompts
-│   └── bot/                 # Chat bot prompts + knowledge topics
+│   ├── bot/                 # Chat bot prompts + knowledge topics
+│   ├── api/                 # News API prompts
+│   └── _shared/             # Shared blocks (anti-slop ruleset)
 ├── scripts/
-│   └── twitter_fetch.py     # No-op stub (replace with your own)
+│   ├── twitter_fetch.py     # No-op stub (replace with your own)
+│   └── eval_reply_grounding.py  # Grounding-pipeline eval harness
 ├── skills/
 │   ├── telegram-explorer/
 │   │   ├── SKILL.md          # Telegram skill definition
@@ -283,7 +313,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-72 tests covering security-critical functions: `sanitize_untrusted()`, `check_output_for_injection()`, `validate_url()`, `validate-headline.sh`, `AgentDB` operations, prompt template loading, and GitHub client enforcement.
+1,100+ tests covering the provider chain, evidence-grounding pipeline, sandbox directives, build queue, breaking news, market matching, dedup layers, and the security-critical functions (`sanitize_untrusted()`, `check_output_for_injection()`, `validate_url()`, `validate-headline.sh`, `AgentDB`, prompt templates, GitHub client enforcement).
 
 ## Chat Bot
 
@@ -299,6 +329,11 @@ python -m pytest tests/ -v
 - **Media analysis** — photos re-encoded via PIL (strips EXIF/metadata); PDFs blocked for security; text files sanitized
 - **Persistent memory** — `[REMEMBER:category]` / `[FORGET:id]` directives for notes that survive restarts (operator-only writes, auto-prunes at 200)
 - **Self-awareness** — tracks own actions (bets, messages, replies) so it knows what IT did
+- **Evidence-grounded replies** — compose → verify → repair-once → re-verify against typed evidence; ambient replies publish only when factually supported
+- **Runtime-mediated sandbox** — `[SANDBOX]` directive executed by trusted Python in a locked-down Docker container, then synthesized tools-disabled
+- **Breaking-news pings** — rate-gated reactions to live-news WS events
+- **Two-pass pre-screen + notification gate** — cheap classification screen (and zero-LLM regex gate for mechanical headline-bot notifications) before any expensive call
+- **Knowledge base** — platform reference topics keyword-loaded into prompts on demand
 - **Configurable providers** — same `PROVIDER_ORDER` support as ln-agent.py
 
 ### Setup
@@ -325,7 +360,10 @@ python -m pytest tests/ -v
 | `OPERATOR_IDS` | No | JSON array of Telegram user IDs: `'[12345678]'` |
 | `AGENT_DIR` | No | Agent directory for operator Bash tool restrictions (default: script directory) |
 | `PROVIDER_ORDER` | No | Comma-separated provider priority (default: `codex,claude,opencode`) |
-| `CODEX_MODEL` / `CODEX_EFFORT` | No | Codex model + reasoning effort (defaults: `gpt-5.5` / `xhigh`) |
+| `CODEX_MODEL` / `CODEX_EFFORT` | No | Codex model + reasoning effort (defaults: `gpt-5.6-sol` / `xhigh`) |
+| `CODEX_CLASSIFY_MODEL` | No | Codex classification-tier model (default `gpt-5.6-terra`) |
+| `BENTHIC_DB` / `BENTHIC_LOG_FILE` | No | Override DB / log paths (also used by the test suite) |
+| `ENABLE_REPLY_GROUNDING` | No | Evidence-grounded reply pipeline (default on; `0` = emergency rollback) |
 | `OPENCODE_MODEL` | No | OpenCode model to enable it (e.g. `anthropic/claude-sonnet-4-5`) |
 
 ### Running
@@ -364,9 +402,11 @@ Set `AGENT_NAME` to brand your instance, then customize `prompts/bot/identity.md
 `benthic-builder.py` is an opt-in background daemon that consumes a `build_tasks`
 queue from the shared SQLite. Operators (via the chat bot's persistent-memory
 directives) can hand the daemon a project brief; the daemon spawns Codex CLI in
-an isolated workdir, hands it the brief plus a delivery rubric (working code,
-README, .env.example, dependency manifest), and pushes the result as a public
-repo under your configured GitHub org.
+an isolated workdir and drives a goal-driven loop over `codex app-server`
+(`codex exec` fallback) with the brief plus a delivery rubric (working code,
+README, .env.example, dependency manifest, hard security acceptance criteria).
+An acceptance gate (review + independent VERIFY) must pass before the result is
+pushed as a public repo under your configured GitHub org.
 
 Each task is **isolated** (per-task `workdir` under `BUILD_ROOT`, never touches
 the agent's own files), **time-capped** (6h hard wall, real target 30-90 min),
@@ -385,6 +425,9 @@ the queue.
 | `BUILD_LOG_ROOT` | No | Build log directory (default `/tmp/agent-build-logs`) |
 | `BUILD_TIMEOUT` | No | Hard cap per task in seconds (default 21600 = 6h) |
 | `BUILD_POLL_INTERVAL` | No | Seconds between queue polls (default 10) |
+| `BUILD_USE_APPSERVER` | No | `0` forces the `codex exec` fallback (default app-server mode) |
+| `BUILD_MAX_TURNS` | No | Goal-loop turn cap in app-server mode (default 40) |
+| `BENTHIC_BASE` | No | Agent base dir for DB + github_client.sh (default: script directory) |
 | `CODEX_BIN` / `CODEX_MODEL` / `CODEX_EFFORT` | No | Same vars as the news agent; daemon shares Codex config |
 
 ### Running
@@ -399,6 +442,24 @@ pm2 start ecosystem.config.js
 ```
 
 The bot's identity prompt documents the operator-facing CLI (`bin/benthic-build start <repo_name> --notes "..." <<'BRIEF' ... BRIEF`); see `prompts/bot/identity.md` for the full flow.
+
+## News API (optional)
+
+`benthic_api.py` exposes the agent's curated output as a standalone FastAPI
+service with read-only access to `agent.db`:
+
+- **`GET /health`** — healthcheck (no DB dependency)
+- **`GET /news?limit=20&offset=0&since=ISO8601`** — paginated headline feed
+- **`POST /analyze {"url": "..."}`** — provider-chain newsworthiness evaluation
+  (rate limited via `API_RATE_LIMIT`, default 10 req/min)
+
+All endpoints (except `/health`) require a static bearer token. Set `API_KEY`
+and have your gateway/marketplace send `Authorization: Bearer <key>`:
+
+```bash
+export API_KEY=your-static-token
+python3 benthic_api.py          # uvicorn on API_PORT (default 8099)
+```
 
 ## Contributing
 

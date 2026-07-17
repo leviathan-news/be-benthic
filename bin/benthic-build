@@ -1,0 +1,273 @@
+#!/usr/bin/env python3
+"""benthic-build — operator-tier task queue for autonomous build work.
+
+Bot calls this as a Bash tool to enqueue, query, or cancel build tasks.
+The benthic-builder daemon (separate PM2 process) consumes the queue.
+
+Subcommands:
+  start <repo_name> [--notes "..."] [--chat <id>] [--message <id>]
+        [--user <id>] [--request "..."]
+        Reads brief from stdin. Inserts a build_tasks row, prints JSON
+        with the task id. Daemon picks it up.
+
+  status [<task_id>]
+        Without args: list last 5 tasks (id, repo, status, repo_url).
+        With id: full row JSON.
+
+  cancel <task_id>
+        SIGTERM the running subprocess (if any) and mark cancelled.
+
+  list
+        Last 10 tasks summary.
+"""
+import json
+import os
+import re
+import signal
+import sqlite3
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+DB_FILE = os.environ.get("BENTHIC_DB", str(Path.home() / "server/ln-agent/agent.db"))
+ROUTE_FILE = os.path.join(os.path.dirname(os.path.abspath(DB_FILE)), ".build-route.json")
+ROUTE_MAX_AGE = 900  # seconds; stale files cannot hijack much-later manual CLI runs.
+
+
+def _route_from_file() -> dict:
+    """Read the bot-written routing hand-off when it is present and fresh.
+
+    This file is the authoritative routing source because the provider tool
+    sandbox may drop environment variables and the LLM may pass stale flags.
+    Invalid, missing, or stale route files fall back to the older env/flag path.
+    """
+    try:
+        with open(ROUTE_FILE) as f:
+            d = json.load(f)
+        if time.time() - float(d.get("written_at", 0)) > ROUTE_MAX_AGE:
+            return {}
+        return d
+    except Exception:
+        return {}
+
+
+def conn() -> sqlite3.Connection:
+    c = sqlite3.connect(DB_FILE, timeout=10)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA journal_mode=WAL")
+    c.execute("""CREATE TABLE IF NOT EXISTS build_tasks (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        requested_by INTEGER NOT NULL DEFAULT 0,
+        chat_id INTEGER NOT NULL DEFAULT 0,
+        message_id INTEGER,
+        request_text TEXT,
+        brief TEXT NOT NULL,
+        repo_name TEXT NOT NULL,
+        notes TEXT,
+        status TEXT NOT NULL DEFAULT 'pending',
+        pid INTEGER,
+        work_dir TEXT,
+        log_path TEXT,
+        repo_url TEXT,
+        error TEXT,
+        started_at TEXT,
+        finished_at TEXT,
+        created_at TEXT NOT NULL
+    )""")
+    return c
+
+
+def _parse_flags(args: list[str]) -> tuple[dict, list[str]]:
+    """Pull --flag value pairs out of args; return (flags_dict, leftover_positional)."""
+    flags: dict = {}
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a.startswith("--"):
+            key = a[2:]
+            if i + 1 >= len(args):
+                print(f"ERROR: flag {a!r} needs a value", file=sys.stderr)
+                sys.exit(2)
+            flags[key] = args[i + 1]
+            i += 2
+        else:
+            positional.append(a)
+            i += 1
+    return flags, positional
+
+
+def cmd_start(args: list[str]) -> None:
+    flags, positional = _parse_flags(args)
+    if not positional:
+        print("ERROR: repo_name required", file=sys.stderr)
+        sys.exit(2)
+    repo_name = positional[0]
+    if not re.match(r"^[a-zA-Z0-9._-]+$", repo_name):
+        print("ERROR: invalid repo name (alphanumeric, hyphens, underscores, dots only)", file=sys.stderr)
+        sys.exit(2)
+    if len(repo_name) > 80:
+        print("ERROR: repo name too long (max 80 chars)", file=sys.stderr)
+        sys.exit(2)
+
+    brief = sys.stdin.read().strip()
+    if len(brief) < 30:
+        print("ERROR: brief too short (min 30 chars). Pipe the project description on stdin.", file=sys.stderr)
+        sys.exit(2)
+    if len(brief) > 50_000:
+        print("ERROR: brief too long (max 50000 chars)", file=sys.stderr)
+        sys.exit(2)
+
+    def _int(name: str) -> int | None:
+        v = flags.get(name)
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            print(f"ERROR: --{name} must be an integer, got {v!r}", file=sys.stderr)
+            sys.exit(2)
+
+    route = _route_from_file()
+
+    def _resolve_route(file_key: str, env_name: str, flag_name: str) -> int | None:
+        """Resolve routing with precedence ENV var > FILE > CLI flag. The caller sets
+        env per-invocation (isolated per subprocess); the shared route FILE is a
+        stale-prone fallback a concurrent build start can clobber, so env must win
+        — PR #1 finding."""
+        raw = os.environ.get(env_name)
+        if raw not in (None, ""):
+            try:
+                return int(raw)
+            except ValueError:
+                pass
+        v = route.get(file_key)
+        if v is not None:
+            try:
+                return int(v)
+            except (TypeError, ValueError):
+                pass
+        return _int(flag_name)
+
+    now = datetime.now(timezone.utc).isoformat()
+    with conn() as c:
+        cur = c.execute(
+            """INSERT INTO build_tasks
+               (requested_by, chat_id, message_id, request_text, brief, repo_name,
+                notes, status, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)""",
+            (
+                _resolve_route("user_id", "BENTHIC_BUILD_USER", "user") or 0,
+                _resolve_route("chat_id", "BENTHIC_BUILD_CHAT", "chat") or 0,
+                _resolve_route("message_id", "BENTHIC_BUILD_MESSAGE", "message"),
+                flags.get("request"),
+                brief,
+                repo_name,
+                flags.get("notes"),
+                now,
+            ),
+        )
+        task_id = cur.lastrowid
+        c.commit()
+
+    print(json.dumps({
+        "task_id": task_id,
+        "repo_name": repo_name,
+        "status": "pending",
+        "message": (
+            f"Build #{task_id} queued for {repo_name}. "
+            "Builder daemon will pick it up on the next poll. "
+            "Tell the operator I'll ping when the repo is pushed."
+        ),
+    }))
+
+
+def cmd_status(args: list[str]) -> None:
+    with conn() as c:
+        if args:
+            try:
+                tid = int(args[0])
+            except ValueError:
+                print("ERROR: task_id must be an integer", file=sys.stderr)
+                sys.exit(2)
+            row = c.execute("SELECT * FROM build_tasks WHERE id = ?", (tid,)).fetchone()
+            if not row:
+                print(json.dumps({"error": "task not found", "task_id": tid}))
+                sys.exit(1)
+            print(json.dumps(dict(row), default=str, indent=2))
+        else:
+            rows = c.execute(
+                """SELECT id, repo_name, status, requested_by, repo_url,
+                          started_at, finished_at
+                   FROM build_tasks ORDER BY id DESC LIMIT 5"""
+            ).fetchall()
+            print(json.dumps([dict(r) for r in rows], default=str, indent=2))
+
+
+def cmd_cancel(args: list[str]) -> None:
+    if not args:
+        print("ERROR: task_id required", file=sys.stderr)
+        sys.exit(2)
+    try:
+        tid = int(args[0])
+    except ValueError:
+        print("ERROR: task_id must be an integer", file=sys.stderr)
+        sys.exit(2)
+    with conn() as c:
+        row = c.execute("SELECT * FROM build_tasks WHERE id = ?", (tid,)).fetchone()
+        if not row:
+            print(json.dumps({"error": "task not found", "task_id": tid}))
+            sys.exit(1)
+        if row["status"] not in ("pending", "running"):
+            print(json.dumps({
+                "error": f"cannot cancel task in state {row['status']!r}",
+                "task_id": tid,
+            }))
+            sys.exit(1)
+        if row["pid"]:
+            try:
+                os.kill(row["pid"], signal.SIGTERM)
+            except ProcessLookupError:
+                pass
+            except PermissionError:
+                pass
+        c.execute(
+            "UPDATE build_tasks SET status='cancelled', finished_at=? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), tid),
+        )
+        c.commit()
+    print(json.dumps({"task_id": tid, "status": "cancelled"}))
+
+
+def cmd_list(args: list[str]) -> None:
+    with conn() as c:
+        rows = c.execute(
+            """SELECT id, repo_name, status, requested_by, chat_id, repo_url,
+                      error, started_at, finished_at
+               FROM build_tasks ORDER BY id DESC LIMIT 10"""
+        ).fetchall()
+        print(json.dumps([dict(r) for r in rows], default=str, indent=2))
+
+
+def main() -> None:
+    if len(sys.argv) < 2:
+        print(__doc__, file=sys.stderr)
+        sys.exit(2)
+    sub = sys.argv[1]
+    rest = sys.argv[2:]
+    handlers = {
+        "start": cmd_start,
+        "status": cmd_status,
+        "cancel": cmd_cancel,
+        "list": cmd_list,
+    }
+    handler = handlers.get(sub)
+    if not handler:
+        print(f"ERROR: unknown subcommand {sub!r}. Allowed: {', '.join(handlers)}", file=sys.stderr)
+        sys.exit(2)
+    handler(rest)
+
+
+if __name__ == "__main__":
+    main()

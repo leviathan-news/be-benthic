@@ -32,8 +32,8 @@ def test_load_prompt_with_vars():
     test_file = test_dir / "vars.md"
     test_file.write_text("Hello {name}, today is {date}.")
     try:
-        result = load_prompt("test/vars", name="TestAgent", date="2026-04-12")
-        assert result == "Hello TestAgent, today is 2026-04-12."
+        result = load_prompt("test/vars", name="Benthic", date="2026-04-12")
+        assert result == "Hello Benthic, today is 2026-04-12."
     finally:
         test_file.unlink()
         test_dir.rmdir()
@@ -94,7 +94,7 @@ def test_load_prompt_missing_var():
     test_file.write_text("Hello {name}, you are {role}.")
     try:
         with pytest.raises(KeyError):
-            load_prompt("test/missing_var", name="TestAgent")
+            load_prompt("test/missing_var", name="Benthic")
     finally:
         test_file.unlink()
         test_dir.rmdir()

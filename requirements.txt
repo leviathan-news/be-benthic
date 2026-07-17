@@ -2,3 +2,6 @@ telethon
 requests
 eth-account
 Pillow
+fastapi
+uvicorn
+websockets

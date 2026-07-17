@@ -12,7 +12,7 @@ module.exports = {
       // env: {
       //   BOT_HQ_GROUP_ID: "-100...",
       //   WALLET_KEY_FILE: "~/.claude/.ln-wallet-key",
-      //   TELEGRAM_CREDS_FILE: "~/.claude/telegram-creds.json",
+      //   CHANNELS: '["@examplechannel"]',
       // }
     },
     {
@@ -27,6 +27,34 @@ module.exports = {
       //   BOT_TOKEN: "your_telegram_bot_token",
       //   BOT_USERNAME: "my_bot",
       //   AGENTS_GROUP_ID: "-100...",
+      // }
+    },
+    {
+      name: "news-api",
+      cwd: __dirname,
+      interpreter: ".venv/bin/python3",
+      script: "benthic_api.py",
+      autorestart: true,
+      max_restarts: 10,
+      restart_delay: 5000,
+      // env: {
+      //   API_KEY: "static-bearer-token-for-your-gateway",
+      //   API_PORT: "8099",
+      // }
+    },
+    {
+      name: "builder",
+      cwd: __dirname,
+      interpreter: ".venv/bin/python3",
+      script: "benthic-builder.py",
+      autorestart: true,
+      max_restarts: 10,
+      restart_delay: 5000,
+      // Optional daemon — remove this block if you don't run autonomous builds.
+      // env: {
+      //   BUILD_GITHUB_ORG: "YourGithubOrg",
+      //   BUILD_GIT_USER_NAME: "Agent Builder",
+      //   BUILD_GIT_USER_EMAIL: "agent@example.com",
       // }
     },
   ]

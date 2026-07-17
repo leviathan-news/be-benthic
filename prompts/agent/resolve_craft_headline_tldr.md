@@ -46,6 +46,9 @@ TL;DR RULES:
 - Same crypto-native tone as the headline — direct, opinionated, no fluff
 - Write like a CT poster summarizing the story for a friend, not an analyst writing a briefing
 
+TL;DR VOICE ONLY:
+{no_slop}
+
 SOURCE URL: {url}
 ORIGINAL TELEGRAM POST:
 <user_content>{safe_text}</user_content>

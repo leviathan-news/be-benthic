@@ -1,0 +1,71 @@
+# Benthic execpolicy. Starlark; `codex exec` loads ~/.codex/rules/*.rules by default.
+#
+# Two jobs:
+# 1) ALLOW the wrapper scripts that must read a now-denied ~/.claude credential.
+#    An execpolicy `allow` runs the command OUTSIDE the sandbox, where the
+#    filesystem profile's deny does not apply — so these scripts read their own
+#    creds (and Telethon writes its session) while an injected in-sandbox
+#    `cat`/`curl` still cannot read those files. Tools that read NO denied cred
+#    (run-sandbox.sh, validate-headline.sh, curl) are intentionally left to run
+#    in-sandbox (curl stays in-sandbox so it cannot exfiltrate a denied secret).
+# 2) FORBID destructive / remote / deploy commands and direct secret reads
+#    (defense-in-depth; the filesystem profile is the hard boundary, and execpolicy
+#    prefix matching has a known Unicode-confusable bypass, so do not rely on it).
+#
+# Replace /path/to/agent-dir with your agent install directory. Where your tool
+# strings use a ~ form, list BOTH the ~ and expanded absolute forms — consumers
+# call the scripts via Path(...).expanduser(), but bot tool strings keep the ~.
+
+# ── github_client.sh (reads ~/.claude/.github-token) — bot ────────────────────
+# execpolicy is sender-agnostic + host-global, so the powerful `--operator` path
+# is deliberately NOT allow-listed (any sender could otherwise invoke it). Only the
+# rate-limited + attributed `--user` path (and the bare issue/pr form) is allowed;
+# operator-only GitHub ops are not available via Codex and must be done directly.
+for gh in ["/path/to/agent-dir/github_client.sh"]:
+    prefix_rule(pattern=[gh, "--user"], decision="allow",
+                justification="Non-operator GitHub ops (rate-limited + attributed wrapper).")
+    prefix_rule(pattern=[gh, "issue"], decision="allow",
+                justification="GitHub issue ops via the checked wrapper.")
+    prefix_rule(pattern=[gh, "pr"], decision="allow",
+                justification="GitHub PR ops via the checked wrapper.")
+
+# ── telegram_client.py (reads telegram-creds.json + agent_session*) — agent ───
+TG_PY = "/path/to/agent-dir/.venv/bin/python3"
+TG_SCRIPT = "/path/to/agent-dir/skills/telegram-explorer/scripts/telegram_client.py"
+for sub in ["messages", "search-global", "dialogs", "info", "topics", "pinned"]:
+    prefix_rule(pattern=[TG_PY, TG_SCRIPT, sub], decision="allow",
+                justification="Telegram read-only " + sub + " (reads session outside sandbox).")
+
+# ── twitter_fetch.py (reads twitter-cookies.txt) — agent ──────────────────────
+TW_SCRIPT = "/path/to/agent-dir/scripts/twitter_fetch.py"
+TW_PY = "/path/to/agent-dir/.venv/bin/python3"
+for inv in [[TW_PY, TW_SCRIPT], ["python3", TW_SCRIPT], [TW_SCRIPT]]:
+    prefix_rule(pattern=inv, decision="allow",
+                justification="Twitter/X read-only fetch (reads cookies outside sandbox).")
+
+# pm2 is intentionally NOT allow-listed: it is an operator-only diagnostic and
+# execpolicy cannot tell operator from non-operator (host-global), so granting it
+# would expose process logs to any sender. pm2 runs in-sandbox (fails on the daemon
+# socket); operators run pm2 directly outside Codex.
+
+# ── FORBID: destructive / remote / deploy ─────────────────────────────────────
+for d in [["rm", "-rf"], ["rm", "-fr"], ["rm", "-r"], ["rm", "-R"],
+          ["git", "clean"], ["git", "reset", "--hard"], ["git", "checkout", "--"], ["git", "restore"],
+          ["pm2", "restart"], ["pm2", "reload"], ["pm2", "stop"], ["pm2", "delete"],
+          ["ssh"], ["scp"], ["rsync"], ["dd"], ["mkfs"], ["chmod", "-R"], ["chown", "-R"]]:
+    prefix_rule(pattern=d, decision="forbidden", justification="Blocked destructive/remote/deploy command.")
+
+# ── FORBID: direct reads/copies of secret files (defense-in-depth) ────────────
+read_cmds = ["cat", "head", "tail", "od", "xxd", "base32", "base64", "cp", "less", "more", "strings", "hexdump"]
+secret_files = [
+    "/home/<user>/.claude/.ln-wallet-key", "/home/<user>/.claude/.ln-bot-token",
+    "/home/<user>/.claude/.credentials.json",
+    "/home/<user>/.claude/session-env",
+    "/home/<user>/.claude/agent_session.session",
+    "/home/<user>/.claude/.github-token", "/home/<user>/.claude/telegram-creds.json",
+    "/home/<user>/.claude/twitter-cookies.txt",
+]
+for c in read_cmds:
+    for f in secret_files:
+        prefix_rule(pattern=[c, f], decision="forbidden",
+                    justification="Block direct read/copy of a credential file.")

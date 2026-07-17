@@ -9,8 +9,7 @@ __pycache__/
 agent.db
 agent.db-shm
 agent.db-wal
-agent.log
-bot.log
+*.log
 *.session
 
 # Environment files
@@ -31,3 +30,10 @@ knowledge.json
 # Runtime state
 .poll_offset
 .last_market_check
+
+# Dev-tool state
+.worktrees/
+.superpowers/
+
+# sandbox: generated host->IP map (written by setup-network.sh on the host)
+sandbox/.resolved-hosts

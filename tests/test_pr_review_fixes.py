@@ -104,20 +104,3 @@ def test_codex_timeout_floors_tool_and_reasoning_calls():
     assert providers._codex_effective_timeout(600, "WebSearch") == 3600
     # ...but a caller asking for MORE than the floor still wins.
     assert providers._codex_effective_timeout(7200, "WebSearch") == 7200
-
-
-# ── #6 API analyze stays tool-free ─────────────────────────────────────────
-def test_api_llm_ask_passes_no_tools_sentinel(monkeypatch):
-    os.environ.setdefault("WALLET_PRIVATE_KEY", "")
-    import benthic_api
-    captured = {}
-
-    def fake_ask(prompt, **kwargs):
-        captured.update(kwargs)
-        return "ok"
-
-    monkeypatch.setattr(benthic_api._provider_chain, "ask", fake_ask)
-    benthic_api.llm_ask("classify this please")
-    assert captured.get("tools") == "__none__", (
-        "API classification calls must pass the no-tools sentinel so Codex does "
-        "not enable web_search")

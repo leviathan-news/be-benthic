@@ -30,19 +30,6 @@ module.exports = {
       // }
     },
     {
-      name: "benthic-api",
-      cwd: __dirname,
-      interpreter: ".venv/bin/python3",
-      script: "benthic_api.py",
-      autorestart: true,
-      max_restarts: 10,
-      restart_delay: 5000,
-      // env: {
-      //   API_KEY: "static-bearer-token-for-your-gateway",
-      //   API_PORT: "8099",
-      // }
-    },
-    {
       name: "benthic-builder",
       cwd: __dirname,
       interpreter: ".venv/bin/python3",

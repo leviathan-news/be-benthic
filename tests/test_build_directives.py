@@ -213,7 +213,7 @@ def test_pm2_logs_directive_caps_numeric_lines():
 
 def test_pm2_list_and_show_directives_run_with_valid_process():
     bot = _load_bot_module()
-    text = "[PM2-LIST]\n[PM2-SHOW:benthic-api]\n"
+    text = "[PM2-LIST]\n[PM2-SHOW:benthic-builder]\n"
     msg = {"message_id": 8, "text": "pm2 process status"}
 
     with patch.object(bot, "_PM2_BIN", PM2_BIN), \
@@ -224,7 +224,7 @@ def test_pm2_list_and_show_directives_run_with_valid_process():
     calls = [call.args[0] for call in run.call_args_list]
     assert calls == [
         [PM2_BIN, "list"],
-        [PM2_BIN, "show", "benthic-api"],
+        [PM2_BIN, "show", "benthic-builder"],
     ]
 
 

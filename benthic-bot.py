@@ -125,7 +125,7 @@ _BUILD_BLOCK_RE = re.compile(r"\[BUILD:([^\]\n]+)\]\s*(.*?)\s*\[/BUILD\]\s*", re
 _BUILD_CANCEL_RE = re.compile(r"^[ \t]*\[BUILD-CANCEL:([^\]\s]+)\][ \t]*(?:\n|$)", re.MULTILINE)
 _BUILD_STATUS_RE = re.compile(r"^[ \t]*\[BUILD-STATUS:([^\]\s]+)\][ \t]*(?:\n|$)", re.MULTILINE)
 _PM2_ALLOWED_PROCS = {
-    "ln-agent", "benthic-bot", "benthic-api", "benthic-tunnel", "benthic-builder",
+    "ln-agent", "benthic-bot", "benthic-builder",
 }
 _PM2_LOGS_RE = re.compile(r"^[ \t]*\[PM2-LOGS:([^\]\n]+)\][ \t]*(?:\n|$)", re.MULTILINE)
 _PM2_LIST_RE = re.compile(r"^[ \t]*\[PM2-LIST\][ \t]*(?:\n|$)", re.MULTILINE)

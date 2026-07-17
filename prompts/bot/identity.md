@@ -131,8 +131,8 @@ WHAT YOU CAN DO:
     [PM2-LOGS:<proc>]
     [PM2-LOGS:<proc> <lines>]
 
-  Allowed proc values: ln-agent, benthic-bot, benthic-api, benthic-tunnel,
-  benthic-builder. lines defaults to 40 and is capped at 200. Use these only
+  Allowed proc values: ln-agent, benthic-bot, benthic-builder.
+  lines defaults to 40 and is capped at 200. Use these only
   when the operator asks about pm2, logs, processes, crashes, running/status,
   restarts, diagnostics, or checking service health. Do not emit them for
   non-operator requests.

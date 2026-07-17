@@ -10,24 +10,22 @@ This is the **Leviathan News (LN)** workspace — a white-label crypto/DeFi news
 
 2. **`benthic-bot.py`** — Telegram chat bot (PM2 name `benthic-bot`) sharing brain/identity with ln-agent. Responds in groups and operator DMs. Features: evidence-grounded replies, per-chat memory isolation, tiered operator auth, [GROUP] directive routing, agent-chat API polling, message debouncing, media analysis, persistent memory, self-awareness tracking, runtime-mediated sandbox, breaking-news reactions.
 
-3. **`benthic_api.py`** — Standalone FastAPI service (PM2 name `benthic-api`) exposing the curated news feed and article analysis as paid, bearer-token-authenticated API endpoints (marketplace-ready). Read-only access to `agent.db`.
+3. **`benthic-builder.py`** *(optional daemon)* — Codex-powered build queue. Consumes `build_tasks` rows from the shared SQLite, drives a goal-driven loop over `codex app-server` (exec fallback) in a per-task workdir, gates on review + independent VERIFY, and pushes the result as a public repo under `BUILD_GITHUB_ORG` via `github_client.sh repo push`. Each task is isolated, time-capped at 6h, and reports back to the originating Telegram chat. Operator CLI: `bin/benthic-build`.
 
-4. **`benthic-builder.py`** *(optional daemon)* — Codex-powered build queue. Consumes `build_tasks` rows from the shared SQLite, drives a goal-driven loop over `codex app-server` (exec fallback) in a per-task workdir, gates on review + independent VERIFY, and pushes the result as a public repo under `BUILD_GITHUB_ORG` via `github_client.sh repo push`. Each task is isolated, time-capped at 6h, and reports back to the originating Telegram chat. Operator CLI: `bin/benthic-build`.
+4. **`reply_grounding.py`** — Evidence-grounding contracts for bot replies: strict reply/verifier/media parsers, typed evidence bundles, exact X-status extraction, and the proxy-free pinned HTTP fetcher. Imported by `benthic-bot.py`.
 
-5. **`reply_grounding.py`** — Evidence-grounding contracts for bot replies: strict reply/verifier/media parsers, typed evidence bundles, exact X-status extraction, and the proxy-free pinned HTTP fetcher. Imported by `benthic-bot.py`.
+5. **`providers.py`** — Provider-agnostic LLM dispatch layer. Defines `ClaudeProvider` / `CodexProvider` / `OpenCodeProvider` (each with its own `CircuitBreaker` + tier table) and `ProviderChain` (ordered fallback, env-driven via `PROVIDER_ORDER`). All runtime components import from here; swapping the "primary brain" is a single env var change, no code edits.
 
-6. **`providers.py`** — Provider-agnostic LLM dispatch layer. Defines `ClaudeProvider` / `CodexProvider` / `OpenCodeProvider` (each with its own `CircuitBreaker` + tier table) and `ProviderChain` (ordered fallback, env-driven via `PROVIDER_ORDER`). All runtime components import from here; swapping the "primary brain" is a single env var change, no code edits.
+6. **`prompt_loader.py`** — Shared prompt template loader. Reads `.md` files from `prompts/`, caches in-memory, fills `{placeholders}` via `str.format()`. Used by all runtime components.
 
-7. **`prompt_loader.py`** — Shared prompt template loader. Reads `.md` files from `prompts/`, caches in-memory, fills `{placeholders}` via `str.format()`. Used by all runtime components.
-
-8. **`prompts/`** — External prompt template directory. All LLM prompts extracted from the agent files for dev-time context savings and clean separation. Subdirs: `agent/`, `bot/` (+ `knowledge/` topic files), `api/`, and `_shared/`.
+7. **`prompts/`** — External prompt template directory. All LLM prompts extracted from the agent files for dev-time context savings and clean separation. Subdirs: `agent/`, `bot/` (+ `knowledge/` topic files), and `_shared/`.
    Creative-tier prompts inject the shared anti-slop block from `prompts/_shared/no_ai_slop.md` via `{no_slop}`.
 
-9. **`github_client.sh`** — Write-only GitHub client wrapper. Enforces repo allowlist (`~/.claude/.github-repos-allowlist`), rate limits non-operators (default 30/day, override via `RATE_LIMIT_MAX`), adds attribution footer. Supports: `issue create|close|comment|edit`, `pr create|comment`, `repo create|push`, `allowlist add|list`. Token loaded from `~/.claude/.github-token`. New repos auto-added to allowlist under `GITHUB_ORG` (env).
+8. **`github_client.sh`** — Write-only GitHub client wrapper. Enforces repo allowlist (`~/.claude/.github-repos-allowlist`), rate limits non-operators (default 30/day, override via `RATE_LIMIT_MAX`), adds attribution footer. Supports: `issue create|close|comment|edit`, `pr create|comment`, `repo create|push`, `allowlist add|list`. Token loaded from `~/.claude/.github-token`. New repos auto-added to allowlist under `GITHUB_ORG` (env).
 
-10. **`codex-policy/`** — Codex permission profiles + execpolicy rules for locked-down Codex invocations: every `~/.claude` secret is denied in-sandbox while allowlisted wrapper scripts run outside it. Ready to append to the deploy host's `~/.codex/config.toml` and `~/.codex/rules/`.
+9. **`codex-policy/`** — Codex permission profiles + execpolicy rules for locked-down Codex invocations: every `~/.claude` secret is denied in-sandbox while allowlisted wrapper scripts run outside it. Ready to append to the deploy host's `~/.codex/config.toml` and `~/.codex/rules/`.
 
-11. **`skills/leviathan-headlines/`** — Claude Code plugin skill for manual headline crafting and review following LN editorial standards.
+10. **`skills/leviathan-headlines/`** — Claude Code plugin skill for manual headline crafting and review following LN editorial standards.
 
 ## Architecture: ln-agent.py
 
@@ -281,46 +279,15 @@ Same stack as ln-agent.py plus: memory directives stripped from non-operator mes
 - **Identity-leak scanner** — `check_identity_leak()` (NFKD-normalized substring match on `IDENTITY_LEAK_PATTERNS`) blocks meta/harness-confusion output — e.g. "interactive Claude Code session", "not the live bot", "group-reply decision prompt" — that a model emits when it breaks character instead of answering as Benthic. Runs for **all** senders (operators included, like `check_structural_leaks`) at `_finalize_generated_response()`, with `send_message()` repeating the check as defense in depth. Backstop for the 2026-06-03 incident where the full-brain reply posted a meta-essay to the group because the exact-match gate only caught a literal `SKIP`.
 - **Provider-wrapper parity** — the Claude provider is now wrapped (`prompts/bot/claude_wrapper.md` via `ClaudeProvider.wrapper`) with the same one-shot "output only what the task asks, no meta-commentary, return empty if you can't comply" discipline Codex already had (`codex_wrapper.md`). Previously only Codex was wrapped, so a Claude-backed decision could break character and essay-leak.
 
-## Architecture: benthic_api.py
-
-Standalone FastAPI service for the SerenDB marketplace. Read-only access to `agent.db`, no cross-imports from ln-agent or benthic-bot.
-
-### Endpoints
-- **`GET /health`** — healthcheck, no DB dependency
-- **`GET /news?limit=20&offset=0&since=ISO8601`** — paginated headline feed from `posted_articles`. Filters out `[duplicate]`, `[stale]`, NULL, and empty headlines. Newest first.
-- **`POST /analyze {"url": "..."}`** — Provider-chain newsworthiness evaluation: Codex `gpt-5.6-sol`/low/no-tools is primary and Claude Sonnet/low/no-tools is the fallback. Returns `{newsworthy, score, summary, tags, primary_source}`. Rate limited (`API_RATE_LIMIT`, default 10 req/min).
-
-### Defense Stack (mirrors ln-agent/benthic-bot)
-- Prompt injection output check, leak pattern detection, structural leak detection (all NFKD-normalized)
-- `<user_content>` tags on untrusted URL input in analyze prompt
-- Pydantic `AnalyzeResponse` model: whitelists fields, bounds score (1-10), summary (500 chars), tags (20 items, 50 chars each), primary_source (2048 chars)
-- 3-pass JSON extraction (raw → fences → bracket search)
-
-### Provider Layer (mirrors ln-agent/benthic-bot)
-- Provider chain via `llm_ask()` (default order: `codex,claude`; Codex `gpt-5.6-sol`/low/no-tools primary, Claude Sonnet/low/no-tools fallback). See `providers.py` for the shared `ClaudeProvider` / `CodexProvider` / `OpenCodeProvider` / `ProviderChain` abstraction used by all three components.
-- Each provider has a three-consecutive-failure breaker. Only Claude retries internally (5s, then 10s) and opens the six-hour quota cooldown; a failed Codex call lets the chain try the next available provider.
-- `_build_provider_env()` for PM2/NVM PATH resolution
-- Codex classification calls use component permission profiles without `--dangerously-bypass-approvals-and-sandbox`; explicit `tools="__none__"` calls instead use the hard text-only invocation documented above.
-
-### PM2 Processes
-- `benthic-api` — FastAPI on port `API_PORT` (default 8099)
-- Optional: front it with a cloudflared tunnel or reverse proxy if you expose it publicly
-
-### Marketplace Registration
-- Callers authenticate with a static bearer token (`API_KEY` env — the billing
-  gateway sends it when proxying requests). Register the endpoints with the
-  marketplace/gateway of your choice; keep credentials outside the repo.
-
 ## Running the Agent
 
 ```bash
 python3 ln-agent.py          # news agent (continuous loop)
 python3 benthic-bot.py       # chat bot
-python3 benthic_api.py       # news API (uvicorn on API_PORT, default 8099)
 python3 benthic-builder.py   # optional Codex build daemon
 ```
 
-Dependencies: `telethon`, `requests`, `eth_account`, `Pillow`, `fastapi`, `uvicorn`, `websockets`, Claude CLI, Codex CLI.
+Dependencies: `telethon`, `requests`, `eth_account`, `Pillow`, `websockets`, Claude CLI, Codex CLI.
 
 ## Sandbox Management
 
@@ -389,11 +356,11 @@ Checks: character count (75-150), trailing period, sentence case, article usage,
 - `@LeviathanTsunami` articles are always submitted even if LN API says they exist (Tsunami auto-posts don't reach main feed via Bot HQ)
 - `AUTO_DOWNVOTE_USERS` (env, comma-separated LN usernames) — `.lower()` compared against author display name. Always auto-downvoted, no LLM evaluation.
 - `AUTO_UPVOTE_USERS` (env, comma-separated) — same pattern but hardcoded +1.
-- `BLOCKED_SOURCE_DOMAINS` — Python-side blocklist of content-farm and aggregator domains. Hard guard checked early in `process_article_sync` (both pre- and post-URL-resolve) so an eval-prompt slip doesn't reach LN. Env overrides: `BLOCKED_SOURCE_DOMAINS=...` replaces the default list; `EXTRA_BLOCKED_SOURCE_DOMAINS=...` appends. Match is suffix-based on the URL host (so `zine.live` blocks `www.zine.live` and any subdomain, but not `badzine.live`). Defaults include `zine.live`, press-release wires, and a curated set of SEO-driven crypto aggregators (`cryptopotato.com`, `u.today`, `watcher.guru`, etc.). Read once at module import — env changes need `pm2 restart ln-agent --update-env` to take effect. Rejected articles are recorded with `headline="[blocked source]"` so the public news API (`benthic_api.py`) filters them out.
+- `BLOCKED_SOURCE_DOMAINS` — Python-side blocklist of content-farm and aggregator domains. Hard guard checked early in `process_article_sync` (both pre- and post-URL-resolve) so an eval-prompt slip doesn't reach LN. Env overrides: `BLOCKED_SOURCE_DOMAINS=...` replaces the default list; `EXTRA_BLOCKED_SOURCE_DOMAINS=...` appends. Match is suffix-based on the URL host (so `zine.live` blocks `www.zine.live` and any subdomain, but not `badzine.live`). Defaults include `zine.live`, press-release wires, and a curated set of SEO-driven crypto aggregators (`cryptopotato.com`, `u.today`, `watcher.guru`, etc.). Read once at module import — env changes need `pm2 restart ln-agent --update-env` to take effect. Rejected articles are recorded with `headline="[blocked source]"` so downstream consumers can filter them out.
 - `HQ_DEDUP_HOURS` / `HQ_DEDUP_FETCH_LIMIT` — Env overrides for the Bot HQ duplicate-check window. Default is 168h (7 days) with 300-message fetch. Read per-cycle via `_env_int()` so a malformed value falls back to the default instead of crashing the cycle. The previous 6h cap let stories slip through when re-posted days later from a different source.
 - Channel numeric IDs are cached in SQLite to avoid Telegram `ResolveUsernameRequest` flood waits
 - Claude CLI uses `--allowedTools` whitelist (WebSearch, WebFetch, Read, Grep, Glob, + read-only Bash patterns for telegram_client.py, twitter_fetch.py, validate-headline.sh). No `Skill` — removed after security audit (Skill gave unrestricted access to telegram-explorer send capability). Telegram client restricted to read-only subcommands (messages, search-global, dialogs, info, topics, pinned).
-- Normal Codex calls run under component-scoped permission profiles: each passes `-c default_permissions=<benthic_agent|benthic_bot|benthic_api> -c approval_policy=never` (profiles defined in the deploy host's `~/.codex/config.toml` — ready-to-append copies in `codex-policy/`; each denies all `~/.claude` secrets in-sandbox). `--dangerously-bypass-approvals-and-sandbox` is only the fallback when no profile is configured — never in practice. The explicit `tools="__none__"` path is intentionally different: it uses `--ignore-user-config`, cannot select a custom profile, and supplies read-only sandboxing plus `approval_policy=never` directly. Codex ≥0.142.5 additionally REQUIRES a global `default_permissions` in config.toml when `[permissions]` profiles exist (use `benthic_bot`, the tightest) — without it every ordinary profile-less invocation (interactive shell, benthic-builder app-server) dies at config load.
+- Normal Codex calls run under component-scoped permission profiles: each passes `-c default_permissions=<benthic_agent|benthic_bot> -c approval_policy=never` (profiles defined in the deploy host's `~/.codex/config.toml` — ready-to-append copies in `codex-policy/`; each denies all `~/.claude` secrets in-sandbox). `--dangerously-bypass-approvals-and-sandbox` is only the fallback when no profile is configured — never in practice. The explicit `tools="__none__"` path is intentionally different: it uses `--ignore-user-config`, cannot select a custom profile, and supplies read-only sandboxing plus `approval_policy=never` directly. Codex ≥0.142.5 additionally REQUIRES a global `default_permissions` in config.toml when `[permissions]` profiles exist (use `benthic_bot`, the tightest) — without it every ordinary profile-less invocation (interactive shell, benthic-builder app-server) dies at config load.
 - LN API submit response nests article ID at `data["news"]["id"]`, NOT `data["article_id"]` at top level
 - Log rotation: 10MB max, 5 backups. LLM timeout: 1 hour per call.
 - All HTTP calls to LN API have 5-min timeout

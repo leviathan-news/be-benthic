@@ -1,6 +1,6 @@
 """Provider-agnostic LLM dispatch layer.
 
-Used by ln-agent.py, benthic-bot.py, and benthic_api.py. Defines:
+Used by ln-agent.py and benthic-bot.py. Defines:
 
 - `Provider` protocol — what every LLM CLI wrapper looks like.
 - `ClaudeProvider`, `CodexProvider`, `OpenCodeProvider` — concrete subprocess wrappers.

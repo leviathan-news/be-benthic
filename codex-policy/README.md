@@ -25,7 +25,7 @@ benthic-builder is intentionally excluded (it uses `codex app-server`, not
 ## How it works (validated empirically)
 
 - **Every sensitive `~/.claude` file is denied to in-sandbox commands** in every
-  profile (the four profiles are filesystem-identical). A `deny` blocks reads at the
+  profile (the three profiles are filesystem-identical). A `deny` blocks reads at the
   OS sandbox level. `~/.claude/plugins` stays readable so tool scripts can be found.
 - **execpolicy `allow` runs the matched command OUTSIDE the sandbox**, where the deny
   doesn't apply. The three credential-reading wrappers — `github_client.sh`,
@@ -74,7 +74,7 @@ back to Claude), never unrestricted.
 
 ## Profiles
 
-`benthic_bot`, `benthic_bot_operator`, `benthic_agent`, `benthic_api` — currently
+`benthic_bot`, `benthic_bot_operator`, `benthic_agent` — currently
 filesystem-identical (deny all sensitive `~/.claude` files + `~/.ssh`/`~/.aws`/
 `~/.gnupg`/`~/.netrc`; read `/path/to/agent-dir`; write `/tmp`; network enabled). Kept
 as separate names so `providers.py` can diverge them later (e.g. per-component egress).

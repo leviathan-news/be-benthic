@@ -17,7 +17,7 @@
 #   still fetch arbitrary URLs (grounding, network enabled) but cannot read any
 #   denied secret. The Codex env is also secret-stripped in providers.py.
 # Net: EVERY sensitive ~/.claude file is denied in-sandbox in EVERY profile; the
-# four profiles are filesystem-identical. ~/.claude/plugins stays readable so the
+# three profiles are filesystem-identical. ~/.claude/plugins stays readable so the
 # tool scripts there can be located. benthic-builder is excluded (codex app-server).
 #
 # KNOWN RESIDUAL: github_client.sh write subcommands run outside the sandbox and
@@ -94,25 +94,3 @@ extends = ":workspace"
 [permissions.benthic_agent.network]
 enabled = true
 
-[permissions.benthic_api]
-extends = ":workspace"
-[permissions.benthic_api.filesystem]
-":minimal" = "read"
-"/path/to/agent-dir" = "read"
-"/tmp" = "write"
-"~/.claude/.ln-wallet-key" = "deny"
-"~/.claude/.ln-bot-token" = "deny"
-"~/.claude/.credentials.json" = "deny"
-"~/.claude/session-env" = "deny"
-"~/.claude/*.session*" = "deny"
-"~/.claude/.github-token" = "deny"
-"~/.claude/.github-repos-allowlist" = "deny"
-"~/.claude/.github-rate-limit" = "deny"
-"~/.claude/telegram-creds.json" = "deny"
-"~/.claude/twitter-cookies.txt" = "deny"
-"~/.ssh" = "deny"
-"~/.aws" = "deny"
-"~/.gnupg" = "deny"
-"~/.netrc" = "deny"
-[permissions.benthic_api.network]
-enabled = true

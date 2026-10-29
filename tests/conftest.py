@@ -24,6 +24,9 @@ _BOT_STATE_ROOT = Path(_BOT_STATE_DIR.name)
 # pytest imports any test module so offline tests cannot touch repository state.
 os.environ["BENTHIC_DB"] = str(_BOT_STATE_ROOT / "agent.db")
 os.environ["BENTHIC_LOG_FILE"] = str(_BOT_STATE_ROOT / "benthic.log")
+# LNClient reads an operator API key; tests must never pick up a real one.
+os.environ.pop("LN_API_KEY", None)
+os.environ["LN_API_KEY_FILE"] = str(_BOT_STATE_ROOT / "no-ln-api-key")
 
 # White-label build: these are required at import time by ln-agent.py and
 # benthic-bot.py (no baked-in defaults). Provide harmless test values.
@@ -38,6 +41,11 @@ os.environ.setdefault("WALLET_PRIVATE_KEY", "")
 os.environ.setdefault("AGENT_NAME", "Benthic")
 os.environ.setdefault("BOT_USERNAME", "benthic_bot")
 os.environ.setdefault("OPERATOR_IDS", "[111000111]")
+# Env-driven in the white-label build (the curated source list and the
+# news channel are operator data). Tests that pin the unset defaults run
+# ln-agent.py in a fresh interpreter with these removed.
+os.environ.setdefault("ID_SOURCES", '{"-1001000000777": "Example Private Feed"}')
+os.environ.setdefault("BENTHIC_NEWS_CHANNEL", "@example_news")
 
 
 def _apply_ram_cap() -> None:

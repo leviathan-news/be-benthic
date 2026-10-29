@@ -120,3 +120,19 @@ def test_submit_article_omits_market_id_when_none():
     c.submit_article("https://e.com/a", "A headline")
     args, kwargs = c.session.post.call_args
     assert "market_id" not in kwargs["json"]
+
+
+def test_post_yap_returns_true_for_success():
+    module = _load_ln_agent()
+    c = _client(module)
+    c.session.post.return_value = _resp(status=201, ok=True)
+
+    assert c.post_yap(91, "A useful comment", ["analysis"]) is True
+
+
+def test_post_yap_returns_false_for_http_rejection():
+    module = _load_ln_agent()
+    c = _client(module)
+    c.session.post.return_value = _resp(status=500, ok=False)
+
+    assert c.post_yap(92, "A useful comment", ["analysis"]) is False

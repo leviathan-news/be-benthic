@@ -12,6 +12,12 @@ BEFORE WRITING:
 2. Search Twitter/X for reactions, hot takes, and additional context on this topic
 3. Use WebSearch to find any related recent developments that add depth
 
+USEFULNESS GATE:
+- If your research does not uncover a concrete fact, second-order effect,
+  market implication, historical parallel, or defensible counterpoint beyond
+  the headline, respond with exactly: SKIP
+- Never include SKIP inside a comment or add explanation around it.
+
 THEN write a comment (2-4 sentences) that:
 - Adds genuine insight the headline doesn't cover — second-order effects, historical parallels, market implications
 - References specific protocols, metrics, on-chain data, or precedents when relevant

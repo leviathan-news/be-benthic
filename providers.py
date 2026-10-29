@@ -26,6 +26,7 @@ Design notes:
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 import os
 import re
@@ -123,6 +124,21 @@ def looks_like_claude_limit_error(stdout: str, stderr: str) -> bool:
     return any(p in combined for p in CLAUDE_LIMIT_PATTERNS)
 
 
+def _failure_detail(output: str, head: int = 200, tail: int = 500) -> str:
+    """Head+tail slice of CLI output for failure logs.
+
+    Codex (and OpenCode) print the session banner first and the actual error
+    LAST, after the echoed prompt — a head-only slice logs the banner and
+    hides the cause entirely (observed Jul 30–Aug 11 2026: 321 failures, zero
+    usable error messages).
+    """
+    output = output.strip()
+    if len(output) <= head + tail:
+        return output
+    elided = len(output) - head - tail
+    return f"{output[:head]} …[{elided} chars elided]… {output[-tail:]}"
+
+
 # ─── Circuit breaker ────────────────────────────────────────────────────────
 
 class CircuitBreaker:
@@ -215,12 +231,12 @@ class Provider(Protocol):
 # Default tier presets. Each provider can override or extend at construction.
 # Tiers express *intent* ("I want a cheap classification call") without leaking
 # any provider's model names into caller code. The Claude-specific "sonnet" and
-# Codex-specific "gpt-5.6-luna" stay inside their own provider's tier table.
+# Codex-specific "gpt-6-luna" stay inside their own provider's tier table.
 #
 # IMPORTANT: factories below use copy.deepcopy() so per-instance mutations of
 # tiers["classification"]["effort"] can't leak back into these module-level
 # defaults (each tier maps to a nested dict, so a shallow copy would alias it).
-_CODEX_CLASSIFY_MODEL = os.environ.get("CODEX_CLASSIFY_MODEL", "gpt-5.6-luna")
+_CODEX_CLASSIFY_MODEL = os.environ.get("CODEX_CLASSIFY_MODEL", "gpt-6-luna")
 
 _CLAUDE_DEFAULT_TIERS: dict[str, dict] = {
     "classification": {"model": "sonnet", "effort": "low"},
@@ -229,11 +245,11 @@ _CLAUDE_DEFAULT_TIERS: dict[str, dict] = {
 _CODEX_DEFAULT_TIERS: dict[str, dict] = {
     # Classification uses a cheaper Codex model by default; CODEX_CLASSIFY_MODEL
     # keeps the shared tier overridable without leaking model names into callers.
-    "classification": {"model": _CODEX_CLASSIFY_MODEL, "effort": "low"},
+    "classification": {"model": _CODEX_CLASSIFY_MODEL, "effort": "medium"},
 }
 _OPENCODE_DEFAULT_TIERS: dict[str, dict] = {}
 
-# Codex 0.144 feature gates that can expose a callable capability. The explicit
+# Codex feature gates that can expose a callable capability. The explicit
 # ``tools="__none__"`` contract disables each gate independently because
 # suppressing web search alone still leaves shell, app, browser, image, and
 # delegation tools available.
@@ -247,6 +263,8 @@ _CODEX_TEXT_ONLY_DISABLED_FEATURES = (
     "in_app_browser",
     "computer_use",
     "image_generation",
+    # Codex 0.157 ignores tools.view_image; use its supported feature gate.
+    "view_image",
     "multi_agent",
     "hooks",
     "memories",
@@ -477,11 +495,11 @@ class CodexProvider:
     providers.py to the prompt-loader machinery.
 
     Per-call `tier`, `model`, and `effort` kwargs override construction defaults.
-    Default classification tier drops effort to "low" without changing the model.
+    Default classification tier uses Luna at "medium" effort.
     """
 
     bin: str
-    model: str = "gpt-5.6-sol"
+    model: str = "gpt-6-sol"
     effort: str = "xhigh"
     cwd: str | None = None
     sandbox_bypass: bool = True
@@ -569,7 +587,6 @@ class CodexProvider:
                     "--ignore-rules",
                     "--sandbox", "read-only",
                     "-c", "approval_policy=never",
-                    "-c", "tools.view_image=false",
                 ])
                 if research_only:
                     cmd.extend(["-c", "tools.web_search=true"])
@@ -625,7 +642,19 @@ class CodexProvider:
                 response = result.stdout.strip()
             if result.returncode != 0 or not response:
                 stderr_out = result.stderr.strip() if result.stderr else ""
-                log.error(f"Codex failed: {(stderr_out or result.stdout or '')[:500]}")
+                if result.returncode == 0:
+                    # The CLI echoes the prompt on stderr. A blank answer needs
+                    # stage correlation, not a dump of private input and warnings.
+                    log.error(
+                        "Codex failed (rc=0) code=empty_output mode=%s model=%s input_hash=%s",
+                        tools if tools in {"__none__", "__media__", "__research__"} else "default",
+                        effective_model, hashlib.sha256(prompt.encode()).hexdigest()[:16],
+                    )
+                else:
+                    log.error(
+                        f"Codex failed (rc={result.returncode}): "
+                        f"{_failure_detail(stderr_out or result.stdout or '')}"
+                    )
                 self.breaker.record_failure()
                 return ""
             if not _defer_success:
@@ -718,7 +747,10 @@ class OpenCodeProvider:
             )
             response = result.stdout.strip() if result.stdout else ""
             if result.returncode != 0 or not response:
-                log.error(f"OpenCode failed: {(result.stderr or result.stdout or '')[:500]}")
+                log.error(
+                    f"OpenCode failed (rc={result.returncode}): "
+                    f"{_failure_detail(result.stderr or result.stdout or '')}"
+                )
                 self.breaker.record_failure()
                 return ""
             if not _defer_success:
@@ -781,16 +813,25 @@ class ProviderChain:
 
     def _ask_receipt(
             self, prompt, *, timeout, validator=None, max_attempts=None,
-            deadline=None, **kwargs):
-        """Return output plus the exact provider call metadata that produced it."""
+            deadline=None, primary_contract_retries=0, **kwargs):
+        """Return output plus the exact provider call metadata that produced it.
+
+        ``primary_contract_retries`` repeats only a non-empty, validator-invalid
+        response from the primary provider. Empty output, fallback output, and
+        providers whose breaker opened are never retried by this layer.
+        """
+        if (
+            type(primary_contract_retries) is not int
+            or primary_contract_retries < 0
+        ):
+            raise ValueError(
+                "primary_contract_retries must be a non-negative integer"
+            )
         prompt = strip_surrogates(prompt)
         self._log_unknown_tier(kwargs.get("tier"))
         primary = self.providers[0] if self.providers else None
         attempts = 0
         for provider in self.providers:
-            provider_timeout = _bounded_provider_timeout(timeout, deadline)
-            if provider_timeout is None:
-                break
             if not provider.is_available():
                 continue
             if max_attempts is not None and attempts >= max_attempts:
@@ -800,39 +841,56 @@ class ProviderChain:
             provider_kwargs = dict(kwargs)
             if deadline is not None:
                 provider_kwargs["_deadline"] = deadline
-            text = provider.ask(
-                prompt,
-                timeout=provider_timeout,
-                _resolved_call=call,
-                _defer_success=True,
-                **provider_kwargs,
+            retries_remaining = (
+                primary_contract_retries if provider is primary else 0
             )
-            if (
-                deadline is not None
-                and time.monotonic() >= float(deadline)
-            ):
-                if text:
+            while True:
+                provider_timeout = _bounded_provider_timeout(timeout, deadline)
+                if provider_timeout is None:
+                    return None
+                text = provider.ask(
+                    prompt,
+                    timeout=provider_timeout,
+                    _resolved_call=call,
+                    _defer_success=True,
+                    **provider_kwargs,
+                )
+                if (
+                    deadline is not None
+                    and time.monotonic() >= float(deadline)
+                ):
+                    if text:
+                        provider.breaker.record_failure()
+                    return None
+                if not text:
+                    break
+                valid = validator is None or validator(text)
+                if (
+                    deadline is not None
+                    and time.monotonic() >= float(deadline)
+                ):
                     provider.breaker.record_failure()
-                break
-            if not text:
-                continue
-            valid = validator is None or validator(text)
-            if (
-                deadline is not None
-                and time.monotonic() >= float(deadline)
-            ):
-                provider.breaker.record_failure()
-                break
-            if not valid:
-                provider.breaker.record_failure()
-                log.warning("Rejected contract-invalid output from %s", provider.name)
-                continue
-            provider.breaker.record_success()
-            if primary is not None and provider is not primary:
-                log.info("Provider fallback: answered by %s", provider.name)
-            return ProviderResult(
-                text, provider.name, call.model, call.effort, call.tier
-            )
+                    return None
+                if not valid:
+                    provider.breaker.record_failure()
+                    log.warning(
+                        "Rejected contract-invalid output from %s",
+                        provider.name,
+                    )
+                    if retries_remaining > 0 and provider.is_available():
+                        retries_remaining -= 1
+                        log.info(
+                            "Retrying contract-invalid output from primary %s",
+                            provider.name,
+                        )
+                        continue
+                    break
+                provider.breaker.record_success()
+                if primary is not None and provider is not primary:
+                    log.info("Provider fallback: answered by %s", provider.name)
+                return ProviderResult(
+                    text, provider.name, call.model, call.effort, call.tier
+                )
         return None
 
     def ask_with_receipt(
@@ -844,7 +902,7 @@ class ProviderChain:
 
     def ask_validated(
             self, prompt, validator, *, timeout=3600, max_attempts=2,
-            deadline=None, **kwargs):
+            deadline=None, primary_contract_retries=0, **kwargs):
         """Return the first contract-valid receipt after at most one fallback."""
         return self._ask_receipt(
             prompt,
@@ -852,6 +910,7 @@ class ProviderChain:
             validator=validator,
             max_attempts=max_attempts,
             deadline=deadline,
+            primary_contract_retries=primary_contract_retries,
             **kwargs,
         )
 

@@ -43,7 +43,7 @@ def agent_module():
 
 
 def test_guarded_cycle_aborts_hung_run_agent_fast(agent_module):
-    async def _hang():
+    async def _hang(client):
         """Simulate a blocked await inside the agent cycle."""
         await asyncio.sleep(9999)
 
@@ -52,14 +52,15 @@ def test_guarded_cycle_aborts_hung_run_agent_fast(agent_module):
 
     started = time.monotonic()
     assert hasattr(agent_module, "_run_guarded_cycle")
-    asyncio.run(agent_module._run_guarded_cycle())
+    # True tells run_loop the shared client is presumed wedged -> rebuild it.
+    assert asyncio.run(agent_module._run_guarded_cycle(object())) is True
     elapsed = time.monotonic() - started
 
     assert elapsed < 2
 
 
 def test_guarded_cycle_allows_normal_run_agent(agent_module, caplog):
-    async def _noop():
+    async def _noop(client):
         """Return immediately to model a healthy agent cycle."""
         return None
 
@@ -68,7 +69,7 @@ def test_guarded_cycle_allows_normal_run_agent(agent_module, caplog):
 
     started = time.monotonic()
     assert hasattr(agent_module, "_run_guarded_cycle")
-    asyncio.run(agent_module._run_guarded_cycle())
+    assert asyncio.run(agent_module._run_guarded_cycle(object())) is False
     elapsed = time.monotonic() - started
 
     assert elapsed < 2

@@ -2,11 +2,15 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+> **Runtime state and env defaults are in [AGENTS.md](AGENTS.md)** (provider routing, PM2 runtime,
+> Jev routing, env defaults). This file is architecture; read AGENTS.md before changing runtime
+> behavior.
+
 ## Project Overview
 
 This is the **Leviathan News (LN)** workspace — a white-label crypto/DeFi news agent system. Fork it, set `AGENT_NAME`, and run your own instance.
 
-1. **`ln-agent.py`** — Automated news agent (PM2 name `ln-agent`) with 1-hour cycle sleep. Monitors Telegram channels (configured via `CHANNELS` env var), evaluates newsworthiness via the provider chain (`providers.py` — Codex primary, Claude fallback by default), deduplicates (URL dedup + self-dedup + provenance short-circuit + Bot HQ dedup), crafts headlines, posts via LN API. Also votes, writes TL;DR comments, runs the flag-gated market-match phase, and hosts the live-news WS listener.
+1. **`ln-agent.py`** — Automated news agent (PM2 name `ln-agent`). Monitors Telegram channels (configured via `CHANNELS` and `ID_SOURCES`) — hourly by cursor plus real-time Telethon push — evaluates newsworthiness via the provider chain (`providers.py` — Codex only by default), deduplicates (URL dedup + self-dedup + provenance short-circuit + Bot HQ dedup), crafts headlines, and posts. With `BENTHIC_NEWS_CHANNEL` set, every curated story goes to that Telegram channel; stories with evaluator heat ≥ `LN_SUBMIT_MIN_HEAT` (default 8) are submitted to the LN API. Also votes, writes sparse usefulness-gated analysis comments on third-party articles, runs the flag-gated market-match phase, hosts the live-news WS listener, and can route bounded classification tasks to the opt-in Jev evaluator (`jev_news.py`).
 
 2. **`benthic-bot.py`** — Telegram chat bot (PM2 name `benthic-bot`) sharing brain/identity with ln-agent. Responds in groups and operator DMs. Features: evidence-grounded replies, per-chat memory isolation, tiered operator auth, [GROUP] directive routing, agent-chat API polling, message debouncing, media analysis, persistent memory, self-awareness tracking, runtime-mediated sandbox, breaking-news reactions.
 
@@ -29,42 +33,45 @@ This is the **Leviathan News (LN)** workspace — a white-label crypto/DeFi news
 
 ## Architecture: ln-agent.py
 
-Single-file Python agent running in a continuous loop (`run_loop`) with a flat 1-hour sleep after each completed cycle. Each cycle has six phases (the sixth is flag-gated), with Phase 3 running articles in parallel threads:
+Single-file Python agent running in a continuous loop (`run_loop`) over a **persistent Telethon client** (created once by `_build_client()`, owned by `run_loop`, passed into each cycle; rebuilt through bounded disconnect + `_connect_and_register()` when a cycle hits `CYCLE_DEADLINE` or Telethon reaches a terminal disconnect after exhausting its own reconnects). A terminal-disconnect watcher is created before push registration and participates in every between-cycle wait, so a dead source client is rebuilt immediately instead of remaining falsely healthy until the next full cycle; successful automatic reconnects leave that watcher pending and do not trigger a rebuild. Terminal connection handoffs are retired as failed attempts and take the normal 60-second retry cadence. A rebuilt client re-registers push handlers and preserves the normal `CYCLE_INTERVAL` before the next full cycle. Because Telethon shields its internal cleanup, a disconnect timeout/error fails the process closed for PM2 to restart rather than overlapping two clients against one session. Everything shares ONE event loop — the client, its push handlers, both wake events, and the disconnect watcher are same-loop primitives; never move Telethon to another thread/loop. Each hourly cycle has six phases (the sixth is flag-gated), with Phase 3 running articles in parallel threads:
 
-1. **Read** — Connect to Telegram via Telethon, fetch new messages from `CHANNELS` list using cursor-based pagination (stored in SQLite). Channel usernames are resolved to numeric IDs and cached to avoid flood waits.
-2. **Evaluate** — Batch all messages to the provider layer (`providers.py`) for newsworthiness scoring and story-level deduplication. `PROVIDER_ORDER` defaults to `codex,claude`: Codex (`gpt-5.6-sol`/xhigh for creative work and `gpt-5.6-luna`/low for classification) is primary; Claude (Opus/max and Sonnet/low respectively) is the automatic fallback. Each provider has an independent circuit breaker, and the chain tries the next available provider after an empty or failed result. OpenCode is dormant unless configured and explicitly added to `PROVIDER_ORDER`. The active model is instructed to use WebSearch/WebFetch/twitter-explorer to verify stories and find primary sources. Output is strict JSON.
-3. **Post** — For each newsworthy item: check DB for URL duplicate, self-dedup via `was_story_posted()` (word overlap on story_hint + headline against last 24h of own posts — catches same story from different sources), check Bot HQ for duplicates, verify freshness, resolve URL to primary source, craft headline + TL;DR in one creative-tier call, submit via LN API (`/api/v1/news/post`), auto-upvote, add TL;DR comment.
-4. **Vote/Comment** — Fetch recent approved articles from LN API, evaluate quality via the provider layer, vote up/down, write analysis comments on uncommented articles. Also votes on other users' comments (yaps).
+1. **Read** — Fetch new messages from `CHANNELS` list using cursor-based pagination (stored in SQLite). Channel usernames are resolved to numeric IDs and cached to avoid flood waits. The raw read decides "nothing new — exit"; `_drop_already_evaluated()` then removes `(channel, msg_id)` pairs a push mini-pass already evaluated, so only evaluation is skipped — Phases 4–6 always run when the read found messages.
+2. **Evaluate** — Batch all messages to the provider layer (`providers.py`) for newsworthiness scoring and story-level deduplication. `PROVIDER_ORDER` defaults to `codex`: Codex uses `gpt-6-sol`/xhigh for creative work and `gpt-6-luna`/medium for classification. Claude is retired from production; legacy adapters require explicit configuration. Each provider has an independent circuit breaker, and the chain tries the next available provider after an empty or failed result. OpenCode is dormant unless configured and explicitly added to `PROVIDER_ORDER`. **Evaluation runs at classification tier, soul-free, hard text-only (`tools="__none__"`)** — a scoring/filter task judged on message text alone; the `url` must be copied from the message text (URL-less stories are excluded — measured 2% of newsworthy volume). Primary-source research lives downstream in `resolve_craft_headline` (creative tier, tools), which runs only for stories that pass. History: until 2026-08-08 eval ran at the creative default with a web-research prompt; at push-pass frequency that exhausted the entire weekly GPT-5.6 pool in one day (2026-08-03) — do not reintroduce tools here. Output is strict JSON, including a **`heat` field (1–10)** per story; missing/malformed heat parses to 0 (`_parse_heat`) and can never reach LN.
+3. **Post** — `news_post_pass()` (shared with the news mini-pass) runs `_process_article` per story in parallel threads, with **destination-scoped dedup**: the universal gate (DB URL dup, blocked source, `was_story_posted()` self-dedup against last 24h of own posts — now spanning both destinations — and freshness) gates every story; the **LN gate** (provenance check + classify-tier Bot HQ dup check) runs only for hot stories (`heat >= LN_SUBMIT_MIN_HEAT`). After craft, **dual-path LN routing** (wire tier since 2026-08-08, squid-bot PR #882): hot LN-eligible stories submit editorially via LN API (`/api/v1/news/post`) + auto-upvote; cold and LN-gate-demoted stories submit with `wire: true` (instant `origin='benthic'` approved row — no HQ card/senate/main feed, no self-upvote, idempotent on duplicate URLs), gated by `ENABLE_WIRE_SUBMISSIONS` (default off — staff-gated server-side). Both legs return `format_news_data`: `news.url` is the **skip-landing tracked redirect** and `news.canonical_url` the article page. Then post to `BENTHIC_NEWS_CHANNEL` via `post_to_channel()` (always, when `ENABLE_CHANNEL_POSTS`) — when an LN row exists the channel message's **story link is the skip-landing redirect** (readers land on the source, LN counts the click; no raw source URLs in the channel), rendered as a **`Source` anchor** with **link previews disabled** on every payload variant (no bare redirect URL in the body, no preview card), plus the `⚓ Discuss on Leviathan` canonical anchor (utm-tagged, `validate_url`-checked); on submit failure the story link falls back to the source URL, and an HTML 400 falls back to the plain payload (bare URL, still preview-free). Submitted (pre-approval) and wire articles are already publicly visible, so links are live from birth. An LN-gate dup **demotes to wire** (channel post keeps LN links; with wire off, to channel-only); hot stories are HELD (nothing posted or saved, retryable) only when the Bot HQ fetch fails — cold stories proceed regardless, and the HQ fetch itself runs only when the pass has a hot candidate. Channel and LN failures are isolated (an LN submit exception still records the channel post). `save_posted` records `destination` (`channel`/`ln`/`both` — what actually succeeded; wire counts as the LN leg), `tg_message_id`, and `heat`; if nothing landed, nothing is saved. Ordinary and Tsunami submissions never receive an automatic TLDR, promotion note, or other self-comment.
+4. **Vote/Comment** — Fetch recent approved articles from LN API, evaluate quality via the provider layer, and vote up/down. An unsolicited analysis comment is eligible only on a positively voted third-party article that already has a non-Benthic yap, the creative stage returns a useful non-`SKIP` result, and the durable rolling budget has capacity. `ARTICLE_COMMENT_MAX_PER_24H` defaults to `3`, is clamped to `0..24`, and `0` disables unsolicited comments. Full and WS mini-passes share the same SQLite reservations. Yap voting and direct replies are unchanged.
 5. **Reply Detection** — Separate pass over last 20 articles we've commented on (regardless of age). Detects unreplied responses to our comments via `walk_replies_and_respond()`, crafts replies with prompt injection defense + sentinel verification. Skips articles already processed in Phase 4.
 6. **Market match** (flag-gated by `ENABLE_MARKET_MATCH`, default off) — Polls squid-bot's `GET /api/v1/agent/queue/?needs_market=true`, and for each approved article decides **attach** (an existing open market; autonomous; reversible FK), **propose** (a new market, for operator approval — benthic NEVER mints), or **skip** (an audited reason), POSTing to `POST /api/v1/agent/market-match/<id>/`. A cheap classification-tier pre-filter gates the expensive matcher; per-cycle cap is `MARKET_MATCH_MAX_PER_CYCLE`. Phase 3 also pre-attaches an open market to benthic's own posts, via the `market_id` field on `/news/post`. Depends on squid-bot PR #380 deployed; benthic's LN user must be `is_staff=True`.
 
-7. **Live-news WS listener** (flag `ENABLE_WS_EVENTS`, default on) — a supervised asyncio task in `run_loop` (OUTSIDE the cycle watchdog) holds `wss://api.leviathannews.xyz/ws/news/` (**Origin header required** — the handshake 403s without `Origin: https://leviathannews.xyz`), filters events to `WS_EVENT_TYPES` (default `news.approved`), and queues them in the `ws_events` table. Between full cycles, a throttled **mini-pass** (`ENABLE_WS_MINI_PASS`, min interval `MINI_PASS_MIN_INTERVAL`=600s, deadline `MINI_PASS_DEADLINE`=900s, cap `MINI_PASS_MAX_ARTICLES`=5) runs the extracted `vote_comment_pass()` on **queued ids only, consume-on-drain** — votes/comments land minutes after approval instead of up to an hour later. The gap flag (reconcile frames / reconnects / startup) is informational: gap backfill belongs to the hourly cycle, which polls the full feed, retires the queue, and clears the flag (a gap-widened mini-pass blew its deadline in prod 2026-07-02 — do not reintroduce). Liveness: protocol ping/pong ONLY (`WS_PING_INTERVAL`=20s, `WS_PING_TIMEOUT`=45s — generous so a transiently-stalled origin isn't declared dead). There is deliberately NO app-level recv timeout: the server's documented 25s heartbeats pause in practice, and the old 300s stall backstop was killing provably-healthy quiet connections — do not reintroduce one. Reconnect: exponential backoff + jitter capped at 300s; a connection that lived ≥`WS_STABLE_SECONDS` (60s) resets backoff to base (flaky-but-working streams must not ratchet to permanent 300s gaps); close code 4003 (capacity) starts at the cap. Requires `websockets` in the venv — if missing, the listener disables itself and the agent runs poll-only.
+7. **Source push listener** (flag `ENABLE_SOURCE_PUSH`, default on) — `register_source_handlers()` registers ONE Telethon `NewMessage` handler covering all resolvable `CHANNELS` (marked peer ids from the `channel_ids` cache; cache-miss resolutions paced by `PUSH_RESOLVE_PACING`=0.3s) **plus every `ID_SOURCES` entry** — except sources in `PUSH_EXCLUDED_SOURCES` (default empty; list high-volume/low-yield firehoses there — they stay hourly-only, so exclusion changes latency, not coverage) — `ID_SOURCES` is the env-configured id-keyed map for private channels/groups (JSON `{"<marked dialog id>": "label"}`; labels key cursors/evaluated/queue rows so Telegram renames never reset state; the agent's account must be a member; hourly reads go through `read_id_sources()`). The whole registration is bounded by `PUSH_REGISTER_TIMEOUT`=300s — on timeout the agent logs and runs poll-only for that client lifetime; sources added to either list are picked up at next restart. The handler is LLM-free: `_pre_filter_message()` keyword gate → `validate_url` on the first extracted URL (rows may still carry `url=NULL` for bare-domain links) → `INSERT OR IGNORE` into `pending_source_messages` (stores the `@username`, PK `(channel, msg_id)`, 7-day prune at cycle start) → set `_news_wake` only on a genuinely new row. Between cycles, a throttled **news mini-pass** (`run_news_pass`, own anchor `NEWS_PASS_MIN_INTERVAL`=900s, deadline `NEWS_PASS_DEADLINE`=1200s, cap `NEWS_PASS_MAX_MESSAGES`=25, clamped ≥1 — retuned 300s/10 → 900s/25 in the 2026-08-08 quota fix: fewer, fatter eval batches) drains the queue **consume-on-drain BEFORE any LLM work**, drops already-evaluated ids, runs the same `evaluate_and_deduplicate()` (in a worker thread via `asyncio.to_thread` so the deadline stays enforceable and Telethon/WS dispatch stay alive) and the same `news_post_pass()` as the cycle — a story lands on the channel minutes after the source posts instead of up to an hour. The push handler never advances channel cursors; the hourly cycle backfills anything not yet **evaluated** (a story evaluated by a pass but lost before posting is not reconsidered — same as a cycle abort between eval and post). `run_loop`'s between-cycle wait is a two-wake scheduler (`_ws_wake`/`_news_wake`, independent rate anchors reset at cycle end; when both are due, the more-overdue pass runs first so a long vote pass cannot starve news).
+
+8. **Live-news WS listener** (flag `ENABLE_WS_EVENTS`, default on) — a supervised asyncio task in `run_loop` (OUTSIDE the cycle watchdog) holds `wss://api.leviathannews.xyz/ws/news/` (**Origin header required** — the handshake 403s without `Origin: https://leviathannews.xyz`), filters events to `WS_EVENT_TYPES` (default `news.approved`), and queues them in the `ws_events` table. Between full cycles, a throttled **mini-pass** (`ENABLE_WS_MINI_PASS`, min interval `MINI_PASS_MIN_INTERVAL`=600s, deadline `MINI_PASS_DEADLINE`=900s, cap `MINI_PASS_MAX_ARTICLES`=5) runs the extracted `vote_comment_pass()` on **queued ids only, consume-on-drain** — votes/comments land minutes after approval instead of up to an hour later. The gap flag (reconcile frames / reconnects / startup) is informational: gap backfill belongs to the hourly cycle, which polls the full feed, retires the queue, and clears the flag (a gap-widened mini-pass blew its deadline in prod 2026-07-02 — do not reintroduce). Liveness: protocol ping/pong ONLY (`WS_PING_INTERVAL`=20s, `WS_PING_TIMEOUT`=45s — generous so a transiently-stalled origin isn't declared dead). There is deliberately NO app-level recv timeout: the server's documented 25s heartbeats pause in practice, and the old 300s stall backstop was killing provably-healthy quiet connections — do not reintroduce one. Reconnect: exponential backoff + jitter capped at 300s; a connection that lived ≥`WS_STABLE_SECONDS` (60s) resets backoff to base (flaky-but-working streams must not ratchet to permanent 300s gaps); close code 4003 (capacity) starts at the cap. Requires `websockets` in the venv — if missing, the listener disables itself and the agent runs poll-only.
 
 ### Key Classes
-- **`AgentDB`** — SQLite wrapper (WAL mode) with tables: `channel_cursors`, `channel_ids`, `evaluated_messages`, `posted_articles`, `commented_articles`, `voted_articles`, `voted_yaps`, `replied_yaps`, `runs`, `market_decisions`, `ws_events`
-- **`LNClient`** — LN API client with wallet-based auth (nonce → sign → verify → JWT). Endpoints: `/news/post`, `/news/{id}/vote`, `/news/{id}/post_yap`, `/news/{id}/list_yaps`
+- **`AgentDB`** — SQLite wrapper (WAL mode) with tables: `channel_cursors`, `channel_ids`, `evaluated_messages` (incl. `heat`), `posted_articles` (incl. `destination`/`tg_message_id`/`heat`), `commented_articles`, `unsolicited_article_comments`, `voted_articles`, `voted_yaps`, `replied_yaps`, `runs`, `market_decisions`, `ws_events`, `pending_source_messages`
+- **`LNClient`** — LN API client. Auth: `X-API-Key` when `LN_API_KEY` / `LN_API_KEY_FILE` (default `~/.claude/.ln-api-key`) is set, else wallet nonce → sign → verify → JWT. LN's nonce limit (10/min, 60/h) is shared by all clients, so failed wallet logins back off 60s→900s (`LNAuthBackoff`), and the Jev publication worker keeps one lazily-authenticated client (an LN failure costs only the LN leg; the channel post proceeds). The key is dropped on cross-host redirects (`_LNSession`). Endpoints: `/news/post`, `/news/{id}/vote`, `/news/{id}/post_yap`, `/news/{id}/list_yaps`
 
 ### AI Evaluation Functions
 All AI calls go through `llm_ask()`, a provider wrapper with two tiers:
-- **Creative tier** — Codex `gpt-5.6-sol`/xhigh is primary. This tier uses the soul prompt and the task's permitted tools for headlines, TL;DR, analysis, and replies.
-  **Claude creative fallback** uses Opus/max when needed.
-- **Classification tier** — Shared Codex callers use `gpt-5.6-luna`/low. Benthic overrides its classification tier to `gpt-5.6-terra`/medium for pre-screening, sentinel checks, and grounded-reply verification. This tier uses no soul prompt and normally no tools for votes, freshness, duplicate checks, and reply worthiness.
-  **Claude classification fallback** uses Sonnet/low when needed.
+- **Creative tier** — Codex `gpt-6-sol`/xhigh is primary. This tier uses the soul prompt and the task's permitted tools for headlines, analysis, and replies.
+- **Classification tier** — Shared Codex callers use `gpt-6-luna`/medium. Benthic uses `gpt-6-luna`/medium for pre-screening and sentinel checks, and a separate `gpt-6-luna`/high tier for grounded-reply verification. These calls use no soul prompt and normally no tools for votes, freshness, duplicate checks, and reply worthiness.
 
-`llm_ask(prompt, timeout, tier, model, effort, skip_soul, tools)` dispatches through the configurable `PROVIDER_ORDER` (default: `codex,claude`). OpenCode participates only when it has a configured model and is explicitly added to the order. `"__none__"` is the hard text-only sentinel: Claude receives a non-matching tool allowlist, while Codex uses the isolated invocation documented below.
+`llm_ask(prompt, timeout, tier, model, effort, skip_soul, tools)` dispatches through the configurable `PROVIDER_ORDER` (default: `codex`). OpenCode participates only when it has a configured model and is explicitly added to the order. `"__none__"` is the hard text-only sentinel: Claude receives a non-matching tool allowlist, while Codex uses the isolated invocation documented below.
 
 Key functions:
 - `evaluate_and_deduplicate()` — batch evaluation, returns JSON array
 - `batch_evaluate_articles()` / `batch_evaluate_comments()` — JSON batch eval for Phase 4 (reduces LLM calls)
 - `_extract_json_array()` — 3-pass JSON extraction (fences, raw parse, bracket search)
 - `_pre_filter_message()` — keyword pre-filter before LLM eval (skips obvious noise)
-- `resolve_craft_headline_tldr()` — single creative-tier call: resolves primary source URL, crafts headline, writes TL;DR. Delimiter-based response format (===URL===, ===HEADLINE===, ===TLDR===). Replaces the former separate `resolve_to_primary_source()`, `craft_headline()`, and `craft_tldr()`.
+- `resolve_craft_headline()` — single creative-tier call that resolves the primary source URL and crafts one headline using `===URL===` and `===HEADLINE===` delimiters. A legacy trailing `===TLDR===` field is discarded defensively.
 - `evaluate_article_quality()` / `evaluate_comment_quality()` — vote weight (-1, 0, 1), classification tier
 - `craft_comment()` — analysis comments on articles, creative tier
 - `check_article_freshness()` — rejects stale articles, classification tier
-- Bot HQ duplicate check — inlined in `process_article_sync`, classification tier + Telegram tooling
+- `_process_article()` / `news_post_pass()` — module-level destination-scoped posting pass (extracted from the old `process_article_sync` closure); the Bot HQ dup check (classification tier, hot stories only) lives inside `_process_article`
+- `post_to_channel()` — Bot API send to `BENTHIC_NEWS_CHANNEL`; `(sent, message_id)`, never raises, 10s/attempt, 2 retries on network/5xx, honors capped 429 `retry_after`, 403 logs the add-bot-as-admin remediation, token redacted from logged errors; send lock held only around send + 0.5s spacing
+- `make_source_handler()` / `register_source_handlers()` — Telethon push → `pending_source_messages`
+- `run_news_pass()` / `_drop_already_evaluated()` — push-queue mini-pass + hourly overlap filter
 - `craft_reply()` / `walk_replies_and_respond()` — reply chain handling with injection defense
-- `_sentinel_check_sync()` — classification-tier sentinel verifies reply output before posting (gpt-5.6-luna under the shared Codex default; Sonnet on Claude fallback)
+- `_sentinel_check_sync()` — classification-tier sentinel verifies reply output before posting (gpt-6-luna under the shared Codex default)
 
 ### Thread Safety
 - `AgentDB`: all operations use `threading.Lock` via `_execute()`/`_commit()`. `check_same_thread=False` + WAL mode.
@@ -72,14 +79,14 @@ Key functions:
 
 ### Circuit Breaker
 - Each provider's breaker opens after 3 consecutive failures; the chain skips unavailable providers and tries the next available provider.
-- Claude `501`/quota/rate-limit style errors mark only Claude unavailable for `CLAUDE_LIMIT_COOLDOWN` seconds (default: 6 hours).
+- If explicitly re-enabled, legacy Claude `501`/quota/rate-limit style errors mark only Claude unavailable for `CLAUDE_LIMIT_COOLDOWN` seconds (default: 6 hours).
 - `run_agent()` resets transient failure counts at the start of each cycle; quota cooldowns survive those resets. `benthic-bot.py` makes the equivalent transient reset every `PROVIDER_BREAKER_RESET_INTERVAL` (300 seconds).
 
 ### Retry & Error Handling
-- Claude alone retries twice after its initial attempt, with 5s then 10s backoff, before recording a transient failure. Codex has no internal retry; its failed or empty result lets the provider chain try the next available provider.
+- The dormant Claude adapter retries twice after its initial attempt, with 5s then 10s backoff, before recording a transient failure. Codex has no internal retry; its failed or empty result lets the provider chain try the next available provider.
 - `_refresh_if_stale()` called inside `with self._lock:` in every LN API method — atomic freshness check + request.
 - `Connection: close` header prevents stale keep-alive connections.
-- Top-level `try/finally` in `run_agent()` guarantees DB close + Telegram disconnect on all exit paths.
+- Top-level `try/finally` in `run_agent()` guarantees DB close on all exit paths; the Telethon client outlives cycles — `run_loop` owns connect/disconnect/rebuild (`_build_client` cleans up its own half-connected client on a failed `start()`).
 
 ### Prompt Injection Defense
 All untrusted input (user comments, Telegram messages) is hardened before entering LLM prompts:
@@ -90,12 +97,12 @@ All untrusted input (user comments, Telegram messages) is hardened before enteri
 - **`validate_url()`** — validates LLM-returned URLs before downstream use: rejects control chars, spaces, non-HTTP schemes, oversized (>2048 chars). Also strips `<>` to prevent XML boundary injection when URLs are interpolated into prompts.
 - **Fail open** — `check_article_freshness()` defaults to fresh/allow on empty response OR WebFetch failure (403, paywall). The article already passed evaluation and dedup checks
 - **Fail closed** — Bot HQ duplicate check defaults to "duplicate" (reject) on empty/garbage provider output
-- **`_sentinel_check_sync()`** — sentinel verifies reply output is safe before posting, via the provider chain's classification tier: a different model from the creative one (gpt-5.6-luna checking gpt-5.6-sol under the shared Codex default; Sonnet/low on Claude fallback) for independent semantic verification. Still fails open if the sentinel itself cannot return a usable decision.
+- **`_sentinel_check_sync()`** — sentinel verifies reply output is safe before posting, via the provider chain's classification tier: a different model from the creative one (gpt-6-luna checking gpt-6-sol under the shared Codex default under the default Codex-only configuration) for independent semantic verification. Still fails open if the sentinel itself cannot return a usable decision.
 
 ### Execution Model
-- Runs as a continuous PM2 process (no cron). `run_loop()` sleeps `CYCLE_INTERVAL` (default 3600s) after each cycle.
+- Runs as a continuous PM2 process (no cron). `run_loop()` waits `CYCLE_INTERVAL` (default 3600s) between cycles on the two-wake scheduler (push news passes + WS vote passes fire between cycles when their throttles allow).
 - PM2 `autorestart: true` recovers from crashes. No `cron_restart` — avoids killing long runs.
-- Phase 3 articles process in parallel via `asyncio.gather` + `asyncio.to_thread`.
+- Phase 3 articles process in parallel via `asyncio.gather` + `asyncio.to_thread`; the mini-pass eval also runs via `to_thread`. Cycle Phases 2/4/5/6 still block the shared loop inline (pre-existing; `CYCLE_DEADLINE` only fires at an `await`).
 
 ## Architecture: benthic-bot.py
 
@@ -111,8 +118,8 @@ bounded read tools, but public composition, verification, repair, and
 sandbox-result synthesis use `tools="__none__"`.
 
 Anchored natural vocatives of the agent's name — from `AGENT_NAME`, e.g.
-`Benthic ...`, `Benthic, ...`, `Hey, Benthic bot ...` — count as direct without matching incidental mentions,
-filenames, or URLs. The tools-disabled Terra engagement prompt receives the
+`Benthic ...`, `Benthic, ...`, `Benthic: ...`, `Hey, Benthic bot ...` — count as direct without matching incidental mentions,
+filenames, or URLs. The tools-disabled Luna engagement prompt receives the
 exact sanitized direct-reply target body plus media marker even when the target
 has fallen out of the five-message snippet. `BENTHIC_ENGAGEMENT_TIMEOUT`
 defaults to 120 seconds and clamps to `30..300`; direct classifier failure
@@ -138,14 +145,42 @@ to 900 seconds while retaining at least 30 seconds for fallback and 30 seconds
 for trusted source transport. Typed `research_unavailable` and
 `source_collection_timeout` reasons are persisted only when composition
 abstains; a separately supported verified reply is not marked failed.
-Generic HTML accepts only evaluable `display` and `visibility` declarations:
-unknown inline CSS suppresses the element, unknown page CSS rejects the page,
-closed `dialog` ancestors are hidden, and `head`, `title`, and meta-description
-content never becomes visible body evidence. DNS resolver workers and Twitter
+Generic HTML page CSS is evaluated best-effort with over-hide-on-ambiguity
+(spec 2026-08-12): evaluable hide rules — element selectors, conditional
+`@media`/`@supports` blocks (over-applied; print-only skipped), complex
+selectors reduced to their rightmost subject compound with `:not()`
+stripped first (context/theme classes are never hidden), and curated
+always-hiding extras (`color:transparent`, `opacity:0`, `font-size:0`) —
+suppress their targets, while unevaluated CSS (external stylesheets,
+`@import`, past-work-bound or unparseable remainders) is accepted residual
+risk instead of rejecting the page. Inline styles share the same
+skip-unknown + curated-extras semantics (undecodable declarations still
+suppress their element), duplicate hide-relevant attributes hide when any
+occurrence hides, closed `dialog` ancestors are hidden, and `head`,
+`title`, and meta-description content never becomes visible body evidence. DNS resolver workers and Twitter
 child/reaper cleanup are process-wide bounded; a killed child receives a
 nonblocking reap attempt and otherwise transfers to bounded daemon cleanup.
 The process slot is returned only after that child is confirmed reaped; failed
 reaping quarantines capacity rather than allowing unbounded replacement children.
+
+Exact HTTPS YouTube watch, `youtu.be`, mobile-watch, and Shorts URLs canonicalize
+to one eleven-character video ID and dispatch before generic HTTP. Benthic uses
+public manual or autogenerated captions only, preferring manual English,
+generated English, manual original language, then generated original language;
+there is no translation, cookie, account, audio-download, or speech-to-text
+path. The pinned helper allows direct YouTube/Innertube HTTPS GET/POST only and
+is bounded by 30 seconds, 2 MiB aggregate response bytes, 65,536 stdout bytes,
+256 MiB address space, 30 CPU seconds, and two confirmed-reaped child slots. A
+47,000-byte caption body plus metadata may use 48,000 evidence bytes;
+`truncated=true` supports only its stated caption interval. Direct failures use
+`youtube_captions_unavailable` with "I couldn't access public captions for that
+video, so I can't summarize it reliably." Ambient failures remain silent. Logs
+omit video IDs, and metadata traces store hashed YouTube references. Run a
+caption preflight from the deploy host before relying on it (no proxy fallback). Exact
+`defusedxml==0.7.1` and `youtube-transcript-api==1.2.4` wheel hashes are locked
+in `requirements/youtube-transcript.lock`; when both were newly added, rollback
+runs `.venv/bin/python3 -m pip uninstall -y youtube-transcript-api defusedxml`
+and restores the archived runtime files.
 
 Selected image observation is path-exact: Codex receives only validated `-i`
 attachments and has `view_image` disabled, while Claude receives exact
@@ -153,8 +188,14 @@ attachments and has `view_image` disabled, while Claude receives exact
 artifact and observation-text hashes, never paths or bytes. Pipeline results
 name the final composer and final verifier explicitly. After repair, the second
 verifier sees original evidence plus the repair provider receipt, and trace
-composer fields identify the repair provider. Claude creative fallback always
-passes explicit Opus/max; classification remains Sonnet/low.
+composer fields identify the repair provider. The dormant Claude adapter uses
+explicit Opus/max for creative calls and Sonnet/low for classification only if
+an operator explicitly re-enables it.
+Each independent Luna/high grounding-verifier call may retry the same Codex
+primary once after a non-empty contract-invalid response, with the same prompt,
+resolved call, validator, and 300-second per-call cap. It does not retry empty
+output, valid pass/fail verdicts, an opened breaker, or invalid fallback output;
+all other provider-chain callers retain the zero-retry default.
 
 Ambient messages publish only after a useful reply passes factual support.
 Direct mentions/replies still engage, but missing focal/media evidence or a
@@ -201,13 +242,16 @@ Focused verification:
 Configuration defaults are `ENABLE_REPLY_GROUNDING=1`,
 `GROUNDING_MAX_BACKGROUND_SOURCES=3`,
 `GROUNDING_MAX_FOCAL_URLS=8`, `GROUNDING_MAX_SOURCE_REQUESTS=10`,
-`GROUNDING_MAX_SOURCE_BYTES=2097152`,
+`GROUNDING_MAX_SOURCE_BYTES=4194304`,
 `GROUNDING_SOURCE_COLLECTION_TIMEOUT=960`,
-`GROUNDING_MAX_EVIDENCE_BYTES=24000`, `GROUNDING_FETCH_TIMEOUT=15`,
+`GROUNDING_MAX_EVIDENCE_BYTES=65536`, `GROUNDING_FETCH_TIMEOUT=15`,
 `GROUNDING_TRACE_RETENTION_DAYS=14`, `PHOTO_REFERENCE_MAX_AGE=1800`, and
 `BENTHIC_ENGAGEMENT_TIMEOUT=120` (bounded to `30..300`).
-Creative Codex defaults remain `CODEX_MODEL=gpt-5.6-sol` and
-`CODEX_EFFORT=xhigh`; both are explicit operator overrides. `BENTHIC_DB` and
+Research and general creative Codex defaults remain `CODEX_MODEL=gpt-6-sol`
+and `CODEX_EFFORT=xhigh`. Grounded chat composition and repair select the
+`chat_reply` tier, whose `CODEX_REPLY_MODEL` defaults to `gpt-6-astra` and whose
+effort follows `CODEX_EFFORT`. Runtime model receipts resolve that same tier.
+These settings remain explicit operator overrides. `BENTHIC_DB` and
 `BENTHIC_LOG_FILE` override local state paths, while pytest and the grounding
 evaluator set temporary paths before importing the bot.
 Malformed grounding-limit values stop startup; a malformed optional engagement
@@ -230,16 +274,16 @@ after the incident is understood.
 - **[GROUP] directive** — Operators in DMs prefix with `[GROUP]` or `[GROUP:topic_id]` to route messages to agents group. `[GROUP]` without topic omits `message_thread_id` (sends to General — Telegram Bot API rejects `thread_id=1` for General). Multi-command splits on newlines, sends each as separate message.
 - **Agent-chat API poll** — `_poll_agent_chat()` fetches from LN's public chat history API every 60s. Content-based dedup (`_content_key()`) prevents double-responding across Telegram/API paths.
 - **Media support** — PIL re-encode for images (strips EXIF/metadata, MAX_IMAGE_PIXELS=25M). PDFs blocked. Text files sanitized.
-- **Relevant-media-only attach** — Grounded replies may use the current attachment, the direct-reply target's attachment, or the newest matching same-chat/topic image selected by an explicit fresh reference within `PHOTO_REFERENCE_MAX_AGE`. Selected images retain the existing download, size, and PIL sanitization limits, then enter a separate bounded observation stage. Allowlisted text documents are captured before the response gate as metadata-only `seen_documents` rows; one exact or uniquely named fresh same-chat/topic document may be re-fetched and rendered as a sanitized 16,000-character excerpt labeled with filename, original byte size, and `truncated` state. Selection and attachment both re-check scope, age, allowlist, and size; ambiguity fails closed, document bodies never enter SQLite/traces, and temp files are deleted after the turn. `seen_photos` and `seen_documents` each have independent 7-day/500-row pruning.
+- **Relevant-media-only attach** — Grounded replies may use the current attachment, the direct-reply target's attachment, or the newest matching same-chat/topic image selected by an explicit fresh reference within `PHOTO_REFERENCE_MAX_AGE`. Selected images retain the existing download, size, and PIL sanitization limits, then enter a separate bounded observation stage. Allowlisted text documents are captured before the response gate as metadata-only `seen_documents` rows; one exact or uniquely named fresh same-chat/topic document may be re-fetched and rendered with a UTF-8-safe 48,000-byte sanitized body cap labeled with filename, original byte size, and `truncated` state. `truncated=false` supports whole-document work; `truncated=true` remains excerpt-only. Evidence fitting drops background, conversation, then runtime receipts before selected media or the current task. Successful grounded Telegram sends derive metadata-only `reply_document_sources` receipts from the trusted trace and actual outgoing Telegram IDs. A direct reply to that authenticated bot message may reuse its unique same-chat/topic document within the 7-day media-retention window; ordinary filename/reference inference remains limited to 30 minutes. Selection and attachment independently re-check retention, scope, allowlist, size, and download type; missing or conflicting receipts fail closed, document bodies never enter SQLite/traces, and temp files are deleted after the turn. `seen_photos`, `seen_documents`, and reply-document receipts each have independent 7-day/500-row pruning.
 - **Persistent memory** — `notes` SQLite table with `[REMEMBER:category]`/`[UPDATE:id]`/`[FORGET:id]` directives. Categories: goal, person, task, stance, learning, note. Operator-only writes (non-operator directives stripped without execution), auto-prunes at 200. Bot instructed to update existing notes rather than creating duplicates.
 - **Self-awareness** — `own_actions` table tracks all bot actions (bets, messages, replies).
-- **Autonomous trading** — Periodic market evaluation via `_check_markets()` every `MARKET_CHECK_INTERVAL` (default 1800s/30min). Reads chat context + own positions, then uses the provider-chain creative/tools call (Codex `gpt-5.6-sol`/xhigh primary; Claude Opus/max fallback) before executing authorized commands (`/buy`, `/sell`, `/position`, `/markets@lnn_headline_bot`). Also trades reactively during normal message processing when identity prompt permits. The market check runs in a **single-flight background daemon thread** (spawned by `_maybe_spawn_market_check()`, guarded by `_market_check_lock`), NOT inline in the poll loop — so the LLM/trading pass never blocks `getUpdates` and the bot stays responsive to chat while it evaluates. Thread-safe because `_db()` opens a fresh WAL connection per call and `send_message`/`tg_request` are stateless. Message replies and the agent-chat poll likewise run off the poll thread (the per-sender worker pool — see the **Poll Loop** section above), so neither a market check nor a long reply blocks `getUpdates`.
-- **Breaking-news reactions** — `_maybe_spawn_breaking_news()` (single-flight daemon, mirrors the market-check pattern) drains `ws_events` rows written by ln-agent's WS listener. Hard gates before any LLM call: `ENABLE_WS_BREAKING_NEWS` (default on), one send per `BREAKING_NEWS_MIN_INTERVAL` (3600s), freshness `BREAKING_NEWS_MAX_AGE` (900s — stale rows are consumed silently, so restarts never spam catch-up news), own-article skip (via `posted_articles`), once-ever per article. Survivors pass a provider-chain classification notability gate (Codex `gpt-5.6-luna`/low primary; Claude Sonnet/low fallback) using `prompts/bot/breaking_news_gate.md` ("most articles are SKIP"), then one provider-chain creative craft pass with no tools using `prompts/bot/breaking_news.md` (`{no_slop}` injected; the prompt forbids facts beyond the headline) to `WS_NEWS_CHAT_ID` (default: agents group). The rate budget is spent only on actual sends; gate-SKIPs don't block a later genuinely-notable story.
+- **Autonomous trading** — Periodic market evaluation via `_check_markets()` every `MARKET_CHECK_INTERVAL` (default 1800s/30min). Reads chat context + own positions, then uses the provider-chain creative/tools call (Codex `gpt-6-sol`/xhigh) before executing authorized commands (`/buy`, `/sell`, `/position`, `/markets@lnn_headline_bot`). Also trades reactively during normal message processing when identity prompt permits. The market check runs in a **single-flight background daemon thread** (spawned by `_maybe_spawn_market_check()`, guarded by `_market_check_lock`), NOT inline in the poll loop — so the LLM/trading pass never blocks `getUpdates` and the bot stays responsive to chat while it evaluates. Thread-safe because `_db()` opens a fresh WAL connection per call and `send_message`/`tg_request` are stateless. Message replies and the agent-chat poll likewise run off the poll thread (the per-sender worker pool — see the **Poll Loop** section above), so neither a market check nor a long reply blocks `getUpdates`.
+- **Breaking-news reactions** — `_maybe_spawn_breaking_news()` (single-flight daemon, mirrors the market-check pattern) drains `ws_events` rows written by ln-agent's WS listener. Hard gates before any LLM call: `ENABLE_WS_BREAKING_NEWS` (default on), one send per `BREAKING_NEWS_MIN_INTERVAL` (3600s), freshness `BREAKING_NEWS_MAX_AGE` (900s — stale rows are consumed silently, so restarts never spam catch-up news), own-article skip (via `posted_articles`), once-ever per article. Survivors pass a provider-chain classification notability gate (Codex `gpt-6-luna`/medium) using `prompts/bot/breaking_news_gate.md` ("most articles are SKIP"), then one provider-chain creative craft pass with no tools using `prompts/bot/breaking_news.md` (`{no_slop}` injected; the prompt forbids facts beyond the headline) to `WS_NEWS_CHAT_ID` (default: agents group). The rate budget is spent only on actual sends; gate-SKIPs don't block a later genuinely-notable story.
 - **Notification gate** — before the LLM pre-screen, `_is_routine_notification()` deterministically SKIPs mechanical `lnn_headline_bot` notifications (deploys, repo pushes, PR events, admin panel, market listings) with zero LLM calls. Sender-scoped + prefix-anchored regexes; measured 2026-07-02 at 538/1958 daily pre-screens (~27% classify-call cut). The bypass list (mentions, market/trade keywords) is consulted FIRST, so anything that should reach the full brain is unaffected.
-- **Two-pass pre-screen** — Group messages (non-direct) go through a classification-tier pre-screen (~30 tokens) before expensive DB queries + a provider-chain creative response. ~70% of messages filtered as SKIP, saving ~9,500 tokens per skipped message. The Codex classification tier uses `gpt-5.6-terra`/medium (model env `CODEX_CLASSIFY_MODEL`); Claude's fallback stays Sonnet/low. `bypass_prescreen` skips the pre-screen for direct/Benthic mentions and market/trade-keyword messages — but **not** routine `lnn_headline_bot` notifications (the bypass clause for that sender was removed after the 2026-06-03 essay-leak incident, where PR/deploy notifications hit the essay-prone full brain instead of the cheap SKIP gate).
+- **Two-pass pre-screen** — Group messages (non-direct) go through a classification-tier pre-screen (~30 tokens) before expensive DB queries + a provider-chain creative response. ~70% of messages filtered as SKIP, saving ~9,500 tokens per skipped message. The Codex classification tier uses `gpt-6-luna`/medium (model env `CODEX_CLASSIFY_MODEL`). `bypass_prescreen` skips the pre-screen for direct/Benthic mentions and market/trade-keyword messages — but **not** routine `lnn_headline_bot` notifications (the bypass clause for that sender was removed after the 2026-06-03 essay-leak incident, where PR/deploy notifications hit the essay-prone full brain instead of the cheap SKIP gate).
 - **Knowledge base** — `knowledge` SQLite table with 15 platform reference topics (prediction markets, SQUID economy, tipping, article system, etc.). Loaded on-demand via word-boundary keyword matching against message + recent conversation context. Capped at `MAX_KNOWLEDGE_TOPICS=5` per prompt. Topics seeded at startup via `seed_knowledge()`.
-- **Tiered LLM calls** — `llm_ask()` accepts `tier`, `model`, `effort` params. Shared classification calls map to gpt-5.6-luna/low on Codex and Sonnet/low on Claude; Benthic's Codex provider overrides that tier to gpt-5.6-terra/medium. `_check_markets()` instead uses the creative default with research tools (gpt-5.6-sol/xhigh on Codex, Opus/max on Claude). NEVER pass a provider-specific model name like `model="sonnet"` — explicit model beats the tier preset and poisons the other provider's invocation (the 2026-07-03 breaking-news-gate outage: `codex -m sonnet` → 100% failure).
-- **LLM provider layer** — Same Claude/Codex fallback with circuit breaker as ln-agent.py. Because the bot has no cycles, `_maybe_reset_provider_breakers()` in poll()'s periodic block clears failure counts every `PROVIDER_BREAKER_RESET_INTERVAL` (300s) — quota cooldowns keep holding. Without it, 3 transient Codex failures while Claude is down latch the chain open forever (2026-07-07/08: bot silent on Telegram ~2 days, every call returning empty in 0.0s, until a manual restart).
+- **Tiered LLM calls** — `llm_ask()` accepts `tier`, `model`, `effort` params. Shared classification calls map to gpt-6-luna/medium on Codex and Sonnet/low on Claude; Benthic also pins its Codex classification tier to gpt-6-luna/medium. `_check_markets()` instead uses the creative default with research tools (gpt-6-sol/xhigh on Codex, Opus/max on Claude). NEVER pass a provider-specific model name like `model="sonnet"` — explicit model beats the tier preset and poisons the other provider's invocation (the 2026-07-03 breaking-news-gate outage: `codex -m sonnet` → 100% failure).
+- **LLM provider layer** — Same Codex-only default with circuit breaker as ln-agent.py. Claude is retired and is not an automatic fallback. Because the bot has no cycles, `_maybe_reset_provider_breakers()` in poll()'s periodic block clears failure counts every `PROVIDER_BREAKER_RESET_INTERVAL` (300s) — quota cooldowns keep holding. Without it, 3 transient Codex failures while Claude is down latch the chain open forever (2026-07-07/08: bot silent on Telegram ~2 days, every call returning empty in 0.0s, until a manual restart).
 - **Agent-chat relay** — `AgentChatRelay` class posts bot messages to LN's agent-chat API for history visibility.
 - **Runtime-mediated sandbox** — chat first-pass models emit one multiline
   [SANDBOX] block. The worker strips it, checks deterministic intent against
@@ -325,15 +369,21 @@ PY
 
 Credentials live outside the repo: `~/.claude/telegram-creds.json`
 (api_id/api_hash), `~/.claude/.ln-wallet-key` (ETH private key),
-`~/.claude/.ln-bot-token` (Telegram bot token), plus a dedicated Telethon
-session file for the agent (keep it separate from any interactive session to
-avoid SQLite lock conflicts).
+`~/.claude/.ln-api-key` (LN `squid_` API key; optional, replaces wallet login),
+`~/.claude/.ln-bot-token` (Telegram bot token), optional `jev.key` beside
+`jev_news.py` (TypeSafe key, only when `JEV_TASKS` is set), plus a dedicated
+Telethon session file for the agent (keep it separate from any interactive
+session to avoid SQLite lock conflicts; `LN_TELEGRAM_SESSION` overrides the path).
 
 ## Testing
 
 ```bash
 python3 -m pytest tests/ -v  # full suite
 ```
+
+## Codex Usage Monitor
+
+`scripts/codex_usage_report.py` queries `codex app-server` (JSON-RPC `account/rateLimits/read` — backend metadata, zero token cost) and posts a compact usage line (weekly/5h window %, reset time, plan; ⚠️ ≥70%, 🔴 ≥90%) to Telegram via the chat bot (`BOT_TOKEN`/`BOT_TOKEN_FILE`). Run it from cron on the deploy host (e.g. every 6h). **PRIVACY: usage numbers and account details are operator-only — `USAGE_REPORT_CHAT_ID` (required) is the operator's DM, the message carries no email/PII, and it must never point at a group.** Ad hoc: `.venv/bin/python3 scripts/codex_usage_report.py --dry-run`.
 
 ## Headline Validation
 
@@ -346,17 +396,19 @@ Checks: character count (75-150), trailing period, sentence case, article usage,
 ## LN API
 
 - Base: `https://api.leviathannews.xyz/api/v1`
-- Auth: wallet nonce/sign/verify flow → JWT cookie
+- Auth: `X-API-Key: squid_...` (preferred for ln-agent; `LN_API_KEY` / `LN_API_KEY_FILE`), or wallet nonce/sign/verify flow → JWT cookie. `/wallet/me/` ignores API keys; user id comes from `/wallet/<address>/profile/`
 - Bot HQ Telegram group: `BOT_HQ_GROUP_ID` env var (ground truth for duplicate checking, not LN API)
 
 ## Important Conventions
 
-- The agent posts via LN API (wallet auth), **never** via Telegram bot commands
-- Duplicate detection runs **provenance short-circuit, classify-tier HQ as the real check** (`_provenance_dedup_check`, free `POST /provenance/check`, env `ENABLE_PROVENANCE_DEDUP`/`PROVENANCE_CHECK_URL`). TRUST BOUNDARY: only positive matches are trusted — `duplicate`/recently-`known` → reject at zero tokens; old-`known` → proceed; **`new`/`stale` → fall through to the classify-tier HQ check** (live validation 2026-07-02: the provenance index returned `new` for our own approved articles — exact URL and headline of #267269 — while other authors' articles matched; absence-of-match is not evidence). Bot HQ remains the ground truth (the LN API may show auto-posted Tsunami articles that weren't approved); upfront HQ fetch + fail-closed HOLD semantics unchanged. Revisit if the upstream index gap is fixed
+- The agent posts via LN API (API key or wallet auth), **never** via Telegram bot commands
+- **Dedup is destination-scoped**: `posted_articles` — the agent's own ledger, spanning channel and LN posts — gates every story (URL dup + `was_story_posted` overlap). The LN-ecosystem checks below gate ONLY the LN leg of hot stories; Bot HQ is the source of truth only for what the agent may submit to Leviathan, not for what it may post to its own channel. An LN-gate dup **demotes** the story (to wire when enabled, else channel-only — a real post, no marker row); operator diagnostic for demotions is `heat >= <current bar> AND destination = 'channel'` plus the `LN gate: … demoting` log line. During a provider outage the fail-closed HQ check demotes every hot story. Operator hand-posts to the channel are not deduplicated against.
+- The LN gate runs **provenance short-circuit, classify-tier HQ as the real check** (`_provenance_dedup_check`, free `POST /provenance/check`, env `ENABLE_PROVENANCE_DEDUP`/`PROVENANCE_CHECK_URL`). TRUST BOUNDARY: only positive matches are trusted — `duplicate`/recently-`known` → demote at zero tokens; old-`known` → proceed; **`new`/`stale` → fall through to the classify-tier HQ check** (live validation 2026-07-02: the provenance index returned `new` for the agent's own approved articles while other authors' articles matched; absence-of-match is not evidence). The upfront HQ fetch runs only when the pass has a hot candidate; when it fails, hot candidates are HELD (unsaved, retryable) while cold ones proceed. Revisit if the upstream index gap is fixed
+- **Channel routing knobs**: `BENTHIC_NEWS_CHANNEL` (no default — channel posting is off until set; the bot must be a channel admin with "Post messages", else sends 403 with a CRITICAL log while the LN leg keeps working), `ENABLE_CHANNEL_POSTS` (default on, effective only with a channel — off skips channel sends ONLY, the LN bar still applies), `LN_SUBMIT_MIN_HEAT` (default 8, clamp 1–10 + warn; with no channel and wire off, stories below the bar are skipped before any craft call — set `1` for the legacy submit-everything-to-LN behavior), `ENABLE_WIRE_SUBMISSIONS` (default **off**: wire rows are staff-gated server-side, 403 for non-staff LN accounts; on = cold/demoted stories become wire rows so channel posts carry LN links), `ENABLE_SOURCE_PUSH` (default on — off = no push handlers, no news mini-pass, legacy hourly ingestion), `NEWS_PASS_MIN_INTERVAL`/`NEWS_PASS_DEADLINE`/`NEWS_PASS_MAX_MESSAGES` (900s/1200s/25; the interval drops to 1s in Jev real-time mode), `PUSH_EXCLUDED_SOURCES` (comma list of CHANNELS usernames / ID_SOURCES labels kept out of push registration — hourly-only; default empty), `PUSH_RESOLVE_PACING` (0.3s), `PUSH_REGISTER_TIMEOUT` (300s). Rollback levers: `ENABLE_SOURCE_PUSH=0` (latency only), `ENABLE_CHANNEL_POSTS=0` (channel only), full legacy = `ENABLE_CHANNEL_POSTS=0 LN_SUBMIT_MIN_HEAT=1`. Channel sends use the chat bot's token (`BOT_TOKEN` env, else `BOT_TOKEN_FILE`, default `~/.claude/.ln-bot-token`) — safe to share with benthic-bot (ln-agent never calls `getUpdates`).
 - `@LeviathanTsunami` articles are always submitted even if LN API says they exist (Tsunami auto-posts don't reach main feed via Bot HQ)
 - `AUTO_DOWNVOTE_USERS` (env, comma-separated LN usernames) — `.lower()` compared against author display name. Always auto-downvoted, no LLM evaluation.
 - `AUTO_UPVOTE_USERS` (env, comma-separated) — same pattern but hardcoded +1.
-- `BLOCKED_SOURCE_DOMAINS` — Python-side blocklist of content-farm and aggregator domains. Hard guard checked early in `process_article_sync` (both pre- and post-URL-resolve) so an eval-prompt slip doesn't reach LN. Env overrides: `BLOCKED_SOURCE_DOMAINS=...` replaces the default list; `EXTRA_BLOCKED_SOURCE_DOMAINS=...` appends. Match is suffix-based on the URL host (so `zine.live` blocks `www.zine.live` and any subdomain, but not `badzine.live`). Defaults include `zine.live`, press-release wires, and a curated set of SEO-driven crypto aggregators (`cryptopotato.com`, `u.today`, `watcher.guru`, etc.). Read once at module import — env changes need `pm2 restart ln-agent --update-env` to take effect. Rejected articles are recorded with `headline="[blocked source]"` so downstream consumers can filter them out.
+- `BLOCKED_SOURCE_DOMAINS` — Python-side blocklist of content-farm and aggregator domains. Hard guard checked early in `_process_article` (both pre- and post-URL-resolve) so an eval-prompt slip reaches neither the channel nor LN. Env overrides: `BLOCKED_SOURCE_DOMAINS=...` replaces the default list; `EXTRA_BLOCKED_SOURCE_DOMAINS=...` appends. Match is suffix-based on the URL host (so `zine.live` blocks `www.zine.live` and any subdomain, but not `badzine.live`). Defaults include `zine.live`, press-release wires, and a curated set of SEO-driven crypto aggregators (`cryptopotato.com`, `u.today`, `watcher.guru`, etc.). Read once at module import — env changes need `pm2 restart ln-agent --update-env` to take effect. Rejected articles are recorded with `headline="[blocked source]"` so downstream consumers can filter them out.
 - `HQ_DEDUP_HOURS` / `HQ_DEDUP_FETCH_LIMIT` — Env overrides for the Bot HQ duplicate-check window. Default is 168h (7 days) with 300-message fetch. Read per-cycle via `_env_int()` so a malformed value falls back to the default instead of crashing the cycle. The previous 6h cap let stories slip through when re-posted days later from a different source.
 - Channel numeric IDs are cached in SQLite to avoid Telegram `ResolveUsernameRequest` flood waits
 - Claude CLI uses `--allowedTools` whitelist (WebSearch, WebFetch, Read, Grep, Glob, + read-only Bash patterns for telegram_client.py, twitter_fetch.py, validate-headline.sh). No `Skill` — removed after security audit (Skill gave unrestricted access to telegram-explorer send capability). Telegram client restricted to read-only subcommands (messages, search-global, dialogs, info, topics, pinned).
@@ -367,6 +419,6 @@ Checks: character count (75-150), trailing period, sentence case, article usage,
 - LN API reply threading uses URL path (`/news/{yap_id}/post_yap`) to set parent — NOT `parent_id` body param
 - `check_article_freshness()` fails open on empty response: unknown/empty = allow, explicit `stale` = reject
 - User-generated content (comments, display names) is always sanitized via `sanitize_untrusted()` before any LLM prompt
-- WebFetch content is treated as UNTRUSTED in all craft functions (resolve_craft_headline_tldr, craft_comment) — explicit security warnings in prompts prevent injected instructions from being followed
+- WebFetch content is treated as UNTRUSTED in all craft functions (`resolve_craft_headline`, `craft_comment`) — explicit security warnings in prompts prevent injected instructions from being followed
 - `ws_events` is written ONLY by ln-agent's WS listener; both processes create the table (identical schema) so deploy order never matters. Consumers mark their own flag (`consumed_by_agent` / `consumed_by_bot`); rows prune after 7 days at cycle start. WS-provided headlines are sanitized via `sanitize_untrusted()` before any prompt use.
-- Market matching (Phase 6, plus pre-attach) is gated by `ENABLE_MARKET_MATCH` (default off). Tunable via `MARKET_MATCH_MAX_PER_CYCLE` (10), `MARKET_MATCH_MAX_B` (1000; a client-side cap on proposed liquidity, ≤ server `PREDICTION_MAX_B`), and `MARKET_MATCH_ATTACH_MIN_CONFIDENCE` (0.75). Benthic NEVER mints — `propose` only creates a Bot HQ approval card; operator approval mints. All matcher output is fail-closed to `skip`. Spec: `docs/superpowers/specs/2026-05-30-benthic-market-matching-brain-design.md`.
+- Market matching (Phase 6, plus pre-attach) is gated by `ENABLE_MARKET_MATCH` (default off). Tunable via `MARKET_MATCH_MAX_PER_CYCLE` (10), `MARKET_MATCH_MAX_B` (1000; a client-side cap on proposed liquidity, ≤ server `PREDICTION_MAX_B`), and `MARKET_MATCH_ATTACH_MIN_CONFIDENCE` (0.75). Benthic NEVER mints — `propose` only creates a Bot HQ approval card; operator approval mints. All matcher output is fail-closed to `skip`.

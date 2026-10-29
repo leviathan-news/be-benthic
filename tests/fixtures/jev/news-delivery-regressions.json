@@ -1,0 +1,98 @@
+[
+  {
+    "id": "misttrack_65409",
+    "partition": "incident",
+    "text": "\u26a0\ufe0f\u26a0\ufe0f\u26a0\ufe0f2.358 #BTC transferred from 2 wallet addresses to Bitget-Exploiter.\n\n[Go MistTrack](https://light.misttrack.io/address/BTC/bc1pngz4d5v7np7d4cy4ltenvcuws4mauxt8kthqdr384zgnzdqpacsqhhawfq) | [Transaction Details](https://blockchair.com/bitcoin/transaction/a54f282173aaf7b8a85542ef4476086894579513d390e63589eea04a81957ee2)",
+    "expected": false
+  },
+  {
+    "id": "misttrack_65653",
+    "partition": "incident",
+    "text": "180,000,000.0 #USDT transferred from #Bitfinex to #Tether-Treasury.\n\n[Go MistTrack](https://light.misttrack.io/address/USDT-TRC20/TKHuVq1oKVruCGLvqVexFs6dawKv6fQgFs)",
+    "expected": false
+  },
+  {
+    "id": "whale_large",
+    "partition": "boundary",
+    "text": "180 million USDT transferred from Bitfinex to Tether Treasury. https://www.coindesk.com/business/report",
+    "expected": false
+  },
+  {
+    "id": "exploiter_transfer",
+    "partition": "boundary",
+    "text": "2.358 BTC transferred from two wallets to an address labelled Bitget Exploiter. No new incident or finding is reported. https://www.coindesk.com/business/report",
+    "expected": false
+  },
+  {
+    "id": "security_new_freeze",
+    "partition": "boundary",
+    "text": "Circle and Tether have now frozen $318,000 linked to the Bitget hack, a new freeze action after the incident. https://www.coindesk.com/business/report",
+    "expected": true
+  },
+  {
+    "id": "security_new_return",
+    "partition": "boundary",
+    "text": "The Bitget exploiter returned $30 million to the exchange today following negotiations, the first recovery of stolen funds. https://www.coindesk.com/business/report",
+    "expected": true
+  },
+  {
+    "id": "security_new_exploit",
+    "partition": "boundary",
+    "text": "Investigators discovered an ongoing $4 million drain from Cedar Finance lending pools today. The team has halted withdrawals. https://www.coindesk.com/business/report",
+    "expected": true
+  },
+  {
+    "id": "security_new_attribution",
+    "partition": "boundary",
+    "text": "Researchers newly traced the Bitget attacker to a named hacking group through transaction links disclosed today. https://www.coindesk.com/business/report",
+    "expected": true
+  },
+  {
+    "id": "treasury_acquisition",
+    "partition": "boundary",
+    "text": "Strategy announced a new purchase of 1,200 bitcoin funded by its convertible issuance. https://www.coindesk.com/business/report",
+    "expected": true
+  },
+  {
+    "id": "treasury_internal",
+    "partition": "boundary",
+    "text": "150 million USDT moved between Tether Treasury wallets. https://www.coindesk.com/business/report",
+    "expected": false
+  },
+  {
+    "id": "ordinary_perpetual",
+    "partition": "boundary",
+    "text": "MEXC adds another perpetual trading pair for MASKSOL. No product or regulatory change. https://www.coindesk.com/business/report",
+    "expected": false
+  },
+  {
+    "id": "routine_spot",
+    "partition": "boundary",
+    "text": "MEXC adds an ordinary SI spot trading pair. https://www.coindesk.com/business/report",
+    "expected": true
+  },
+  {
+    "id": "structural_derivatives",
+    "partition": "boundary",
+    "text": "The CFTC approved Cedar Exchange to launch the first regulated US prediction-market futures product. https://www.coindesk.com/business/report",
+    "expected": true
+  },
+  {
+    "id": "foundation_treasury",
+    "partition": "boundary",
+    "text": "The Ethereum Foundation transfers 35,000 ETH to Kraken as part of treasury management. https://x.com/EF_ESP/status/123456790",
+    "expected": true
+  },
+  {
+    "id": "other_foundation_treasury",
+    "partition": "boundary",
+    "text": "The Solana Foundation announced a transfer of 500,000 SOL to Coinbase as a new allocation under its treasury management plan. https://www.coindesk.com/business/report",
+    "expected": true
+  },
+  {
+    "id": "automated_exchange_transfer",
+    "partition": "boundary",
+    "text": "15,000 ETH transferred from Kraken to Coinbase. https://www.coindesk.com/business/report",
+    "expected": false
+  }
+]

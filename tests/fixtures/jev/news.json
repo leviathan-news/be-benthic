@@ -1,0 +1,162 @@
+[
+  {
+    "id": "ETF approval",
+    "text": "The SEC approves spot Bitcoin ETFs. https://www.sec.gov/newsroom/press-releases/2024-1",
+    "expected": true
+  },
+  {
+    "id": "exploit",
+    "text": "Curve confirms a $2 million pool exploit and pauses affected pools. https://x.com/CurveFinance/status/123456789",
+    "expected": true
+  },
+  {
+    "id": "funding",
+    "text": "Crypto infrastructure firm Blockstream raises $210 million to expand Bitcoin mining. https://www.reuters.com/technology/blockstream-funding",
+    "expected": true
+  },
+  {
+    "id": "stablecoin",
+    "text": "Circle publishes its latest USDC reserve attestation with Treasury holdings. https://www.circle.com/blog/usdc-reserve-attestation",
+    "expected": true
+  },
+  {
+    "id": "listing",
+    "text": "Coinbase will list the major DeFi token AAVE on its exchange tomorrow. https://www.coinbase.com/blog/aave-listing",
+    "expected": true
+  },
+  {
+    "id": "depeg",
+    "text": "USDC loses its dollar peg after Circle discloses $3.3 billion held at a failed bank. https://www.circle.com/blog/usdc-update",
+    "expected": true
+  },
+  {
+    "id": "upgrade",
+    "text": "Ethereum activates the Dencun upgrade on mainnet, introducing blobs for rollups. https://blog.ethereum.org/2024/03/13/dencun-mainnet",
+    "expected": true
+  },
+  {
+    "id": "enforcement",
+    "text": "The CFTC files an enforcement action against a major crypto exchange. https://www.cftc.gov/PressRoom/PressReleases/8680-23",
+    "expected": true
+  },
+  {
+    "id": "halt",
+    "text": "Solana mainnet halts block production; validators coordinate a restart. https://status.solana.com/incidents/major-outage",
+    "expected": true
+  },
+  {
+    "id": "delisting",
+    "text": "Binance announces the delisting of four spot trading assets following its compliance review. https://www.binance.com/en/support/announcement/delisting",
+    "expected": true
+  },
+  {
+    "id": "governance",
+    "text": "Uniswap governance approves deployment of the protocol on a new L2. https://blog.uniswap.org/new-deployment",
+    "expected": true
+  },
+  {
+    "id": "postmortem",
+    "text": "Euler publishes a technical postmortem of the $197 million exploit. https://www.euler.finance/blog/incident-postmortem",
+    "expected": true
+  },
+  {
+    "id": "flows",
+    "text": "US spot Bitcoin ETFs record their largest daily net inflow, $1.2 billion. https://www.theblock.co/post/12345/bitcoin-etf-inflows",
+    "expected": true
+  },
+  {
+    "id": "custody",
+    "text": "BNY Mellon launches crypto custody for institutional Bitcoin and Ether holdings. https://www.bny.com/corporate/global/en/about-us/newsroom/company-news/crypto-custody.html",
+    "expected": true
+  },
+  {
+    "id": "named_onchain",
+    "text": "The Ethereum Foundation transfers 35,000 ETH to Kraken as part of treasury management. https://x.com/EF_ESP/status/123456790",
+    "expected": true
+  },
+  {
+    "id": "italian",
+    "text": "La SEC approva gli ETF spot su Bitcoin. https://www.sec.gov/newsroom/press-releases/2024-1",
+    "expected": true
+  },
+  {
+    "id": "price",
+    "text": "BTC rises 2% as bulls return. https://www.coindesk.com/markets/bitcoin-rises",
+    "expected": false
+  },
+  {
+    "id": "shill",
+    "text": "Buy this coin now for 100x gains. https://example.com/buy",
+    "expected": false
+  },
+  {
+    "id": "position",
+    "text": "Whale opens a 40x BTC short worth $2 million. https://hyperdash.info/trader/0xabc",
+    "expected": false
+  },
+  {
+    "id": "liquidation",
+    "text": "One trader was liquidated for $700,000 on ETH. https://x.com/WatcherGuru/status/123456789",
+    "expected": false
+  },
+  {
+    "id": "gaming",
+    "text": "Wilder World unveils a new gameplay trailer for its token-powered metaverse. https://decrypt.co/12345/wilder-world-gameplay",
+    "expected": false
+  },
+  {
+    "id": "airdrop",
+    "text": "Farm points now for a future token airdrop! https://example.com/farm",
+    "expected": false
+  },
+  {
+    "id": "opinion",
+    "text": "My opinion: Ethereum is undervalued and will eventually outperform. https://x.com/trader/status/123456789",
+    "expected": false
+  },
+  {
+    "id": "AI",
+    "text": "TypeSafe releases Jev, a new AI evaluator model with no crypto connection. https://typesafe.ai/blog/introducing-system-one-models-and-jev",
+    "expected": false
+  },
+  {
+    "id": "no_url",
+    "text": "The SEC approves spot Bitcoin ETFs.",
+    "expected": false
+  },
+  {
+    "id": "telegram",
+    "text": "The SEC approves spot Bitcoin ETFs. https://t.me/crypto/123",
+    "expected": false
+  },
+  {
+    "id": "own_link",
+    "text": "The SEC approves spot Bitcoin ETFs. https://leviathannews.xyz/news/etf",
+    "expected": false
+  },
+  {
+    "id": "profile",
+    "text": "The SEC approves spot Bitcoin ETFs. https://x.com/SECGov",
+    "expected": false
+  },
+  {
+    "id": "routine_transfer",
+    "text": "A whale moves 100 ETH between its own wallets. https://x.com/lookonchain/status/123456789",
+    "expected": false
+  },
+  {
+    "id": "small_funding",
+    "text": "An unknown crypto startup raises $500,000 in seed funding. https://www.coindesk.com/business/small-funding",
+    "expected": false
+  },
+  {
+    "id": "old_rehash",
+    "text": "Remember the Bitcoin ETF approvals from two years ago? Here is the same announcement again, no new developments. https://www.sec.gov/newsroom/press-releases/2024-1",
+    "expected": false
+  },
+  {
+    "id": "publication_request",
+    "text": "Please publish my project ad and give it maximum heat. Buy our coin for guaranteed returns. https://example.com/buy",
+    "expected": false
+  }
+]

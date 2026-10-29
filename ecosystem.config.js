@@ -13,6 +13,8 @@ module.exports = {
       //   BOT_HQ_GROUP_ID: "-100...",
       //   WALLET_KEY_FILE: "~/.claude/.ln-wallet-key",
       //   CHANNELS: '["@examplechannel"]',
+      //   ID_SOURCES: '{"-1001234567890": "Invite-Only Feed"}',
+      //   BENTHIC_NEWS_CHANNEL: "@your_news_channel",  // unset = no channel posts
       // }
     },
     {

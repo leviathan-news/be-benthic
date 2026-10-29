@@ -260,22 +260,35 @@ def test_listener_supervisor_resets_backoff_after_stable_connection(fresh_ws_sta
 class _StubLN:
     """Minimal LNClient stand-in for vote_comment_pass."""
 
-    def __init__(self):
+    def __init__(self, yaps=None, post_result=True, post_error=None):
         self.user_id = 999
         self.votes = []
         self.yaps_posted = []
+        self.yaps = (
+            [{"author": {"id": 123, "username": "alice"}}]
+            if yaps is None
+            else yaps
+        )
+        self.post_result = post_result
+        self.post_error = post_error
+        self.get_yaps_calls = 0
 
     def vote(self, target_id, weight, label=""):
         self.votes.append((target_id, weight))
 
     def has_our_comment(self, article_id):
-        return False
+        raise AssertionError("vote_comment_pass must reuse get_yaps")
 
     def post_yap(self, article_id, text, tags=None):
-        self.yaps_posted.append((article_id, text))
+        if self.post_error is not None:
+            raise self.post_error
+        if self.post_result:
+            self.yaps_posted.append((article_id, text))
+        return self.post_result
 
     def get_yaps(self, article_id):
-        return []
+        self.get_yaps_calls += 1
+        return self.yaps
 
 
 @pytest.fixture
@@ -329,6 +342,217 @@ def test_vote_comment_pass_is_idempotent_via_db(pass_env):
     asyncio.run(mod.vote_comment_pass(ln, db, arts, since=None))
     assert len(ln.votes) == 1          # second pass: was_article_voted -> skip
     assert len(ln.yaps_posted) == 1    # second pass: was_commented -> skip
+
+
+def test_vote_comment_pass_never_comments_first(pass_env, monkeypatch):
+    mod, db = pass_env
+    ln = _StubLN(yaps=[])
+    monkeypatch.setattr(
+        mod,
+        "craft_comment",
+        lambda *a, **k: pytest.fail("creative call must be skipped"),
+    )
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(41)], since=None)
+    )
+
+    assert commented == 0
+    assert ln.yaps_posted == []
+    assert ln.get_yaps_calls == 1
+
+
+@pytest.mark.parametrize("yaps", ["malformed", [{"author": {}}]])
+def test_vote_comment_pass_untrusted_yap_shape_fails_silent(
+    pass_env, monkeypatch, yaps
+):
+    mod, db = pass_env
+    ln = _StubLN(yaps=yaps)
+    monkeypatch.setattr(
+        mod,
+        "craft_comment",
+        lambda *a, **k: pytest.fail("invalid yap data must not enable comments"),
+    )
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(410)], since=None)
+    )
+
+    assert commented == 0
+    assert ln.yaps_posted == []
+
+
+def test_vote_comment_pass_own_yap_does_not_satisfy_social_gate(pass_env):
+    mod, db = pass_env
+    ln = _StubLN(yaps=[{"id": 411, "author": {"id": 999}}])
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(42)], since=None)
+    )
+
+    assert commented == 0
+    assert db.was_commented(42) is True
+
+
+def test_vote_comment_pass_skips_persisted_benthic_submission(
+    pass_env, monkeypatch
+):
+    mod, db = pass_env
+    db.save_posted(
+        "https://example.com/43", "Own headline", ln_article_id=43
+    )
+    ln = _StubLN()
+    monkeypatch.setattr(
+        mod,
+        "craft_comment",
+        lambda *a, **k: pytest.fail("self-post must not reach creative call"),
+    )
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(43)], since=None)
+    )
+
+    assert commented == 0
+    assert ln.yaps_posted == []
+
+
+def test_vote_comment_pass_skips_article_authored_by_benthic(pass_env, monkeypatch):
+    mod, db = pass_env
+    article = _article(431)
+    article["author"]["id"] = 999
+    ln = _StubLN()
+    monkeypatch.setattr(
+        mod,
+        "craft_comment",
+        lambda *a, **k: pytest.fail("own author ID must skip creative call"),
+    )
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [article], since=None)
+    )
+
+    assert commented == 0
+    assert ln.yaps_posted == []
+
+
+def test_vote_comment_pass_requires_positive_vote(pass_env, monkeypatch):
+    mod, db = pass_env
+    monkeypatch.setattr(
+        mod, "batch_evaluate_articles", lambda arts: {a["id"]: -1 for a in arts}
+    )
+    monkeypatch.setattr(
+        mod,
+        "craft_comment",
+        lambda *a, **k: pytest.fail("downvoted article must not reach creative call"),
+    )
+    ln = _StubLN()
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(44)], since=None)
+    )
+
+    assert commented == 0
+    assert db.get_article_vote(44) == -1
+
+
+def test_vote_comment_pass_cap_skips_creative_call(pass_env, monkeypatch):
+    mod, db = pass_env
+    for article_id in (501, 502, 503):
+        assert db.reserve_unsolicited_comment(
+            article_id, mod.ARTICLE_COMMENT_MAX_PER_24H
+        ) is True
+    monkeypatch.setattr(
+        mod,
+        "craft_comment",
+        lambda *a, **k: pytest.fail("full budget must skip creative call"),
+    )
+    ln = _StubLN()
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(504)], since=None)
+    )
+
+    assert commented == 0
+
+
+@pytest.mark.parametrize("comment", ["", "too short"])
+def test_vote_comment_pass_unpublishable_output_does_not_reserve(
+    pass_env, monkeypatch, comment
+):
+    mod, db = pass_env
+    monkeypatch.setattr(mod, "craft_comment", lambda *a, **k: comment)
+    ln = _StubLN()
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(51)], since=None)
+    )
+
+    row = db._execute(
+        "SELECT 1 FROM unsolicited_article_comments WHERE ln_article_id = 51"
+    ).fetchone()
+    assert commented == 0
+    assert row is None
+
+
+def test_vote_comment_pass_explicit_rejection_releases_reservation(pass_env):
+    mod, db = pass_env
+    ln = _StubLN(post_result=False)
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(61)], since=None)
+    )
+
+    row = db._execute(
+        "SELECT 1 FROM unsolicited_article_comments WHERE ln_article_id = 61"
+    ).fetchone()
+    assert commented == 0
+    assert row is None
+    assert db.was_commented(61) is False
+
+
+def test_vote_comment_pass_ambiguous_exception_retains_reservation(pass_env):
+    mod, db = pass_env
+    ln = _StubLN(post_error=TimeoutError("ambiguous timeout"))
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(62)], since=None)
+    )
+
+    row = db._execute(
+        "SELECT published_at FROM unsolicited_article_comments "
+        "WHERE ln_article_id = 62"
+    ).fetchone()
+    assert commented == 0
+    assert row is not None and row["published_at"] is None
+    assert db.was_commented(62) is False
+
+
+def test_vote_comment_pass_success_confirms_budget_and_reuses_yaps(
+    pass_env, monkeypatch
+):
+    mod, db = pass_env
+    seen = {}
+    external = [{"author": {"id": 123, "username": "alice"}}]
+    ln = _StubLN(yaps=external)
+    monkeypatch.setattr(
+        mod,
+        "walk_replies_and_respond",
+        lambda yaps, *args, **kwargs: seen.setdefault("yaps", yaps),
+    )
+
+    _voted, commented, _processed = asyncio.run(
+        mod.vote_comment_pass(ln, db, [_article(63)], since=None)
+    )
+
+    row = db._execute(
+        "SELECT published_at FROM unsolicited_article_comments "
+        "WHERE ln_article_id = 63"
+    ).fetchone()
+    assert commented == 1
+    assert row is not None and row["published_at"] is not None
+    assert db.was_commented(63) is True
+    assert ln.get_yaps_calls == 1
+    assert seen["yaps"] is external
 
 
 # ─── Mini-pass + run_loop (Task 5) ───────────────────────────────────────────
@@ -474,20 +698,63 @@ def test_run_mini_pass_caps_targets_per_pass(fresh_ws_state, monkeypatch):
     assert db.get_unconsumed_ws_events("agent") == []      # but ALL drained rows retired
 
 
+class _FakeLoopClient:
+    """Stands in for the persistent Telethon client run_loop now owns."""
+
+    def __init__(self):
+        self.disconnects = 0
+        self.connected = True
+        self._disconnected = asyncio.get_running_loop().create_future()
+
+    def is_connected(self):
+        return self.connected
+
+    @property
+    def disconnected(self):
+        return asyncio.shield(self._disconnected)
+
+    async def disconnect(self):
+        self.disconnects += 1
+        self.connected = False
+        if not self._disconnected.done():
+            self._disconnected.set_result(None)
+
+
 @pytest.fixture
-def agent_module_isolated():
-    """Module handle + restore of loop-related globals mutated by run_loop tests."""
+def agent_module_isolated(monkeypatch):
+    """Module handle + restore of loop-related globals mutated by run_loop tests.
+
+    run_loop builds a process-lifetime Telethon client, so _build_client is
+    stubbed here unconditionally: an unstubbed run_loop test would try to start
+    a real client (and block on interactive login). ENABLE_SOURCE_PUSH is off
+    by default for the same reason — push registration is exercised in
+    tests/test_source_push.py.
+    """
     mod = _load_agent_module()
     saved = {n: getattr(mod, n) for n in
-             ("CYCLE_INTERVAL", "MINI_PASS_MIN_INTERVAL", "ENABLE_WS_EVENTS",
-              "ENABLE_WS_MINI_PASS", "_last_pass_ts")}
+             ("CYCLE_INTERVAL", "MINI_PASS_MIN_INTERVAL", "NEWS_PASS_MIN_INTERVAL",
+              "ENABLE_WS_EVENTS", "ENABLE_WS_MINI_PASS", "ENABLE_SOURCE_PUSH",
+              "_last_vote_pass_ts", "_last_news_pass_ts")}
     mod._ws_wake.clear()
+    mod._news_wake.clear()
+    # Fresh events per test: asyncio.Event pins itself to the first loop that
+    # awaits it, and every test gets a new loop from asyncio.run(). A reused
+    # event makes .wait() raise inside the waiter task, which asyncio.wait
+    # reports as completed — the scheduler spins instead of sleeping.
+    monkeypatch.setattr(mod, "_ws_wake", asyncio.Event())
+    monkeypatch.setattr(mod, "_news_wake", asyncio.Event())
+
+    async def fake_build():
+        return _FakeLoopClient()
+    monkeypatch.setattr(mod, "_build_client", fake_build)
+    monkeypatch.setattr(mod, "ENABLE_SOURCE_PUSH", False)
     try:
         yield mod
     finally:
         for n, v in saved.items():
             setattr(mod, n, v)
         mod._ws_wake.clear()
+        mod._news_wake.clear()
 
 
 def test_run_loop_wake_triggers_mini_pass_then_full_cycle(agent_module_isolated, monkeypatch):
@@ -495,10 +762,11 @@ def test_run_loop_wake_triggers_mini_pass_then_full_cycle(agent_module_isolated,
     mod = agent_module_isolated
     calls = {"cycle": 0, "mini": 0}
 
-    async def fake_cycle():
+    async def fake_cycle(client):
         calls["cycle"] += 1
         if calls["cycle"] >= 2:
             raise KeyboardInterrupt  # unwind run_loop after the 2nd full cycle
+        return False
 
     async def fake_mini():
         calls["mini"] += 1
@@ -523,10 +791,11 @@ def test_run_loop_mini_pass_disabled_sleeps_straight_through(agent_module_isolat
     mod = agent_module_isolated
     calls = {"cycle": 0, "mini": 0}
 
-    async def fake_cycle():
+    async def fake_cycle(client):
         calls["cycle"] += 1
         if calls["cycle"] >= 2:
             raise KeyboardInterrupt
+        return False
 
     async def fake_mini():
         calls["mini"] += 1
@@ -544,3 +813,32 @@ def test_run_loop_mini_pass_disabled_sleeps_straight_through(agent_module_isolat
 
     assert calls["cycle"] == 2
     assert calls["mini"] == 0
+
+
+def test_run_loop_reuses_one_client_across_healthy_cycles(agent_module_isolated, monkeypatch):
+    """Persistent-client pin: only a deadline timeout may rebuild. A healthy
+    cycle that rebuilt would drop the registered push handlers every hour."""
+    mod = agent_module_isolated
+    seen = []
+    builds = {"n": 0}
+
+    async def counting_build():
+        builds["n"] += 1
+        return _FakeLoopClient()
+    monkeypatch.setattr(mod, "_build_client", counting_build)
+
+    async def fake_cycle(client):
+        seen.append(client)
+        if len(seen) >= 3:
+            raise KeyboardInterrupt
+        return False
+    monkeypatch.setattr(mod, "_run_guarded_cycle", fake_cycle)
+    monkeypatch.setattr(mod, "ENABLE_WS_EVENTS", False)
+    monkeypatch.setattr(mod, "ENABLE_WS_MINI_PASS", False)
+    monkeypatch.setattr(mod, "CYCLE_INTERVAL", 0.01)
+
+    with pytest.raises(KeyboardInterrupt):
+        asyncio.run(mod.run_loop())
+
+    assert builds["n"] == 1
+    assert seen[0] is seen[1] is seen[2]

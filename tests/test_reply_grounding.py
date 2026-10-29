@@ -1,6 +1,7 @@
 from dataclasses import replace
 import hashlib
 import json
+import math
 import socket
 import subprocess
 import sys
@@ -45,11 +46,110 @@ def telegram_message(message_id, text, *, chat_id=-1001, topic_id=None):
     return message
 
 
+@pytest.mark.parametrize("url", (
+    "https://youtube.com/watch?v=Noo0NWD0gHU",
+    "https://www.youtube.com/watch?v=Noo0NWD0gHU&t=12",
+    "https://m.youtube.com/watch?v=Noo0NWD0gHU",
+    "https://youtu.be/Noo0NWD0gHU?si=ignored",
+    "https://www.youtu.be/Noo0NWD0gHU",
+    "https://youtube.com/shorts/Noo0NWD0gHU",
+    "https://m.youtube.com/shorts/Noo0NWD0gHU/",
+))
+def test_youtube_parser_binds_supported_urls_to_one_video(url):
+    assert reply_grounding.parse_youtube_video_url(url) == (
+        "Noo0NWD0gHU",
+        "https://www.youtube.com/watch?v=Noo0NWD0gHU",
+    )
+    assert reply_grounding.canonical_source_url(url) == (
+        "https://www.youtube.com/watch?v=Noo0NWD0gHU"
+    )
+
+
+@pytest.mark.parametrize("url", (
+    "http://youtube.com/watch?v=Noo0NWD0gHU",
+    "https://user@youtube.com/watch?v=Noo0NWD0gHU",
+    "https://youtube.com:444/watch?v=Noo0NWD0gHU",
+    "https://youtube.com.attacker.example/watch?v=Noo0NWD0gHU",
+    "https://youtube.com/watch?v=Noo0NWD0gHU&v=AAAAAAAAAAA",
+    "https://youtube.com/watch?v=short",
+    "https://youtube.com/watch/extra?v=Noo0NWD0gHU",
+    "https://youtube.com/watch?v=Noo0NWD0gHU#fragment",
+    "https://youtube.com/watch?v=Noo0NWD0gHU#",
+    "https://youtube.com/playlist?list=PL123",
+    "https://youtube.com/channel/UC123",
+    "https://youtube.com/embed/Noo0NWD0gHU",
+    "https://youtu.be/Noo0NWD0gHU/extra",
+    None,
+    123,
+))
+def test_youtube_parser_rejects_non_video_or_ambiguous_urls(url):
+    assert reply_grounding.parse_youtube_video_url(url) is None
+
+
+@pytest.mark.parametrize("url", (
+    "http://youtube.com/watch?v=Noo0NWD0gHU",
+    "https://youtube.com/watch?v=Noo0NWD0gHU#fragment",
+    "https://youtube.com/playlist?list=PL123",
+    "https://music.youtube.com/watch?v=Noo0NWD0gHU",
+    "https://youtu.be/Noo0NWD0gHU/extra",
+))
+def test_unsupported_youtube_urls_never_become_generic_http(url):
+    with pytest.raises(GroundingFailure, match="YouTube"):
+        canonical_source_url(url)
+
+
+def test_youtube_caption_source_may_use_48000_evidence_bytes():
+    caption = "c" * 40_000
+    evidence = collect_evidence(
+        telegram_message(
+            4407, "https://youtube.com/watch?v=Noo0NWD0gHU"
+        ),
+        [],
+        [],
+        direct=True,
+        mode="grounded",
+        url_fetcher=lambda url, focal: FetchedSource(
+            "https://www.youtube.com/watch?v=Noo0NWD0gHU",
+            "youtube:Noo0NWD0gHU",
+            caption,
+            evidence_byte_limit=48_000,
+        ),
+        limits=GroundingLimits(max_evidence_bytes=65_536),
+    )
+    focal = next(item for item in evidence.items if item.kind == "focal_url")
+    assert focal.text == caption
+
+
+@pytest.mark.parametrize(("source_ref", "limit"), (
+    ("web:0123456789abcdef0123", 48_000),
+    ("youtube:Noo0NWD0gHU", 48_001),
+    ("youtube:Noo0NWD0gHU", True),
+))
+def test_elevated_source_limit_requires_exact_youtube_receipt(
+        source_ref, limit):
+    with pytest.raises(GroundingFailure, match="evidence byte limit"):
+        collect_evidence(
+            telegram_message(
+                4407, "https://youtube.com/watch?v=Noo0NWD0gHU"
+            ),
+            [],
+            [],
+            direct=True,
+            mode="grounded",
+            url_fetcher=lambda url, focal: FetchedSource(
+                url,
+                source_ref,
+                "caption",
+                evidence_byte_limit=limit,
+            ),
+        )
+
+
 def test_collector_keeps_current_and_reply_relationship_typed():
     current = {
         "message_id": 20,
         "chat": {"id": -1001},
-        "from": {"username": "zero"},
+        "from": {"username": "op_user"},
         "date": 1783883746,
         "text": "What does this mean?",
         "reply_to_message": {
@@ -88,6 +188,67 @@ def test_old_context_url_is_not_auto_fetched():
     assert fetched == []
 
 
+@pytest.mark.parametrize("forum, expected", [(False, True), (True, False)])
+def test_reply_threads_only_restrict_conversation_in_forums(forum, expected):
+    current = telegram_message(1146, "You missed the shared chat", topic_id=1143)
+    current["chat"]["is_forum"] = forum
+    link = telegram_message(1141, "https://example.com/shared")
+    link["chat"]["is_forum"] = forum
+    evidence = collect_evidence(
+        current, [link], [], direct=True, mode="conversation",
+        url_fetcher=lambda *_: pytest.fail("context alone must not fetch"),
+    )
+    assert any(item.source_ref == "telegram:-1001:1141"
+               for item in evidence.items) is expected
+
+
+def test_selected_recent_link_is_focal_without_replacing_current_request():
+    current = telegram_message(1146, "Read the shared chat I sent", topic_id=1143)
+    current["chat"]["is_forum"] = False
+    link = telegram_message(1141, "https://example.com/shared")
+    fetched = []
+
+    def fetch(url, focal):
+        fetched.append((url, focal))
+        return FetchedSource(url, "web:shared", "The conversation discusses Leviathan.")
+
+    evidence = collect_evidence(
+        current, [link], [], direct=True, mode="grounded", url_fetcher=fetch,
+        referenced_message=link,
+    )
+    assert fetched == [("https://example.com/shared", True)]
+    assert evidence.items[0].text == "Read the shared chat I sent"
+    assert next(item for item in evidence.items if item.evidence_id == "R2").source_ref == "telegram:-1001:1141"
+    assert evidence.focal_ids == ("F1",)
+
+
+@pytest.mark.parametrize("change", ["other_chat", "other_topic", "old", "future", "bot", "background", "forged"])
+def test_reference_rehydration_rejects_ineligible_messages_before_fetch(change):
+    current = telegram_message(1146, "Read the earlier link", topic_id=7)
+    current["chat"]["is_forum"] = True
+    link = telegram_message(1141, "https://example.com/shared", topic_id=7)
+    link["chat"]["is_forum"] = True
+    if change == "other_chat":
+        link["chat"]["id"] = -999
+    elif change == "other_topic":
+        link["message_thread_id"] = 8
+    elif change == "old":
+        link["date"] = current["date"] - 1801
+    elif change == "future":
+        link["date"] = current["date"] + 1
+    elif change == "bot":
+        link["from"]["is_bot"] = True
+    elif change == "background":
+        link["text"] = "Background: https://example.com/shared"
+    recent = [] if change == "forged" else [link]
+    with pytest.raises(GroundingFailure):
+        collect_evidence(
+            current, recent, [], direct=True, mode="grounded",
+            referenced_message=link,
+            url_fetcher=lambda *_: pytest.fail("ineligible reference fetched"),
+        )
+
+
 def test_evidence_budget_drops_whole_low_priority_items_and_preserves_hashes():
     current = telegram_message(40, "core")
     recent = [telegram_message(39, "conversation-evidence")]
@@ -124,6 +285,66 @@ def test_evidence_budget_rejects_essential_item_overflow_without_slicing():
             url_fetcher=lambda url, focal: None,
             limits=GroundingLimits(max_evidence_bytes=4),
         )
+
+
+def test_collector_preserves_complete_40k_text_document_media():
+    """Media normalization keeps an ordinary editorial review intact."""
+    final_marker = "\n# 10. Maze ideas - Additional nuggets to incorporate"
+    document = "d" * (40_442 - len(final_marker)) + final_marker
+    media_text = (
+        "[Attached text document: filename=review.md; bytes=40442; "
+        "truncated=false]\n" + document
+    )
+    evidence = collect_evidence(
+        telegram_message(411, "Produce the next draft"),
+        recent_messages=[],
+        persisted_context=[],
+        direct=True,
+        mode="conversation",
+        url_fetcher=lambda url, focal: None,
+        media_items=(EvidenceItem(
+            evidence_id="",
+            kind="media",
+            text=media_text,
+            source_ref="telegram:-1001:410:attachment",
+        ),),
+        limits=GroundingLimits(max_evidence_bytes=65_536),
+    )
+
+    media = next(item for item in evidence.items if item.kind == "media")
+    assert media.text == media_text
+    assert media.text.endswith(final_marker)
+
+
+def test_evidence_budget_drops_runtime_receipts_before_selected_media():
+    """Current-task media outranks unrelated runtime snapshots under pressure."""
+    media_text = "[document truncated=false]\n" + "m" * 20_000
+    evidence = collect_evidence(
+        telegram_message(412, "revise"),
+        recent_messages=[],
+        persisted_context=[],
+        direct=True,
+        mode="conversation",
+        url_fetcher=lambda url, focal: None,
+        media_items=(EvidenceItem(
+            evidence_id="",
+            kind="media",
+            text=media_text,
+            source_ref="telegram:-1001:410:attachment",
+        ),),
+        runtime_receipts=(EvidenceItem(
+            evidence_id="",
+            kind="runtime_receipt",
+            text="r" * 8_000,
+            source_ref="runtime:activity:0123456789abcdef0123",
+        ),),
+        limits=GroundingLimits(max_evidence_bytes=21_000),
+    )
+
+    assert [item.kind for item in evidence.items] == [
+        "current_message", "media"
+    ]
+    assert evidence.items[-1].text == media_text
 
 
 @pytest.mark.parametrize(
@@ -945,7 +1166,7 @@ def test_composition_rejects_normalized_claim_over_limit():
         "Evidence ID B2 has the liquidity figure.",
         "The support matrix is incomplete.",
         "The verification stage rejected it.",
-        "That is an unsupported claim.",
+        "My verifier marked an unsupported claim.",
         "The verifier rejected the catalyst.",
     ],
 )
@@ -969,8 +1190,7 @@ def test_naturalize_public_grounding_protocol_rewrites_only_internal_phrases():
 
     assert natural == (
         "My read: I wouldn't buy TOKEN based on the data I could verify. The "
-        "checked OHLCV is hourly. My checks marked a statement I could not "
-        "verify."
+        "checked OHLCV is hourly. My checks marked an unsupported claim."
     )
     assert reply_grounding.public_grounding_protocol_leaks(natural) == ()
 
@@ -1879,6 +2099,42 @@ def test_generic_fetcher_rejects_initial_and_redirected_x_hosts():
         fetcher.fetch("https://www.iana.org/redirect")
 
 
+@pytest.mark.parametrize(
+    "youtube_host", ("youtube.com", "music.youtube.com", "youtu.be")
+)
+def test_generic_fetcher_rejects_youtube_roots_on_every_hop(youtube_host):
+    """Generic HTML cannot fetch any YouTube root or subdomain."""
+    initial = SafeHttpFetcher(
+        resolver=resolver_for(["93.184.216.34"]),
+        connection_factory=lambda *args: pytest.fail(
+            "YouTube request spawned"
+        ),
+    )
+    with pytest.raises(GroundingFailure, match="YouTube"):
+        initial.fetch(
+            f"https://{youtube_host}/watch?v=Noo0NWD0gHU"
+        )
+
+    response = FakePinnedResponse(
+        302,
+        {
+            "location": (
+                f"https://{youtube_host}/watch?v=Noo0NWD0gHU"
+            )
+        },
+        b"",
+    )
+    redirected = SafeHttpFetcher(
+        resolver=resolver_map({
+            "www.iana.org": ["93.184.216.34"],
+            youtube_host: ["93.184.216.35"],
+        }),
+        connection_factory=lambda *args: FakePinnedConnection(response),
+    )
+    with pytest.raises(GroundingFailure, match="YouTube"):
+        redirected.fetch("https://www.iana.org/redirect")
+
+
 @pytest.mark.parametrize("x_host", ("mobile.twitter.com", "api.x.com"))
 def test_generic_fetcher_rejects_x_subdomain_on_initial_and_redirect_hops(
         x_host):
@@ -1927,7 +2183,7 @@ def test_x_subdomain_dot_boundary_keeps_lookalike_host_generic():
     FakePinnedResponse(
         200,
         {"content-type": "text/html"},
-        b"x" * 1_048_577,
+        b"x" * 1_572_865,
     ),
     FakePinnedResponse(
         200,
@@ -1938,6 +2194,43 @@ def test_x_subdomain_dot_boundary_keeps_lookalike_host_generic():
 def test_fetcher_rejects_oversized_or_binary(response):
     with pytest.raises(GroundingFailure):
         public_fixture_fetcher(response).fetch("https://example.com/file")
+
+
+@pytest.mark.parametrize("body,truncated", [
+    ("# Model pricing\n\nInput: $3 per million tokens.\n[Details](https://example.com/prices)\n€", False),
+    ("# Model pricing\n" + "price " * 2_000, True),
+], ids=["complete_utf8", "excerpt"])
+def test_fetcher_accepts_markdown_as_bounded_text(body, truncated):
+    """Official documentation can serve Markdown instead of HTML or plain text."""
+    encoded = body.encode("utf-8")
+    response = FakePinnedResponse(
+        200, {"content-type": "text/markdown; charset=utf-8"}, encoded,
+    )
+    charged = []
+    fetcher = public_fixture_fetcher(response)
+    fetcher.response_byte_consumer = charged.append
+
+    source = fetcher.fetch("https://example.com/model.md")
+
+    assert source.text.startswith("# Model pricing\n")
+    assert source.truncated is truncated
+    assert len(source.text) <= 8_000
+    assert source.reader == "http"
+    assert source.response_bytes == sum(charged) == len(encoded)
+    if not truncated:
+        assert "Input: $3 per million tokens." in source.text
+        assert "[Details](https://example.com/prices)" in source.text
+        assert source.text.endswith("€")
+
+
+def test_markdown_still_obeys_remaining_transport_byte_limit():
+    response = FakePinnedResponse(
+        200, {"content-type": "text/markdown; charset=utf-8"}, b"# Too much text",
+    )
+    with pytest.raises(GroundingFailure, match="response body too large"):
+        public_fixture_fetcher(response).fetch(
+            "https://example.com/model.md", max_response_bytes=5,
+        )
 
 
 @pytest.mark.parametrize("content_type", [
@@ -2057,7 +2350,7 @@ def test_fetcher_rejects_oversized_content_length_before_read():
         200,
         {
             "content-type": "text/plain",
-            "content-length": "1048577",
+            "content-length": "1572865",
         },
         b"small body",
     )
@@ -2207,6 +2500,233 @@ class _FakeTwitterProcess:
 
     def kill(self):
         self.kill_calls += 1
+
+
+def _youtube_success(**overrides):
+    payload = {
+        "ok": True,
+        "video_id": "Noo0NWD0gHU",
+        "language": "English",
+        "language_code": "en",
+        "is_generated": False,
+        "truncated": False,
+        "covered_seconds": 120.0,
+        "total_seconds": 120.0,
+        "caption_text": "[00:00:00] bounded captions",
+        "response_bytes": 1_234,
+    }
+    payload.update(overrides)
+    return json.dumps(payload)
+
+
+def test_youtube_fetcher_returns_contract_bound_caption_evidence():
+    calls, charges = [], []
+
+    def runner(argv, deadline, stdout_limit):
+        calls.append((argv, deadline, stdout_limit))
+        return _youtube_success()
+
+    fetcher = reply_grounding.YouTubeTranscriptFetcher(
+        python="/venv/python",
+        script="/app/scripts/youtube_caption_fetch.py",
+        runner=runner,
+        response_byte_consumer=charges.append,
+    )
+    source = fetcher.fetch(
+        "https://youtu.be/Noo0NWD0gHU",
+        max_response_bytes=2_000_000,
+    )
+    assert source.canonical_url == (
+        "https://www.youtube.com/watch?v=Noo0NWD0gHU"
+    )
+    assert source.source_ref == "youtube:Noo0NWD0gHU"
+    assert source.evidence_byte_limit == 48_000
+    assert "truncated=false" in source.text
+    assert source.response_bytes == 1_234
+    assert charges == [1_234]
+    assert "Noo0NWD0gHU" in calls[0][0]
+    assert all("youtu.be" not in value for value in calls[0][0])
+
+
+def test_youtube_fetcher_maps_typed_failure_after_charging():
+    raw = json.dumps({
+        "ok": False,
+        "failure": "captions_unavailable",
+        "response_bytes": 456,
+    })
+    charges = []
+    fetcher = reply_grounding.YouTubeTranscriptFetcher(
+        python="python",
+        script="helper.py",
+        runner=lambda *args: raw,
+        response_byte_consumer=charges.append,
+    )
+    with pytest.raises(reply_grounding.YouTubeTranscriptUnavailable):
+        fetcher.fetch("https://youtube.com/watch?v=Noo0NWD0gHU")
+    assert charges == [456]
+
+
+def test_youtube_unaccountable_child_spends_complete_reservation():
+    charges = []
+    fetcher = reply_grounding.YouTubeTranscriptFetcher(
+        python="python",
+        script="helper.py",
+        runner=lambda *args: (_ for _ in ()).throw(
+            GroundingFailure("youtube helper timed out")
+        ),
+        response_byte_consumer=charges.append,
+    )
+    with pytest.raises(reply_grounding.YouTubeTranscriptUnavailable):
+        fetcher.fetch(
+            "https://youtube.com/watch?v=Noo0NWD0gHU",
+            max_response_bytes=9_999,
+        )
+    assert charges == [9_999]
+
+
+@pytest.mark.parametrize("changes", (
+    {"video_id": "AAAAAAAAAAA"},
+    {"language": ""},
+    {"language_code": "https://attacker.test"},
+    {"is_generated": 1},
+    {"truncated": 0},
+    {"covered_seconds": math.nan},
+    {"covered_seconds": -1.0},
+    {"covered_seconds": 121.0, "total_seconds": 120.0},
+    {"covered_seconds": 60.0, "total_seconds": 120.0,
+     "truncated": False},
+    {"caption_text": "x" * 47_001},
+    {"caption_text": "x" * 48_001},
+    {"response_bytes": True},
+    {"response_bytes": 2_000_001},
+))
+def test_youtube_receipt_parser_rejects_invalid_fields(changes):
+    payload = json.loads(_youtube_success(**changes))
+    with pytest.raises(GroundingFailure):
+        reply_grounding._parse_youtube_caption_receipt(
+            payload, "Noo0NWD0gHU", reservation=2_000_000
+        )
+
+
+def test_youtube_receipt_parser_requires_exact_keys():
+    payload = json.loads(_youtube_success())
+    for invalid in (
+        {**payload, "extra": 1},
+        {
+            key: value
+            for key, value in payload.items()
+            if key != "language"
+        },
+    ):
+        with pytest.raises(GroundingFailure):
+            reply_grounding._parse_youtube_caption_receipt(
+                invalid, "Noo0NWD0gHU", reservation=2_000_000
+            )
+
+
+@pytest.mark.parametrize(
+    ("stdout", "wait_results"),
+    (
+        ((b"{}",), (2,)),
+        ((b"x" * 65_537,), (0,)),
+        ((), ("timeout", 0)),
+    ),
+    ids=("nonzero", "stdout-overflow", "deadline"),
+)
+def test_youtube_default_runner_failures_spend_complete_reservation(
+        monkeypatch, stdout, wait_results):
+    process = _FakeTwitterProcess(
+        _FakeTwitterPipe(stdout),
+        _FakeTwitterPipe(),
+        wait_results,
+    )
+    monkeypatch.setattr(
+        reply_grounding.subprocess, "Popen", lambda *a, **k: process
+    )
+    charges = []
+    fetcher = reply_grounding.YouTubeTranscriptFetcher(
+        python="python",
+        script="helper.py",
+        timeout=0.1,
+        response_byte_consumer=charges.append,
+    )
+    with pytest.raises(reply_grounding.YouTubeTranscriptUnavailable):
+        fetcher.fetch(
+            "https://youtube.com/watch?v=Noo0NWD0gHU",
+            max_response_bytes=9_999,
+        )
+    assert charges == [9_999]
+
+
+def test_youtube_process_timeout_reaps_before_releasing_slot(monkeypatch):
+    slot = threading.BoundedSemaphore(1)
+    process = _FakeTwitterProcess(
+        _FakeTwitterPipe(),
+        _FakeTwitterPipe(),
+        ("timeout", 0),
+    )
+    monkeypatch.setattr(
+        reply_grounding.subprocess, "Popen", lambda *a, **k: process
+    )
+
+    with pytest.raises(GroundingFailure, match="youtube caption helper"):
+        reply_grounding._run_bounded_source_process(
+            ["helper"],
+            time.monotonic() + 0.1,
+            64,
+            process_slots=slot,
+            source_label="youtube caption helper",
+        )
+
+    assert process.kill_calls == 1
+    assert process.wait_timeouts[-1] == 0
+    assert slot.acquire(blocking=False) is True
+
+
+def test_youtube_process_unreapable_child_quarantines_slot(monkeypatch):
+    release = threading.Event()
+    slot = threading.BoundedSemaphore(1)
+
+    class UnreapableProcess:
+        def __init__(self):
+            self.stdout = _FakeTwitterPipe()
+            self.stderr = _FakeTwitterPipe()
+            self.kill_calls = 0
+
+        def wait(self, timeout=None):
+            if timeout is None:
+                assert release.wait(timeout=1)
+                return 0
+            raise subprocess.TimeoutExpired("helper", timeout)
+
+        def terminate(self):
+            pass
+
+        def kill(self):
+            self.kill_calls += 1
+
+    process = UnreapableProcess()
+    monkeypatch.setattr(
+        reply_grounding.subprocess, "Popen", lambda *a, **k: process
+    )
+
+    with pytest.raises(GroundingFailure, match="youtube caption helper"):
+        reply_grounding._run_bounded_source_process(
+            ["helper"],
+            time.monotonic() + 0.1,
+            64,
+            process_slots=slot,
+            source_label="youtube caption helper",
+        )
+    assert slot.acquire(blocking=False) is False
+    release.set()
+    deadline = time.monotonic() + 1
+    acquired = False
+    while not acquired and time.monotonic() < deadline:
+        acquired = slot.acquire(blocking=False)
+        if not acquired:
+            time.sleep(0.01)
+    assert acquired is True
 
 
 @pytest.mark.parametrize(
@@ -2520,6 +3040,55 @@ def test_fetcher_strips_css_hidden_text_resolved_from_custom_property():
     assert source.text == "Public"
 
 
+@pytest.mark.parametrize("value", [
+    "var(--missing,revert)",
+    "var(--missing, var(--also-missing, block))",
+])
+def test_fetcher_keeps_text_with_visible_css_var_fallback(value):
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200, {"content-type": "text/html"},
+        (f"<style>p.framer-text{{display:{value}}}</style>"
+         "<p class='framer-text'>Article body</p>").encode(),
+    )).fetch("https://example.com/story")
+    assert source.text == "Article body"
+
+
+@pytest.mark.parametrize("definition, value", [
+    ("", "var(--missing, none)"),
+    ("--x:none;", "var(--x, block)"),
+    ("--x:var(--x);", "var(--x, block)"),
+    ("--x:initial;", "var(--x, none)"),
+    ("--x:inherit;", "var(--x, block)"),
+    ("", "var(--missing, var(--other, none))"),
+    ("", "var(--missing, var(--other))"),
+])
+def test_css_var_fallback_does_not_reveal_hidden_or_unresolved_text(definition, value):
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200, {"content-type": "text/html"},
+        (f"<p style='{definition}display:{value}'>secret</p>"
+         "<div>Public</div>").encode(),
+    )).fetch("https://example.com/story")
+    assert source.text == "Public"
+
+
+@pytest.mark.parametrize("definition", [
+    "<style>:root{--x:none}</style>",
+    "<style>@media screen{:root{--x:none}}</style>",
+    "<div style='--x:none'>",
+    r"<style>:root{--\78:none}</style>",
+])
+@pytest.mark.parametrize("target", [
+    "<p style='display:var(--x,block)'>secret</p>",
+    "<style>.article{display:var(--x,block)}</style><p class='article'>secret</p>",
+])
+def test_css_fallback_cannot_override_a_property_defined_elsewhere(definition, target):
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200, {"content-type": "text/html"},
+        (definition + target + "<div>Public</div>").encode(),
+    )).fetch("https://example.com/story")
+    assert source.text == "Public"
+
+
 @pytest.mark.parametrize("style", [
     "display:var(--missing)",
     "--x:var(--x);display:var(--x)",
@@ -2582,19 +3151,23 @@ def test_fetcher_suppresses_transparent_inline_style():
     assert source.text == "Public"
 
 
-def test_fetcher_rejects_transparent_class_rule():
-    """Unsupported page CSS rejects the page instead of admitting hidden prose."""
-    response = FakePinnedResponse(
+@pytest.mark.parametrize(
+    "declaration",
+    ("color:transparent", "opacity:0", "font-size:0px"),
+)
+def test_fetcher_suppresses_curated_hiding_page_declarations(declaration):
+    """Classic visually-hiding page declarations over-hide their targets."""
+    source = public_fixture_fetcher(FakePinnedResponse(
         200,
         {"content-type": "text/html; charset=utf-8"},
         (
-            b"<style>.secret{color:transparent}</style>"
-            b"<p class='secret'>secret</p><p>Public</p>"
-        ),
-    )
+            f"<style>.secret{{{declaration}}}</style>"
+            "<p class='secret'>secret</p><p>Public</p>"
+        ).encode(),
+    )).fetch("https://www.iana.org/story")
 
-    with pytest.raises(GroundingFailure, match="visibility CSS"):
-        public_fixture_fetcher(response).fetch("https://www.iana.org/story")
+    assert "secret" not in source.text
+    assert "Public" in source.text
 
 
 def test_fetcher_suppresses_aria_hidden_whitespace():
@@ -2623,51 +3196,323 @@ def test_fetcher_suppresses_closed_dialog_ancestor():
 @pytest.mark.parametrize(
     "markup",
     (
-        "<p style='display:none' STYLE='display:block'>secret</p>",
-        "<p aria-hidden='true' ARIA-HIDDEN='false'>secret</p>",
-        "<link rel='stylesheet' REL='alternate' href='/hidden.css'><p>Public</p>",
+        "<p style='display:none' STYLE='display:block'>secret</p><p>Public</p>",
+        "<p aria-hidden='true' ARIA-HIDDEN='false'>secret</p><p>Public</p>",
         "<style>.secret{display:none}</style>"
-        "<p class='secret' CLASS='public'>secret</p>",
+        "<p class='secret' CLASS='public'>secret</p><p>Public</p>",
         "<style>#secret{display:none}</style>"
-        "<p id='secret' ID='public'>secret</p>",
+        "<p id='secret' ID='public'>secret</p><p>Public</p>",
     ),
-    ids=("style", "aria-hidden", "rel", "class", "id"),
+    ids=("style", "aria-hidden", "class", "id"),
 )
-def test_fetcher_rejects_duplicate_html_attributes(markup):
-    """Case-insensitive duplicate attributes fail closed before last-wins maps."""
-    response = FakePinnedResponse(
+def test_fetcher_duplicate_hide_attributes_hide_by_union(markup):
+    """If any occurrence of a duplicated hide-relevant attribute hides, it hides."""
+    source = public_fixture_fetcher(FakePinnedResponse(
         200,
         {"content-type": "text/html; charset=utf-8"},
         markup.encode(),
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_duplicate_benign_attributes_keep_the_page():
+    """Duplicate non-hiding attributes no longer reject; first occurrence wins."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<link rel='stylesheet' REL='alternate' href='/hidden.css'>"
+        b"<p data-x='1' DATA-X='2'>Public</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert source.text == "Public"
+
+
+def test_fetcher_over_hides_descendant_selector_subject():
+    """A hiding rule with a complex selector hides its subject compound."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        (
+            b"<style>article .secret{display:none}</style>"
+            b"<article><p class='secret'>secret</p></article><p>Public</p>"
+        ),
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_never_hides_selector_context_classes():
+    """Ancestor context in a hiding selector must not become a hide target.
+
+    Wikipedia/Blockworks shape: skin and theme classes live on root elements
+    and appear as context in hide rules — hiding them blanks the page.
+    """
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        (
+            b"<style>.theme-dark .promo{display:none}</style>"
+            b"<div class='theme-dark'>"
+            b"<p class='promo'>secret</p><p>Public body</p></div>"
+        ),
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public body" in source.text
+
+
+def test_fetcher_sibling_combinator_hides_subject_only():
+    """The right-hand side of sibling combinators is the only hide target."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        (
+            b"<style>.toggle ~ .panel{display:none}</style>"
+            b"<p class='toggle'>Toggle label</p><p class='panel'>secret</p>"
+        ),
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Toggle label" in source.text
+
+
+def test_fetcher_keeps_body_with_benign_unknown_inline_style():
+    """Unknown non-hiding inline properties no longer suppress the element.
+
+    GitHub shape: <body style='word-wrap:break-word'> must not blank the
+    page. Curated always-hiding extras still suppress (next test).
+    """
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<body style='word-wrap:break-word'><p>Public body</p></body>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "Public body" in source.text
+
+
+def test_fetcher_exotic_inline_hiding_is_accepted_residual():
+    """Offscreen-style inline hiding is admitted (documented residual)."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<p style='text-indent:-9999px'>offscreen residual</p>"
+        b"<p>Public</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "offscreen residual" in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_admits_external_stylesheet_page_as_residual():
+    """External stylesheets no longer reject the page (spec 2026-08-12).
+
+    Text an unfetched external stylesheet might hide is admitted — the
+    documented accepted residual of the posture change.
+    """
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        (
+            b"<link rel='stylesheet' href='/screen.css'>"
+            b"<p class='secret'>possibly hidden</p><p>Public</p>"
+        ),
+    )).fetch("https://www.iana.org/story")
+
+    assert "possibly hidden" in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_enforces_inline_page_css_beside_external_stylesheet():
+    """Evaluable inline page CSS still hides even when external CSS exists."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        (
+            b"<link rel='stylesheet' href='/screen.css'>"
+            b"<style>.h{display:none}</style>"
+            b"<p class='h'>secret</p><p>Public</p>"
+        ),
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_accepts_element_selector_reset_css():
+    """Benign resets and @media blocks no longer reject pages (example.com shape)."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        (
+            b"<style>body{background:#f0f0f2;margin:0;padding:0}"
+            b"div{width:600px;margin:5em auto}"
+            b"@media (max-width:700px){div{margin:0 auto;width:auto}}</style>"
+            b"<div><h1>Example Domain</h1><p>Public body</p></div>"
+        ),
+    )).fetch("https://www.iana.org/story")
+
+    assert "Example Domain" in source.text
+    assert "Public body" in source.text
+
+
+def test_fetcher_hides_tag_selector_display_none():
+    """A hiding rule keyed only by element type hides that tag everywhere."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>aside{display:none}</style>"
+        b"<aside>secret</aside><p>Public</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_over_applies_conditional_media_hide_rules():
+    """Hide rules inside conditional @media apply unconditionally (over-hide)."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>@media (max-width:700px){.m{display:none}}</style>"
+        b"<p class='m'>secret</p><p>Public</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_evaluates_against_canonical_light_scheme():
+    """Dark-scheme-only @media blocks are skipped; light-scheme blocks apply.
+
+    Theme-duplicated DOM (Blockworks shape) otherwise loses both copies:
+    over-applying mutually exclusive scheme branches hides everything.
+    """
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>"
+        b"@media (prefers-color-scheme: dark){.light-mode{display:none}}"
+        b"@media (prefers-color-scheme: light){.dark-mode{display:none}}"
+        b"</style>"
+        b"<div class='light-mode'>Public light copy</div>"
+        b"<div class='dark-mode'>dark copy</div>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "Public light copy" in source.text
+    assert "dark copy" not in source.text
+
+
+def test_fetcher_ignores_print_only_media_hide_rules():
+    """Print-only @media blocks cannot affect screen text and are skipped."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>@media print{.p{display:none}}</style>"
+        b"<p class='p'>Print target</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "Print target" in source.text
+
+
+def test_fetcher_skips_keyframes_blocks():
+    """@keyframes selectors are not elements and never become hide targets."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>@keyframes fade{from{opacity:0}to{opacity:1}}</style>"
+        b"<p>Public</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert source.text == "Public"
+
+
+def test_fetcher_hidden_attribute_reset_rule_stays_native():
+    """[hidden]{display:none} resets are redundant with native attr handling."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>[hidden]{display:none}</style>"
+        b"<p hidden>secret</p><p>Public</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_strips_not_pseudo_before_over_hiding():
+    """p:not(.keep){display:none} hides all p — a superset — never only .keep."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>p:not(.keep){display:none}</style>"
+        b"<p>secret</p><p class='keep'>also suppressed</p><div>Public</div>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "also suppressed" not in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_var_display_over_hides_but_var_color_does_not():
+    """Unresolvable var() over-hides for display, never for curated extras."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>.a{display:var(--d)}.b{color:var(--c)}</style>"
+        b"<p class='a'>secret</p><p class='b'>Public var color</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public var color" in source.text
+
+
+def test_fetcher_applies_prefix_before_unterminated_comment():
+    """CSS before an unterminated comment applies; the tail is residual."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>.h{display:none} /* unterminated</style>"
+        b"<p class='h'>secret</p><p>Public</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_abandons_css_after_unbalanced_brace():
+    """A stray close brace abandons only the rest of the sheet (residual)."""
+    source = public_fixture_fetcher(FakePinnedResponse(
+        200,
+        {"content-type": "text/html; charset=utf-8"},
+        b"<style>.h{display:none} } .x{display:none}</style>"
+        b"<p class='h'>secret</p><p class='x'>residual text</p><p>Public</p>",
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "residual text" in source.text
+    assert "Public" in source.text
+
+
+def test_fetcher_rule_cap_prefix_applies_rest_is_residual():
+    """Hide rules past the work bound are residual, not page-rejecting."""
+    filler = "".join(f".f{i}{{margin:0}}" for i in range(520))
+    markup = (
+        f"<style>.h{{display:none}}{filler}.z{{display:none}}</style>"
+        "<p class='h'>secret</p><p class='z'>late residual</p><p>Public</p>"
     )
-
-    with pytest.raises(GroundingFailure, match="duplicate HTML attribute"):
-        public_fixture_fetcher(response).fetch("https://www.iana.org/story")
-
-
-@pytest.mark.parametrize("markup", [
-    (
-        "<style>article .secret{display:none}</style>"
-        "<article><p class='secret'>secret</p><p>Public</p></article>"
-    ),
-    (
-        "<link rel='stylesheet' href='/screen.css'>"
-        "<p class='secret'>possibly hidden</p>"
-    ),
-    (
-        "<style>.secret{opacity:0}</style>"
-        "<p class='secret'>possibly hidden</p>"
-    ),
-])
-def test_fetcher_rejects_unevaluable_visibility_css(markup):
-    """Unsupported screen CSS fails closed instead of admitting hidden prose."""
-    response = FakePinnedResponse(
+    source = public_fixture_fetcher(FakePinnedResponse(
         200,
         {"content-type": "text/html; charset=utf-8"},
         markup.encode(),
-    )
-    with pytest.raises(GroundingFailure, match="visibility CSS"):
-        public_fixture_fetcher(response).fetch("https://www.iana.org/story")
+    )).fetch("https://www.iana.org/story")
+
+    assert "secret" not in source.text
+    assert "late residual" in source.text
+    assert "Public" in source.text
 
 
 def test_fetcher_does_not_resolve_again_after_validation():
@@ -2825,3 +3670,34 @@ def test_dns_resolver_slots_saturate_without_spawning_and_recover(monkeypatch):
         resolver_for(["93.184.216.34"]),
         0.2,
     ) == ("93.184.216.34",)
+
+
+def test_recent_reference_candidates_are_bounded_and_recover_persisted_links():
+    current = telegram_message(1200, 'Read the link I shared')
+    current['chat']['is_forum'] = False
+    recent = [telegram_message(i, f'https://example.com/{i}') for i in range(1180, 1195)]
+    candidates = reply_grounding.conversation_link_candidates(current, recent, [])
+    assert [row['message_id'] for row in candidates] == list(range(1185, 1195))
+    persisted = [{'role': 'incoming', 'message_id': 1199, 'chat_id': -1001,
+                  'topic_id': 1143, 'sender': 'alice', 'sender_is_bot': False,
+                  'timestamp': '2026-07-12T19:34:59+00:00',
+                  'text': 'https://example.com/persisted'}]
+    current['date'] = '2026-07-12T19:35:00+00:00'
+    candidates = reply_grounding.conversation_link_candidates(current, [], persisted)
+    assert [row['message_id'] for row in candidates] == [1199]
+    assert candidates[0]['text'] == 'https://example.com/persisted'
+
+
+def test_nonfactual_rejection_with_reason_is_a_valid_negative_verdict():
+    """Task mismatch can reject an answer whose individual facts are true."""
+    verdict = parse_verification(
+        '{"pass":false,"unsupported_claims":[],"reason":"This answers price change instead of buyer identity."}')
+    assert verdict.passed is False
+    assert verdict.unsupported_claims == ()
+    assert verdict.repair_policy is None
+
+
+@pytest.mark.parametrize("reason", ["", " ", "\t"])
+def test_negative_verdict_cannot_omit_both_objections_and_reason(reason):
+    with pytest.raises(GroundingFailure):
+        parse_verification(json.dumps({"pass": False, "unsupported_claims": [], "reason": reason}))

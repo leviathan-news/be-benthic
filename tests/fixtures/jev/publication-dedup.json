@@ -1,0 +1,433 @@
+[
+  {
+    "id": "task-cases-duplicate:same",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "SEC approves spot Bitcoin ETFs",
+      "earlier": [
+        "SEC gives green light to US spot BTC exchange-traded funds"
+      ]
+    },
+    "expected": true,
+    "partition": "calibration"
+  },
+  {
+    "id": "task-cases-duplicate:different",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Binance lists AAVE",
+      "earlier": [
+        "Coinbase lists AAVE"
+      ]
+    },
+    "expected": false,
+    "partition": "calibration"
+  },
+  {
+    "id": "task-cases-duplicate:new_facts",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Euler recovers all stolen funds",
+      "earlier": [
+        "Euler loses $197 million in exploit"
+      ]
+    },
+    "expected": false,
+    "partition": "calibration"
+  },
+  {
+    "id": "task-cases-duplicate:same_hack",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Curve pauses pools after $2 million hack",
+      "earlier": [
+        "Exploit drains $2 million from Curve pools"
+      ]
+    },
+    "expected": true,
+    "partition": "calibration"
+  },
+  {
+    "id": "task-cases-duplicate:reversal",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Regulator reverses previous crypto ban",
+      "earlier": [
+        "Regulator announces crypto ban"
+      ]
+    },
+    "expected": false,
+    "partition": "calibration"
+  },
+  {
+    "id": "task-cases-duplicate:shared_entity",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Ethereum activates Dencun upgrade",
+      "earlier": [
+        "Ethereum Foundation transfers ETH to Kraken"
+      ]
+    },
+    "expected": false,
+    "partition": "calibration"
+  },
+  {
+    "id": "task-cases-holdout:17",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Stablecoin issuer reveals a $300 million reserve shortfall",
+      "earlier": [
+        "Issuer confirms $300 million missing from stablecoin backing"
+      ]
+    },
+    "expected": true,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-cases-holdout:18",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Stablecoin issuer recovers missing reserves and restores redemptions",
+      "earlier": [
+        "Stablecoin issuer reveals a $300 million reserve shortfall"
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-cases-holdout:19",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Coinbase receives a custody license in Germany",
+      "earlier": [
+        "Binance receives a custody license in Germany"
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-dup_translation",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "La SEC approva un nuovo ETF spot su Bitcoin.",
+      "earlier": [
+        "The SEC approves a new spot Bitcoin ETF."
+      ]
+    },
+    "expected": true,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-dup_paraphrase",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Aave governance votes to add a new collateral market on Base.",
+      "earlier": [
+        "Aave voters approve a new Base collateral market."
+      ]
+    },
+    "expected": true,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-dup_loss_rounding",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Bridge reports approximately $10 million lost in today's incident.",
+      "earlier": [
+        "Bridge loses $10.1 million in today's incident."
+      ]
+    },
+    "expected": true,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-new_recovery",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "The bridge recovers all stolen assets and starts refunding users.",
+      "earlier": [
+        "The bridge loses $10 million in an incident."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-new_resumption",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Exchange resumes withdrawals after fixing the incident.",
+      "earlier": [
+        "Exchange pauses withdrawals during an incident."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-new_approval",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "The SEC approves the issuer's spot ETF application.",
+      "earlier": [
+        "The issuer files a spot ETF application with the SEC."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-new_reversal",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "The court overturns the earlier ban on the exchange.",
+      "earlier": [
+        "The court bans the exchange from operating."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-different_actor",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Kraken obtains a crypto custody license in France.",
+      "earlier": [
+        "Coinbase obtains a crypto custody license in France."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-different_jurisdiction",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Kraken obtains a crypto custody license in France.",
+      "earlier": [
+        "Kraken obtains a crypto custody license in Germany."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-different_asset",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "The SEC approves a spot Ether ETF.",
+      "earlier": [
+        "The SEC approves a spot Bitcoin ETF."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-new_attribution",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Investigators identify the attacker responsible for the exchange breach.",
+      "earlier": [
+        "Exchange reports a breach; attacker identity remains unknown."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-new_loss_estimate",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Exchange triples its confirmed loss estimate after discovering additional affected wallets.",
+      "earlier": [
+        "Exchange publishes its initial loss estimate while the investigation continues."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-shared_entity_only",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Ethereum Foundation changes its treasury staking policy.",
+      "earlier": [
+        "Ethereum activates a network upgrade.",
+        "Ethereum developers schedule their next research meeting."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-negated_outcome",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "The regulator rejects the exchange's license application.",
+      "earlier": [
+        "The regulator approves the exchange's license application."
+      ]
+    },
+    "expected": false,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-same_announcement",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Binance confirms the AAVE spot listing announced this morning.",
+      "earlier": [
+        "Binance announces AAVE spot trading this morning."
+      ]
+    },
+    "expected": true,
+    "partition": "holdout"
+  },
+  {
+    "id": "task-boundaries-report_same_finding",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Another outlet reports the same finding: an exchange's reserve report omitted a liability.",
+      "earlier": [
+        "Investigation finds an exchange omitted a liability from its reserve report."
+      ]
+    },
+    "expected": true,
+    "partition": "holdout"
+  },
+  {
+    "id": "filing_details",
+    "task": "published_duplicate",
+    "partition": "publication",
+    "expected": true,
+    "args": {
+      "headline": "Acurast details ACU token allocations and governance in Blockworks filing, which lists two disclosure gaps",
+      "earlier": [
+        "Acurast details ACU token allocations, vesting and governance in Blockworks transparency filing"
+      ]
+    }
+  },
+  {
+    "id": "amended_filing",
+    "task": "published_duplicate",
+    "partition": "publication",
+    "expected": false,
+    "args": {
+      "headline": "Acurast amends its transparency filing to close both disclosure gaps",
+      "earlier": [
+        "Acurast publishes its token transparency filing with two disclosure gaps"
+      ]
+    }
+  },
+  {
+    "id": "different_filing",
+    "task": "published_duplicate",
+    "partition": "publication",
+    "expected": false,
+    "args": {
+      "headline": "Beldex publishes its token allocation and governance transparency filing",
+      "earlier": [
+        "Acurast publishes its token allocation and governance transparency filing"
+      ]
+    }
+  },
+  {
+    "id": "incident_update",
+    "task": "published_duplicate",
+    "partition": "publication",
+    "expected": false,
+    "args": {
+      "headline": "Protocol reopens withdrawals after completing exploit remediation",
+      "earlier": [
+        "Protocol pauses withdrawals after an exploit drains $4 million"
+      ]
+    }
+  },
+  {
+    "id": "translation",
+    "task": "published_duplicate",
+    "partition": "publication",
+    "expected": true,
+    "args": {
+      "headline": "Acurast publie les allocations et la gouvernance du jeton ACU dans son dossier de transparence",
+      "earlier": [
+        "Acurast publishes ACU token allocations and governance in transparency filing"
+      ]
+    }
+  },
+  {
+    "id": "no_history",
+    "task": "published_duplicate",
+    "partition": "publication",
+    "expected": false,
+    "args": {
+      "headline": "Acurast publishes token allocations and governance",
+      "earlier": []
+    }
+  },
+  {
+    "id": "distinct_mexc_assets",
+    "partition": "delivery-regression",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "MEXC lists MASKSOL perpetual futures",
+      "earlier": [
+        "MEXC lists EACC perpetual futures"
+      ]
+    },
+    "expected": false
+  },
+  {
+    "id": "distinct_mexc_markets",
+    "partition": "delivery-regression",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "MEXC lists SI perpetual futures",
+      "earlier": [
+        "MEXC lists SI on its spot market"
+      ]
+    },
+    "expected": false
+  },
+  {
+    "id": "same_mexc_listing",
+    "partition": "delivery-regression",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "MASKSOL perpetual futures go live on MEXC",
+      "earlier": [
+        "MEXC lists MASKSOL perpetual futures"
+      ]
+    },
+    "expected": true
+  },
+  {
+    "id": "bitget_new_freeze",
+    "partition": "delivery-regression",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Circle and Tether freeze $318K linked to Bitget hack",
+      "earlier": [
+        "Bitget hack on-chain tracking"
+      ]
+    },
+    "expected": false
+  },
+  {
+    "id": "bitget_same_freeze",
+    "partition": "delivery-regression",
+    "task": "published_duplicate",
+    "args": {
+      "headline": "Tether and Circle blacklist Bitget exploiter wallet with $318,000",
+      "earlier": [
+        "Circle and Tether freeze $318K linked to Bitget hack"
+      ]
+    },
+    "expected": true
+  }
+]

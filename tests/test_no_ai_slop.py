@@ -91,6 +91,8 @@ def test_creative_prompts_render_with_shared_no_slop_block() -> None:
         ),
         "bot/grounded_response": load_prompt(
             "bot/grounded_response",
+            requested_task="CURRENT REQUEST",
+            chat_voice=load_prompt("bot/chat_voice"),
             soul_block=bot.BENTHIC_SOUL,
             identity=bot.BENTHIC_IDENTITY,
             no_slop=bot.NO_AI_SLOP,
@@ -107,6 +109,8 @@ def test_creative_prompts_render_with_shared_no_slop_block() -> None:
         ),
         "bot/grounding_repair": load_prompt(
             "bot/grounding_repair",
+            requested_task="CURRENT REQUEST",
+            chat_voice=load_prompt("bot/chat_voice"),
             soul_block=bot.BENTHIC_SOUL,
             identity=bot.BENTHIC_IDENTITY,
             no_slop=bot.NO_AI_SLOP,
@@ -131,12 +135,6 @@ def test_creative_prompts_render_with_shared_no_slop_block() -> None:
             safe_author="alice",
             safe_reply="Why does that matter?",
         ),
-        "agent/resolve_craft_headline_tldr": load_prompt(
-            "agent/resolve_craft_headline_tldr",
-            no_slop=agent.NO_AI_SLOP,
-            url="https://example.com/story",
-            safe_text="Example Telegram post about a protocol launch.",
-        ),
     }
 
     for template_name, rendered in rendered_prompts.items():
@@ -153,9 +151,12 @@ def test_classification_prompt_stays_free_of_no_slop_block() -> None:
         ),
         "bot/grounding_research": load_prompt(
             "bot/grounding_research",
+            now_utc="2026-09-26T16:23:00+00:00",
+            requested_task="CURRENT REQUEST",
             max_sources=3,
             current_message="x",
             focal_evidence="[]",
+            trusted_runtime_context="(none)",
             research_contract="GENERAL MODE",
         ),
         "bot/grounding_media": load_prompt(
@@ -164,6 +165,8 @@ def test_classification_prompt_stays_free_of_no_slop_block() -> None:
         ),
         "bot/grounding_verifier": load_prompt(
             "bot/grounding_verifier",
+            agent_name="Benthic",
+            requested_task="CURRENT REQUEST",
             evidence="[]",
             composition='{"decision":"reply","reply":"x","claims":[]}',
         ),
@@ -173,18 +176,16 @@ def test_classification_prompt_stays_free_of_no_slop_block() -> None:
         assert MARKER not in rendered, f"{template_name} received creative voice rules"
 
 
-def test_resolve_prompt_scopes_no_slop_to_tldr_not_headline() -> None:
-    """The resolve prompt must keep headline guidance and delimiters untouched."""
-    agent = _load_agent_module()
+def test_resolve_prompt_is_headline_only() -> None:
+    """Article publishing must not ask the model to create a TLDR comment."""
     rendered = load_prompt(
-        "agent/resolve_craft_headline_tldr",
-        no_slop=agent.NO_AI_SLOP,
+        "agent/resolve_craft_headline",
         url="https://example.com/story",
         safe_text="Example Telegram post about a protocol launch.",
     )
 
-    headline_rules = rendered.split("TL;DR RULES:", 1)[0].split("HEADLINE RULES:", 1)[1]
-
-    assert MARKER not in headline_rules
-    assert rendered.index(MARKER) > rendered.index("TL;DR RULES:")
-    assert "===HEADLINE===\nYour headline here\n===TLDR===" in rendered
+    assert "===URL===" in rendered
+    assert "===HEADLINE===" in rendered
+    assert "TL;DR" not in rendered
+    assert "===TLDR===" not in rendered
+    assert MARKER not in rendered

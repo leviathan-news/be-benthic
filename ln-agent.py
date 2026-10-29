@@ -14,6 +14,7 @@ News curation agent that sleeps 1 hour after each completed cycle and mirrors th
 
 import asyncio
 import json
+import html
 import logging
 import logging.handlers
 import os
@@ -27,15 +28,18 @@ import tempfile
 import threading
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
 import requests
+import jev_news as jev
+from jev_queue import NewsQueue
 from prompt_loader import load_prompt
 from eth_account import Account
 from eth_account.messages import encode_defunct
-from telethon import TelegramClient
+from telethon import TelegramClient, functions
 from telethon.errors import FloodWaitError
 
 # ─── Configuration ───────────────────────────────────────────────────────────
@@ -45,7 +49,11 @@ DB_FILE = BASE_DIR / "agent.db"
 LOG_FILE = BASE_DIR / "agent.log"
 
 LN_API = "https://api.leviathannews.xyz/api/v1"
-TELEGRAM_SESSION = str(Path("~/.claude/agent_session.session").expanduser()).replace(".session", "")
+# An independent authorization is required: copies of Explorer's session key
+# compete for Telegram updates even when their session filenames differ.
+TELEGRAM_SESSION = str(Path(os.environ.get(
+    "LN_TELEGRAM_SESSION", "~/.claude/agent_session.session"
+)).expanduser()).removesuffix(".session")
 
 
 def _resolve_codex_bin() -> str:
@@ -84,7 +92,7 @@ def load_credentials() -> tuple:
 CLAUDE_BIN = os.environ.get("CLAUDE_BIN",
     shutil.which("claude") or str(Path("~/.local/bin/claude").expanduser()))
 CODEX_BIN = os.environ.get("CODEX_BIN", _resolve_codex_bin())
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-6-sol")
 CODEX_EFFORT = os.environ.get("CODEX_EFFORT", "xhigh")
 # OpenCode CLI — additional fallback provider.
 OPENCODE_BIN = os.environ.get("OPENCODE_BIN", shutil.which("opencode") or "opencode")
@@ -92,13 +100,11 @@ OPENCODE_MODEL = os.environ.get("OPENCODE_MODEL", "")  # e.g. "anthropic/claude-
 CLAUDE_LIMIT_COOLDOWN = int(os.environ.get("CLAUDE_LIMIT_COOLDOWN", str(6 * 60 * 60)))
 # Provider priority — comma-separated list of providers to try in order.
 # Available: "claude", "codex", "opencode". First available provider is used as primary.
-# Default: codex primary, claude as fallback (Claude CLI -p flag removal on the
-# subscription tier made codex more reliable for this project).
-# Example: PROVIDER_ORDER=claude,codex  (legacy ordering, claude first)
-PROVIDER_ORDER = [p.strip() for p in os.environ.get("PROVIDER_ORDER", "codex,claude").split(",") if p.strip()]
+# Claude is retired from production. Additional adapters require explicit opt-in.
+PROVIDER_ORDER = [p.strip() for p in os.environ.get("PROVIDER_ORDER", "codex").split(",") if p.strip()]
 if not PROVIDER_ORDER:
-    PROVIDER_ORDER = ["codex", "claude"]
-    print("WARNING: PROVIDER_ORDER was empty — falling back to default: codex,claude", file=sys.stderr)
+    PROVIDER_ORDER = ["codex"]
+    print("WARNING: PROVIDER_ORDER was empty — falling back to default: codex", file=sys.stderr)
 # Telegram CLI wrapper — bundled copy by default; override via env if you run
 # it from somewhere else (e.g. a plugin install).
 TELEGRAM_CLIENT_SCRIPT = Path(os.environ.get(
@@ -165,8 +171,13 @@ BOT_HQ = int(os.environ["BOT_HQ_GROUP_ID"]) if "BOT_HQ_GROUP_ID" in os.environ e
 CHANNELS = json.loads(os.environ.get("CHANNELS", "[]"))
 if not CHANNELS:
     sys.exit("ERROR: CHANNELS env var is required (JSON array of Telegram channel usernames)")
-# Private channels resolved by display name instead of username
-PRIVATE_CHANNELS = json.loads(os.environ.get("PRIVATE_CHANNELS", "[]"))
+# ID-keyed sources: private channels/groups (or anything without a stable
+# @username), marked dialog id -> label. Labels are OURS — they key cursors,
+# evaluated_messages, and the push queue, so a Telegram-side rename never
+# resets per-source state. The agent's account must be a member of every entry.
+# JSON object of marked dialog id -> label (keys are strings in JSON).
+# Example: ID_SOURCES='{"-1001234567890": "Invite-Only Feed"}'
+ID_SOURCES = {int(k): str(v) for k, v in json.loads(os.environ.get("ID_SOURCES", "{}")).items()}
 
 INITIAL_LOOKBACK_HOURS = 1
 
@@ -496,9 +507,16 @@ class AgentDB:
             is_newsworthy INTEGER NOT NULL DEFAULT 0,
             reason TEXT,
             headline_hint TEXT,
+            heat INTEGER,
             evaluated_at TEXT NOT NULL,
             UNIQUE(channel, msg_id)
         )""")
+        # Migration: add heat column if missing. Nullable — rows written before
+        # the evaluator emitted heat stay NULL, and _parse_heat() maps a missing
+        # signal to 0 (never LN-submittable) rather than inventing a score.
+        cols = [r[1] for r in c.execute("PRAGMA table_info(evaluated_messages)").fetchall()]
+        if "heat" not in cols:
+            c.execute("ALTER TABLE evaluated_messages ADD COLUMN heat INTEGER")
 
         # Articles submitted to LN by the agent
         c.execute("""CREATE TABLE IF NOT EXISTS posted_articles (
@@ -508,14 +526,33 @@ class AgentDB:
             story_hint TEXT,
             ln_article_id INTEGER,
             source_channel TEXT,
+            destination TEXT,
+            tg_message_id INTEGER,
+            heat INTEGER,
             posted_at TEXT NOT NULL
         )""")
+        # Migration: destination routing columns. All nullable — rows written
+        # before routing existed (and marker rows like [blocked source]) keep a
+        # NULL destination rather than being retro-labelled as LN submissions.
+        cols = [r[1] for r in c.execute("PRAGMA table_info(posted_articles)").fetchall()]
+        for col, decl in (("destination", "TEXT"), ("tg_message_id", "INTEGER"),
+                          ("heat", "INTEGER")):
+            if col not in cols:
+                c.execute(f"ALTER TABLE posted_articles ADD COLUMN {col} {decl}")
 
         # Articles the agent has commented on
         c.execute("""CREATE TABLE IF NOT EXISTS commented_articles (
             ln_article_id INTEGER PRIMARY KEY,
             comment_text TEXT,
             commented_at TEXT NOT NULL
+        )""")
+
+        # Durable rate-limit reservations for unsolicited third-party article
+        # comments. Public text is intentionally excluded from this policy table.
+        c.execute("""CREATE TABLE IF NOT EXISTS unsolicited_article_comments (
+            ln_article_id INTEGER PRIMARY KEY,
+            reserved_at TEXT NOT NULL,
+            published_at TEXT
         )""")
 
         # Votes on articles (news)
@@ -585,6 +622,22 @@ class AgentDB:
             UNIQUE(news_id, event_type)
         )""")
 
+        # Real-time source-message queue. The Telethon NewMessage push handler
+        # INSERTs pre-filtered messages; the throttled news mini-pass drains
+        # them (consume-on-drain). The hourly cycle's cursor read is the
+        # backfill of record — this queue is only the accelerator.
+        c.execute("""CREATE TABLE IF NOT EXISTS pending_source_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            channel TEXT NOT NULL,
+            msg_id INTEGER NOT NULL,
+            text TEXT,
+            url TEXT,
+            msg_date TEXT,
+            received_at TEXT NOT NULL,
+            consumed INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(channel, msg_id)
+        )""")
+
         self._commit()
 
     # ── Channel cursors ──
@@ -647,13 +700,15 @@ class AgentDB:
 
     def save_evaluation(self, channel: str, msg_id: int, text: str,
                         url: str = None, is_newsworthy: bool = False,
-                        reason: str = None, headline_hint: str = None):
+                        reason: str = None, headline_hint: str = None,
+                        heat: int = None):
         now = datetime.now(timezone.utc).isoformat()
         self._execute(
             """INSERT OR IGNORE INTO evaluated_messages
-               (channel, msg_id, text, url, is_newsworthy, reason, headline_hint, evaluated_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-            (channel, msg_id, text[:2000], url, int(is_newsworthy), reason, headline_hint, now),
+               (channel, msg_id, text, url, is_newsworthy, reason, headline_hint, heat, evaluated_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (channel, msg_id, text[:2000], url, int(is_newsworthy), reason,
+             headline_hint, heat, now),
         )
         self._commit()
 
@@ -709,15 +764,38 @@ class AgentDB:
         return False
 
     def save_posted(self, url: str, headline: str, story_hint: str = None,
-                    ln_article_id: int = None, source_channel: str = None):
+                    ln_article_id: int = None, source_channel: str = None,
+                    destination: str = None, tg_message_id: int = None,
+                    heat: int = None):
         now = datetime.now(timezone.utc).isoformat()
         self._execute(
             """INSERT INTO posted_articles
-               (url, headline, story_hint, ln_article_id, source_channel, posted_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (url, headline, story_hint, ln_article_id, source_channel, now),
+               (url, headline, story_hint, ln_article_id, source_channel,
+                destination, tg_message_id, heat, posted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (url, headline, story_hint, ln_article_id, source_channel,
+             destination, tg_message_id, heat, now),
         )
         self._commit()
+
+    def recent_published_headlines(self, hours: int = 24) -> list[str]:
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
+        rows = self._execute(
+            "SELECT headline FROM posted_articles WHERE posted_at > ? "
+            "AND (destination IN ('channel','ln','both') OR ln_article_id IS NOT NULL "
+            "OR tg_message_id IS NOT NULL) ORDER BY posted_at DESC, id DESC", (cutoff,)
+        ).fetchall()
+        # Rejected-source and duplicate markers are not publication evidence.
+        # Do not cap this window to the last 25; the evaluator batches it.
+        return [r[0] for r in rows if isinstance(r[0], str) and r[0].strip()]
+
+    def was_article_posted_by_us(self, ln_article_id: int) -> bool:
+        """Return whether this worker persisted the LN article as its submission."""
+        row = self._execute(
+            "SELECT 1 FROM posted_articles WHERE ln_article_id = ?",
+            (ln_article_id,),
+        ).fetchone()
+        return row is not None
 
     # ── Comments ──
 
@@ -735,6 +813,83 @@ class AgentDB:
         )
         self._commit()
 
+    @staticmethod
+    def _comment_window_cutoff(now: datetime) -> str:
+        """Return the exclusive UTC cutoff for the fixed rolling comment window."""
+        return (now - timedelta(hours=24)).isoformat()
+
+    def has_unsolicited_comment_capacity(
+        self, max_comments: int, now: datetime | None = None
+    ) -> bool:
+        """Check capacity before paying for creative generation."""
+        if max_comments <= 0:
+            return False
+        current = now or datetime.now(timezone.utc)
+        row = self._execute(
+            "SELECT COUNT(*) AS count FROM unsolicited_article_comments "
+            "WHERE reserved_at > ?",
+            (self._comment_window_cutoff(current),),
+        ).fetchone()
+        return int(row["count"]) < max_comments
+
+    def reserve_unsolicited_comment(
+        self,
+        ln_article_id: int,
+        max_comments: int,
+        now: datetime | None = None,
+    ) -> bool:
+        """Atomically claim one rolling-window slot for an article."""
+        if max_comments <= 0:
+            return False
+        current = now or datetime.now(timezone.utc)
+        cutoff = self._comment_window_cutoff(current)
+        with self._lock:
+            try:
+                self.conn.execute("BEGIN IMMEDIATE")
+                existing = self.conn.execute(
+                    "SELECT 1 FROM unsolicited_article_comments "
+                    "WHERE ln_article_id = ?",
+                    (ln_article_id,),
+                ).fetchone()
+                count = self.conn.execute(
+                    "SELECT COUNT(*) AS count FROM unsolicited_article_comments "
+                    "WHERE reserved_at > ?",
+                    (cutoff,),
+                ).fetchone()["count"]
+                if existing is not None or int(count) >= max_comments:
+                    self.conn.rollback()
+                    return False
+                self.conn.execute(
+                    "INSERT INTO unsolicited_article_comments "
+                    "(ln_article_id, reserved_at, published_at) "
+                    "VALUES (?, ?, NULL)",
+                    (ln_article_id, current.isoformat()),
+                )
+                self.conn.commit()
+                return True
+            except Exception:
+                self.conn.rollback()
+                raise
+
+    def confirm_unsolicited_comment(
+        self, ln_article_id: int, now: datetime | None = None
+    ) -> None:
+        """Mark a reserved slot as a publication LN explicitly accepted."""
+        current = now or datetime.now(timezone.utc)
+        self._execute_commit(
+            "UPDATE unsolicited_article_comments SET published_at = ? "
+            "WHERE ln_article_id = ?",
+            (current.isoformat(), ln_article_id),
+        )
+
+    def release_unsolicited_comment(self, ln_article_id: int) -> None:
+        """Release only an unpublished reservation after explicit HTTP rejection."""
+        self._execute_commit(
+            "DELETE FROM unsolicited_article_comments "
+            "WHERE ln_article_id = ? AND published_at IS NULL",
+            (ln_article_id,),
+        )
+
     # ── Article votes ──
 
     def was_article_voted(self, ln_article_id: int) -> bool:
@@ -742,6 +897,14 @@ class AgentDB:
             "SELECT 1 FROM voted_articles WHERE ln_article_id = ?", (ln_article_id,)
         ).fetchone()
         return row is not None
+
+    def get_article_vote(self, ln_article_id: int) -> int | None:
+        """Return the persisted article vote, or None when no vote was recorded."""
+        row = self._execute(
+            "SELECT weight FROM voted_articles WHERE ln_article_id = ?",
+            (ln_article_id,),
+        ).fetchone()
+        return int(row["weight"]) if row is not None else None
 
     def save_article_vote(self, ln_article_id: int, weight: int):
         now = datetime.now(timezone.utc).isoformat()
@@ -796,6 +959,42 @@ class AgentDB:
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         cur = self._execute_commit(
             "DELETE FROM ws_events WHERE received_at < ?", (cutoff,))
+        return cur.rowcount
+
+    # ── Pending source messages (push queue) ──
+
+    def add_pending_source_message(self, channel: str, msg_id: int, text: str,
+                                   msg_date: str, url: str | None = None) -> bool:
+        """Insert a push-delivered message; True only when a NEW row was created."""
+        cur = self._execute_commit(
+            """INSERT OR IGNORE INTO pending_source_messages
+               (channel, msg_id, text, url, msg_date, received_at)
+               VALUES (?, ?, ?, ?, ?, ?)""",
+            (channel, msg_id, (text or "")[:4000], url, msg_date,
+             datetime.now(timezone.utc).isoformat()),
+        )
+        return cur.rowcount > 0
+
+    def get_pending_source_messages(self, limit: int = 10) -> list:
+        return self._execute(
+            "SELECT * FROM pending_source_messages WHERE consumed = 0 "
+            "ORDER BY id ASC LIMIT ?", (limit,),
+        ).fetchall()
+
+    def mark_pending_source_consumed(self, row_ids: list) -> None:
+        if not row_ids:
+            return
+        qs = ",".join("?" for _ in row_ids)
+        self._execute_commit(
+            f"UPDATE pending_source_messages SET consumed = 1 WHERE id IN ({qs})",
+            tuple(row_ids),
+        )
+
+    def prune_pending_source_messages(self, days: int = 7) -> int:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        cur = self._execute_commit(
+            "DELETE FROM pending_source_messages WHERE received_at < ?", (cutoff,),
+        )
         return cur.rowcount
 
     # ── Yap/comment votes ──
@@ -880,42 +1079,113 @@ class AgentDB:
 
 # ─── LN API Client ──────────────────────────────────────────────────────────
 
+def load_ln_api_key() -> str | None:
+    """LN `X-API-Key`, or None to sign in with the wallet instead.
+
+    A key never touches /wallet/nonce/, whose 10/min, 60/h limit is shared by
+    every LN client (2026-10-19: wallet logins from this agent held it at 429).
+    """
+    key = os.environ.get("LN_API_KEY", "").strip()
+    if not key:
+        key_path = Path(os.environ.get("LN_API_KEY_FILE", "~/.claude/.ln-api-key")).expanduser()
+        if not key_path.exists():
+            return None
+        key = key_path.read_text().strip()
+    if not re.fullmatch(r"squid_[A-Za-z0-9_-]+", key):
+        raise SystemExit("LN API key is malformed (expected squid_...).")
+    return key
+
+
+class LNAuthBackoff(RuntimeError):
+    """A failed LN login is backing off; no request was sent."""
+
+
+class _LNSession(requests.Session):
+    def rebuild_auth(self, prepared_request, response):
+        # requests strips Authorization on a cross-host redirect but keeps
+        # custom headers, so the API key would follow a redirect off LN.
+        super().rebuild_auth(prepared_request, response)
+        if self.should_strip_auth(response.request.url, prepared_request.url):
+            prepared_request.headers.pop("X-API-Key", None)
+
+
 class LNClient:
+    # A failed login backs off instead of retrying on the next call. One login
+    # per call held LN's shared nonce limit at 429 (2026-09-28, 2026-10-19).
+    AUTH_BACKOFF_BASE = 60
+    AUTH_BACKOFF_MAX = 900
+
     def __init__(self, private_key: str):
         self.account = Account.from_key(private_key)
         self.address = self.account.address
-        self.session = requests.Session()
+        self.api_key = load_ln_api_key()
+        self.session = self._new_session()
         # RLock (not Lock) is required: _refresh_if_stale() -> authenticate() re-acquires
         self._lock = threading.RLock()
+        self._auth_failures = 0
+        self._auth_retry_at = 0.0
+
+    def _new_session(self) -> requests.Session:
+        session = _LNSession()
+        if self.api_key:
+            session.headers["X-API-Key"] = self.api_key
+        return session
+
+    def _check_auth_backoff(self):
+        wait = self._auth_retry_at - time.monotonic()
+        if wait > 0:
+            raise LNAuthBackoff(f"LN login backing off for {wait:.0f}s after "
+                                f"{self._auth_failures} failure(s)")
 
     def authenticate(self):
-        """Wallet-based auth: nonce → sign → verify → JWT cookie."""
+        """API key when configured, else wallet auth: nonce → sign → verify → JWT cookie."""
         with self._lock:
-            r = self.session.get(f"{LN_API}/wallet/nonce/{self.address}/", timeout=300)
-            r.raise_for_status()
-            data = r.json()
-            msg = encode_defunct(text=data["message"])
-            sig = "0x" + self.account.sign_message(msg).signature.hex()
-            r2 = self.session.post(f"{LN_API}/wallet/verify/", json={
-                "address": self.address, "nonce": data["nonce"], "signature": sig,
-            }, timeout=300)
-            r2.raise_for_status()
+            self._check_auth_backoff()
+            try:
+                if not self.api_key:
+                    self._wallet_sign_in()
+            except Exception as e:
+                self._auth_failures += 1
+                delay = min(self.AUTH_BACKOFF_MAX,
+                            self.AUTH_BACKOFF_BASE * 2 ** (self._auth_failures - 1))
+                self._auth_retry_at = time.monotonic() + delay
+                status = getattr(getattr(e, "response", None), "status_code", None)
+                log.warning(f"LN authentication failed ({type(e).__name__}, "
+                            f"http_status={status}); backing off {delay}s")
+                raise
+            self._auth_failures = 0
+            self._auth_retry_at = 0.0
             self.session.headers.update({
                 "Origin": "https://leviathannews.xyz",
                 "Referer": "https://leviathannews.xyz/",
             })
             self._auth_time = time.time()
-            # Get our user_id for matching in yap author data (which doesn't expose eth address)
+            # Get our user_id for matching in yap author data (which doesn't expose eth address).
+            # /wallet/me/ does not accept API keys; the public profile is keyed by address.
+            profile_url = (f"{LN_API}/wallet/{self.address}/profile/" if self.api_key
+                           else f"{LN_API}/wallet/me/")
             try:
-                me = self.session.get(f"{LN_API}/wallet/me/", timeout=300).json()
+                me = self.session.get(profile_url, timeout=300).json()
                 self.user_id = me.get("id")
                 if not self.user_id:
-                    log.error("Failed to get user_id from /wallet/me/ — reply detection will not work")
+                    log.error(f"Failed to get user_id from {profile_url} — reply detection will not work")
                     self.user_id = -1  # Sentinel that will never match
             except Exception as e:
                 log.error(f"Failed to fetch user profile: {e}")
                 self.user_id = -1
-            log.info(f"LN authenticated as {self.address} (user_id={self.user_id})")
+            log.info(f"LN authenticated as {self.address} via "
+                     f"{'API key' if self.api_key else 'wallet'} (user_id={self.user_id})")
+
+    def _wallet_sign_in(self):
+        r = self.session.get(f"{LN_API}/wallet/nonce/{self.address}/", timeout=300)
+        r.raise_for_status()
+        data = r.json()
+        msg = encode_defunct(text=data["message"])
+        sig = "0x" + self.account.sign_message(msg).signature.hex()
+        r2 = self.session.post(f"{LN_API}/wallet/verify/", json={
+            "address": self.address, "nonce": data["nonce"], "signature": sig,
+        }, timeout=300)
+        r2.raise_for_status()
 
     def _refresh_if_stale(self):
         """Re-auth if session is older than 30 min. MUST be called while self._lock is held.
@@ -924,26 +1194,36 @@ class LNClient:
         between freshness check and the actual API call, letting another thread expire the session.
         """
         if not hasattr(self, '_auth_time') or time.time() - self._auth_time > 1800:
+            self._check_auth_backoff()
             log.info("Session stale — re-authenticating")
             self.session.close()
-            self.session = requests.Session()
+            self.session = self._new_session()
             # Disable keep-alive to avoid stale connection errors
             self.session.headers.update({"Connection": "close"})
             self.authenticate()
 
-    def submit_article(self, url: str, headline: str, market_id: int | None = None) -> dict | None:
+    def submit_article(self, url: str, headline: str, market_id: int | None = None,
+                       wire: bool = False) -> dict | None:
         """Submit article via LN API (posts as the agent wallet). Thread-safe.
 
         market_id (optional): pre-attach an existing OPEN prediction market at
         creation (squid-bot PR #380). Only honored server-side for staff
         submitters; invalid/non-open ids are non-fatal there. Omitted from the
         body when None, so behaviour is unchanged for normal posts.
+
+        wire=True (squid-bot PR #882) creates an instant origin='benthic'
+        wire row — approved on creation, no HQ card/senate, never the main
+        feed. Staff-gated + fail-closed server-side (403 for non-staff, never
+        a silent downgrade into the editorial queue). Duplicate URLs return
+        the existing row, so a retried wire submit is idempotent.
         """
         with self._lock:
             self._refresh_if_stale()
             body = {"url": url, "headline": headline}
             if market_id is not None:
                 body["market_id"] = market_id
+            if wire:
+                body["wire"] = True
             r = self.session.post(
                 f"{LN_API}/news/post",
                 json=body,
@@ -956,10 +1236,14 @@ class LNClient:
                 news_obj = data.get("news", {})
                 art_id = news_obj.get("id") or data.get("article_id") or data.get("id")
                 data["article_id"] = art_id
-                log.info(f"Submitted article {art_id}: {headline}")
+                log.info(f"Submitted {'wire ' if wire else ''}article {art_id}: {headline}")
                 return data
             else:
                 log.error(f"Submit failed: {r.status_code} {r.text[:200]}")
+                if r.status_code == 401:
+                    # LN's session TTL equals the 30-minute refresh above; a
+                    # long-lived client logs in again rather than reuse it.
+                    self._auth_time = 0
                 return None
 
     def get_market_queue(self, limit: int = 20) -> list:
@@ -1067,25 +1351,10 @@ class LNClient:
             log.warning(f"Failed to get yaps for {article_id}: {e}")
         return []
 
-    def has_our_comment(self, article_id: int) -> bool:
-        """Check if we already commented on this article by looking at existing yaps."""
-        try:
-            with self._lock:
-                self._refresh_if_stale()
-                r = self.session.get(f"{LN_API}/news/{article_id}/list_yaps", timeout=300)
-                if r.ok:
-                    data = r.json()
-                    yaps = data if isinstance(data, list) else data.get("results", [])
-                    for yap in yaps:
-                        author = yap.get("author", {}) or {}
-                        if author.get("id") == self.user_id:
-                            return True
-        except Exception as e:
-            log.warning(f"Failed to check existing yaps on {article_id}: {e}")
-        return False
-
-    def post_yap(self, content_id: int, text: str, tags: list = None):
-        """Post a comment. content_id = article ID for top-level, yap ID for replies."""
+    def post_yap(
+        self, content_id: int, text: str, tags: list | None = None
+    ) -> bool:
+        """Post a yap and return whether LN explicitly accepted it."""
         payload = {"text": text, "tags": tags or ["analysis"]}
         with self._lock:
             self._refresh_if_stale()
@@ -1099,6 +1368,7 @@ class LNClient:
                 log.info(f"Commented on {content_id}")
             else:
                 log.error(f"Comment failed on {content_id}: {r.status_code} {r.text[:200]}")
+            return bool(r.ok)
 
 # ─── LLM CLI Providers (chain driven by PROVIDER_ORDER env) ─────────────────
 
@@ -1141,7 +1411,7 @@ _opencode_provider = OpenCodeProvider(
     wrapper=_build_codex_prompt,
 )
 _provider_chain = ProviderChain.from_env_order(
-    "PROVIDER_ORDER", default="codex,claude",
+    "PROVIDER_ORDER", default="codex",
     providers={
         "claude": _claude_provider,
         "codex": _codex_provider,
@@ -1158,6 +1428,12 @@ log.info(f"LLM provider chain: {','.join(_provider_chain.names())}")
 ENABLE_MARKET_MATCH = os.environ.get("ENABLE_MARKET_MATCH", "0") == "1"
 MARKET_MATCH_MAX_PER_CYCLE = _env_int("MARKET_MATCH_MAX_PER_CYCLE", 10)
 MARKET_MATCH_MAX_B = _env_int("MARKET_MATCH_MAX_B", 1000)
+
+# Hard rolling cap for unsolicited third-party article analysis comments.
+# Zero disables them; unusually high operator values are clamped defensively.
+ARTICLE_COMMENT_MAX_PER_24H = max(
+    0, min(24, _env_int("ARTICLE_COMMENT_MAX_PER_24H", 3))
+)
 
 # ─── Live-news WebSocket (see docs/superpowers/specs/2026-07-02-leviathan-ws-events-design.md) ───
 ENABLE_WS_EVENTS = os.environ.get("ENABLE_WS_EVENTS", "1") == "1"
@@ -1198,6 +1474,80 @@ PROVENANCE_CHECK_URL = os.environ.get(
     "PROVENANCE_CHECK_URL", "https://api.leviathannews.xyz/api/v1/provenance/check")
 MARKET_MATCH_ATTACH_MIN_CONFIDENCE = _env_float("MARKET_MATCH_ATTACH_MIN_CONFIDENCE", 0.75)
 
+# ── News channel routing ─────────────────────────────────────────────────
+# Everything curated posts to the channel; only heat>=LN_SUBMIT_MIN_HEAT is
+# also submitted to Leviathan. Off = skip channel sends ONLY (the LN bar
+# still applies); full legacy = ENABLE_CHANNEL_POSTS=0 + LN_SUBMIT_MIN_HEAT=1.
+# Target channel: @username or marked numeric id. No default — channel
+# posting stays off until one is configured (the bot must be a channel admin
+# with the "Post messages" right).
+BENTHIC_NEWS_CHANNEL = os.environ.get("BENTHIC_NEWS_CHANNEL", "").strip()
+ENABLE_CHANNEL_POSTS = (os.environ.get("ENABLE_CHANNEL_POSTS", "1") == "1"
+                        and bool(BENTHIC_NEWS_CHANNEL))
+# Wire tier (squid-bot PR #882): cold and LN-gate-demoted stories become
+# instant wire rows (no HQ card/senate/main feed) instead of channel-only
+# posts, so every channel post can carry Leviathan links. Hot stories keep
+# the editorial submission — dual path. The LN server staff-gates wire rows
+# (403 for non-staff accounts), so this is OFF unless your LN account is
+# staff; 0 keeps the channel-only routing for cold stories.
+ENABLE_WIRE_SUBMISSIONS = os.environ.get("ENABLE_WIRE_SUBMISSIONS", "0") == "1"
+# posted_articles.destination vocabulary — one definition, since operator
+# diagnostics query these values directly (see the deploy runbook).
+DEST_CHANNEL = "channel"
+DEST_LN = "ln"
+DEST_BOTH = "both"
+_raw_min_heat = _env_int("LN_SUBMIT_MIN_HEAT", 8)
+LN_SUBMIT_MIN_HEAT = max(1, min(10, _raw_min_heat))
+if LN_SUBMIT_MIN_HEAT != _raw_min_heat:
+    log.warning(f"LN_SUBMIT_MIN_HEAT={_raw_min_heat} out of range — clamped to {LN_SUBMIT_MIN_HEAT}")
+
+# ── Real-time source ingestion (spec 2026-08-02) ─────────────────────────
+# Off = exact legacy hourly ingestion: no push handlers, no news mini-pass.
+# The news pass keeps its OWN rate anchor so a vote mini-pass can never starve
+# it; the hourly cycle remains the backfill of record for anything it misses.
+ENABLE_SOURCE_PUSH = os.environ.get("ENABLE_SOURCE_PUSH", "1") == "1"
+JEV_REALTIME = ENABLE_SOURCE_PUSH and jev.enabled("news")
+# 900s/25: fewer, fatter eval batches. The original 300s/10 let firehose
+# sources hold the mini-pass at max frequency around the clock (measured
+# 2026-08-08: ~9 eval calls/hour, permanent queue saturation) — per-call
+# prompt overhead times 12 passes/hour is what burned the weekly pool.
+NEWS_PASS_MIN_INTERVAL = max(1, _env_int("NEWS_PASS_MIN_INTERVAL", 1 if JEV_REALTIME else 900))
+NEWS_PASS_DEADLINE = _env_int("NEWS_PASS_DEADLINE", 1200)
+_raw_news_pass_max = _env_int("NEWS_PASS_MAX_MESSAGES", 25)
+# Clamp: a non-positive cap would reach SQLite as LIMIT -1 == unlimited —
+# the exact opposite of a cap.
+NEWS_PASS_MAX_MESSAGES = max(1, _raw_news_pass_max)
+if NEWS_PASS_MAX_MESSAGES != _raw_news_pass_max:
+    log.warning(f"NEWS_PASS_MAX_MESSAGES={_raw_news_pass_max} non-positive — "
+                f"clamped to {NEWS_PASS_MAX_MESSAGES}")
+
+# Sources excluded from PUSH registration (they never wake the news
+# mini-pass); the hourly cycle still reads and evaluates them in its one
+# batched call, so exclusion changes latency, not coverage. Use it for
+# high-volume, low-yield firehoses. Entries match CHANNELS usernames or
+# ID_SOURCES labels exactly (comma-separated). Default: none.
+_push_excluded_env = os.environ.get("PUSH_EXCLUDED_SOURCES")
+PUSH_EXCLUDED_SOURCES = (
+    {s.strip() for s in _push_excluded_env.split(",") if s.strip()}
+    if _push_excluded_env is not None
+    else set()
+)
+# Handler registration resolves every channel. Cache hits cost nothing, but a
+# COLD channel_ids cache means one ResolveUsernameRequest per channel — ~68
+# back-to-back calls is the classic flood-wait shape. Only cache misses are
+# paced, so the steady state (and every client rebuild) still registers
+# instantly. Mirrors the 0.3s pacing the hourly type-detection migration uses.
+PUSH_RESOLVE_PACING = _env_float("PUSH_RESOLVE_PACING", 0.3)
+# Registration runs OUTSIDE the cycle watchdog, and Telethon absorbs a flood
+# wait by sleeping it off — so an unbounded registration can wedge the whole
+# process before the first cycle. 300s (not a tighter bound) because a
+# legitimate COLD-cache first run is ~68 resolutions plus PUSH_RESOLVE_PACING
+# between them, and registration happens ONCE per built client: timing out a
+# genuine cold start would leave push dead for that client's entire lifetime.
+PUSH_REGISTER_TIMEOUT = _env_int("PUSH_REGISTER_TIMEOUT", 300)
+PUSH_RECOVERY_INTERVAL = 30
+PUSH_RECOVERY_TIMEOUT = 10
+
 
 
 
@@ -1236,8 +1586,8 @@ def _sentinel_check_sync(text: str, context: str, timeout: int = 120) -> bool:
     """Sentinel check — verifies public-facing output is safe before posting.
 
     Routes through the provider chain at classification tier: with the default
-    codex,claude order that means gpt-5.6-luna giving a second opinion on the
-    creative model's (gpt-5.6-sol) output — a different model from the one that
+    codex,claude order that means gpt-6-luna giving a second opinion on the
+    creative model's (gpt-6-sol) output — a different model from the one that
     wrote the reply, to catch semantic injection that pattern matching can't
     detect. On Claude fallback the check runs Sonnet/low instead.
 
@@ -1391,6 +1741,47 @@ def _pre_filter_message(text: str, is_group: bool = False) -> bool:
     return any(k in text_lower for k in breaking_signals)
 
 
+def _parse_heat(value) -> int:
+    """Evaluator heat: valid ints clamp to 1-10; missing/malformed -> 0.
+
+    0 can never satisfy LN_SUBMIT_MIN_HEAT, so an evaluator that omits the
+    field degrades to channel-only posting — never accidental LN submission.
+
+    OverflowError is caught alongside the usual conversion errors: json.loads
+    turns an overlarge literal ("heat": 1e400) into float inf, and int(inf)
+    would otherwise escape the caller's except clause and lose the batch.
+    """
+    try:
+        return max(1, min(10, int(value)))
+    except (TypeError, ValueError, OverflowError):
+        return 0
+
+
+def _jev_news_item(message, evaluator, *, recover=False):
+    safe_text = sanitize_untrusted(message.get("text", ""), max_len=4000)
+    decision = evaluator.recover(safe_text) if recover else evaluator.evaluate(safe_text)
+    if decision.needs_recovery:
+        raise jev.SourceRecoveryNeeded("source text required")
+    if not decision.newsworthy:
+        return None
+    url = validate_url(decision.url)
+    if not url or url not in message.get("text", ""):
+        raise jev.JevError("source URL not witnessed in message")
+    # Jev cannot generate a hint. A bounded extract retains the topic for
+    # downstream dedup; the creative model still writes the public headline.
+    context = message.get("text", "")
+    hint_text = safe_text
+    if decision.evidence_text:
+        # A bounded source extract supplies a topic for link-only posts and
+        # dedup. Publication still performs its own source/freshness checks.
+        context = sanitize_untrusted(decision.evidence_text, max_len=3000)
+        context += "\nOriginal notification (untrusted):\n" + safe_text
+        hint_text = context
+    hint = re.sub(r"https?://\S+", "", hint_text).strip()[:200]
+    return {**message, "text": context, "url": url, "headline_hint": hint,
+            "reason": decision.reason, "heat": decision.heat}
+
+
 def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
     """
     Evaluate messages for newsworthiness AND deduplicate at the story level.
@@ -1415,6 +1806,31 @@ def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
         log.info(f"Pre-filter dropped all {original_count} messages — nothing to evaluate")
         return []
 
+    if jev.enabled("news"):
+        evaluator = jev.NewsEvaluator()
+        results = []
+        for message in messages:
+            try:
+                try:
+                    item = _jev_news_item(message, evaluator)
+                except jev.SourceRecoveryNeeded:
+                    item = _jev_news_item(message, evaluator, recover=True)
+                if item and evaluator.duplicate(sanitize_untrusted(item["text"], max_len=800),
+                        [sanitize_untrusted(r["text"], max_len=800) for r in results]):
+                    item = None
+            except jev.JevError as exc:
+                log.warning("JEV news evaluation deferred: %s", exc)
+                continue  # a failed request is not a rejection
+            db.save_evaluation(message["channel"], message["id"], message["text"],
+                               url=item["url"] if item else None,
+                               is_newsworthy=item is not None,
+                               reason="jev_selected" if item else "jev_filtered",
+                               headline_hint=item["headline_hint"] if item else None,
+                               heat=item["heat"] if item else None)
+            if item:
+                results.append(item)
+        return results
+
     # Format remaining messages for a single evaluation call
     # Sanitize text from Telegram channels — semi-trusted but still external input
     formatted = "\n\n---\n\n".join([
@@ -1425,7 +1841,13 @@ def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
     prompt = load_prompt("agent/evaluate_and_deduplicate",
         formatted=formatted)
 
-    response = claude_ask(prompt, timeout=900)
+    # Classification tier, soul-free, hard text-only. Evaluation is a
+    # scoring/filter task: the creative default (sol/xhigh + soul + web
+    # search) at push-pass frequency burned the entire weekly GPT-5.6 pool
+    # in one day (2026-08-03). Primary-source research lives downstream in
+    # resolve_craft_headline, which runs only for stories that pass here.
+    response = llm_ask(prompt, timeout=900, tier="classification",
+                       skip_soul=True, tools="__none__")
     if not response:
         return []
     # Check for injection in the raw evaluation response before parsing
@@ -1461,12 +1883,14 @@ def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
                     "url": url,
                     "headline_hint": item.get("headline_hint", ""),
                     "reason": item.get("reason", ""),
+                    "heat": _parse_heat(item.get("heat")),
                 })
                 # Save newsworthy evaluation
                 db.save_evaluation(
                     msg_map[mid]["channel"], mid, msg_map[mid]["text"],
                     url=url, is_newsworthy=True,
                     reason=item.get("reason"), headline_hint=item.get("headline_hint"),
+                    heat=_parse_heat(item.get("heat")),
                 )
 
         # Save all non-newsworthy messages too (so the agent remembers what it rejected)
@@ -1488,7 +1912,8 @@ def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
         log.info("Retrying evaluation with stricter prompt...")
         retry_prompt = load_prompt("agent/evaluate_and_deduplicate_retry",
             formatted=formatted)
-        retry_response = claude_ask(retry_prompt, timeout=900)
+        retry_response = llm_ask(retry_prompt, timeout=900, tier="classification",
+                                 skip_soul=True, tools="__none__")
         if retry_response:
             # Injection check on retry response — same defense as primary path
             if check_output_for_injection(retry_response, context="evaluate_retry"):
@@ -1508,10 +1933,12 @@ def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
                         if mid in msg_map and url:
                             results.append({**msg_map[mid], "url": url,
                                 "headline_hint": item.get("headline_hint", ""),
-                                "reason": item.get("reason", "")})
+                                "reason": item.get("reason", ""),
+                                "heat": _parse_heat(item.get("heat"))})
                             db.save_evaluation(msg_map[mid]["channel"], mid, msg_map[mid]["text"],
                                 url=url, is_newsworthy=True,
-                                reason=item.get("reason"), headline_hint=item.get("headline_hint"))
+                                reason=item.get("reason"), headline_hint=item.get("headline_hint"),
+                                heat=_parse_heat(item.get("heat")))
                     for m in messages:
                         if m["id"] not in {r["id"] for r in results}:
                             db.save_evaluation(m["channel"], m["id"], m["text"],
@@ -1522,64 +1949,72 @@ def evaluate_and_deduplicate(messages: list[dict], db: AgentDB) -> list[dict]:
         return []
 
 
-def resolve_craft_headline_tldr(url: str, original_text: str) -> tuple[str, str, str]:
-    """Resolve primary source, craft headline, AND write TL;DR in a single Opus call.
-
-    Combines three formerly separate Opus invocations into one. The model already
-    WebFetches the article and searches Twitter — doing URL resolution, headline
-    crafting, and TL;DR in the same context avoids redundant fetches and saves
-    2 full Opus calls per article.
-
-    Returns (resolved_url, headline, tldr). Any may be empty string on failure.
-    resolved_url falls back to the original url if resolution fails.
-    """
-    # Escape delimiter patterns in untrusted text to prevent parser confusion —
-    # a crafted Telegram message containing literal "===HEADLINE===" could cause
-    # the response parser to split incorrectly and misattribute content between fields.
+def resolve_craft_headline(url: str, original_text: str) -> tuple[str, str]:
+    """Resolve the primary source and craft one headline in a single call."""
+    # Escape response delimiters in untrusted text so source material cannot
+    # alter field attribution in the model's delimiter-based output.
     safe_text = sanitize_untrusted(original_text, max_len=1200).replace("===", "—-—")
-
-    prompt = load_prompt("agent/resolve_craft_headline_tldr",
-        no_slop=NO_AI_SLOP, url=url, safe_text=safe_text)
-
-    # Generous timeout — this call does URL resolution + headline + TL;DR with multiple
-    # tool invocations (WebFetch, WebSearch, Twitter). Inherits the 3600s default from
-    # the old craft_headline path rather than the tighter 900s from resolve_to_primary_source.
+    prompt = load_prompt(
+        "agent/resolve_craft_headline", url=url, safe_text=safe_text
+    )
     result = claude_ask(prompt)
-    if not result:
-        return url, "", ""
+    return _parse_crafted_headline(result, url)
 
-    # --- Parse delimiter-based response ---
+
+def prepare_news_article(url: str, original_text: str) -> tuple[str, str, str]:
+    """Research once for freshness, primary attribution, and the headline."""
+    safe_text = sanitize_untrusted(original_text, max_len=1200).replace("===", "—-—")
+    prompt = load_prompt("agent/prepare_news_article", url=url, safe_text=safe_text,
+                         today=datetime.now(timezone.utc).isoformat(timespec="seconds"))
+    started = time.monotonic()
+    result = llm_ask(prompt, timeout=180, tier="creative", effort="medium", skip_soul=True)
+    match = re.fullmatch(
+        r"\s*===FRESHNESS===\s*(fresh|stale|unknown|unavailable)\s*"
+        r"===URL===\s*(https?://\S+)\s*===HEADLINE===\s*(.*?)\s*",
+        result or "", re.DOTALL)
+    if not match or "===" in match.group(3) or not validate_url(match.group(2)):
+        log.warning("News preparation unavailable: invalid output (%.1fs)",
+                    time.monotonic() - started)
+        return url, "", "unavailable"
+    freshness, _, _ = match.groups()
+    resolved, headline = url, ""
+    if freshness in {"fresh", "unknown"}:
+        resolved, headline = _parse_crafted_headline(result[result.index("===URL==="):], url)
+        if not headline:
+            freshness = "unavailable"
+    log.info("News preparation freshness=%s duration=%.1fs", freshness,
+             time.monotonic() - started)
+    return resolved, headline, freshness
+
+
+def _parse_crafted_headline(result: str, url: str) -> tuple[str, str]:
+    """Keep URL and public-headline validation shared by both preparation paths."""
+    if not result:
+        return url, ""
+
     resolved_url_raw = ""
     headline_raw = ""
-    tldr_raw = ""
     if "===URL===" in result and "===HEADLINE===" in result:
         after_url = result.split("===URL===", 1)[1]
-        url_and_rest = after_url.split("===HEADLINE===", 1)
-        resolved_url_raw = url_and_rest[0].strip()
-        if len(url_and_rest) > 1:
-            headline_and_rest = url_and_rest[1].split("===TLDR===", 1)
-            headline_raw = headline_and_rest[0].strip()
-            tldr_raw = headline_and_rest[1].strip() if len(headline_and_rest) > 1 else ""
+        url_and_headline = after_url.split("===HEADLINE===", 1)
+        resolved_url_raw = url_and_headline[0].strip()
+        headline_raw = url_and_headline[1].split("===TLDR===", 1)[0].strip()
     elif "===HEADLINE===" in result:
-        # No URL delimiter — model skipped it, treat as headline+tldr only
         log.warning("resolve_craft: no ===URL=== delimiter, using original URL")
-        after_headline = result.split("===HEADLINE===", 1)[1]
-        parts = after_headline.split("===TLDR===", 1)
-        headline_raw = parts[0].strip()
-        tldr_raw = parts[1].strip() if len(parts) > 1 else ""
+        headline_raw = (
+            result.split("===HEADLINE===", 1)[1]
+            .split("===TLDR===", 1)[0]
+            .strip()
+        )
     else:
-        # No delimiters at all — treat entire result as headline only
         log.warning("resolve_craft: no delimiters found, treating as headline-only")
         headline_raw = result.strip()
 
-    # --- Validate resolved URL (same checks as resolve_to_primary_source) ---
-    resolved = url  # default: keep original
+    resolved = url
     if resolved_url_raw:
-        # Extract first URL from the raw text (model may add explanation)
         url_match = re.search(r'https?://\S+', resolved_url_raw)
         if url_match:
             extracted = url_match.group(0).strip().rstrip('.,;:)]\'"')
-            # Hard date check: reject URLs with dates older than 7 days in path
             date_match = re.search(r'/(\d{4})/(\d{2})/(\d{2})/', extracted)
             if date_match:
                 try:
@@ -1593,11 +2028,9 @@ def resolve_craft_headline_tldr(url: str, original_text: str) -> tuple[str, str,
             if extracted:
                 validated = validate_url(extracted)
                 if validated and "leviathannews.xyz" not in validated and "t.me/" not in validated:
-                    # Reject bare profile URLs (x.com/username without /status/)
                     if not re.match(r'^https?://(?:x\.com|twitter\.com)/\w+/?$', validated):
                         resolved = validated
 
-    # --- Validate headline (same checks as before) ---
     lines = [l.strip().strip('"\'').rstrip(".") for l in headline_raw.split('\n') if len(l.strip()) > 20]
     headline = lines[-1] if lines else headline_raw.strip().strip('"\'').rstrip(".")
     headline_lower = headline.lower()
@@ -1610,17 +2043,7 @@ def resolve_craft_headline_tldr(url: str, original_text: str) -> tuple[str, str,
     if headline and check_output_for_injection(headline, context="craft_headline"):
         headline = ""
 
-    # --- Validate TL;DR (same checks as before) ---
-    if tldr_raw and len(tldr_raw) < 30:
-        log.warning(f"Rejected short tldr: {tldr_raw[:80]}")
-        tldr_raw = ""
-    if tldr_raw and any(p in unicodedata.normalize("NFKD", tldr_raw).lower() for p in LEAK_PATTERNS):
-        log.warning(f"Rejected leaked tldr: {tldr_raw[:80]}")
-        tldr_raw = ""
-    if tldr_raw and check_output_for_injection(tldr_raw, context="craft_tldr"):
-        tldr_raw = ""
-
-    return resolved, headline, tldr_raw
+    return resolved, headline
 
 
 def craft_reply(our_comment: str, reply_text: str, reply_author: str, headline: str) -> str:
@@ -1666,6 +2089,12 @@ def evaluate_article_quality(headline: str, tags: list[str]) -> int:
     """
     safe_headline = sanitize_untrusted(headline, max_len=200)
     tags_str = ", ".join(sanitize_untrusted(t, max_len=30) for t in tags) if tags else "crypto"
+    if jev.enabled("votes"):
+        try:
+            return jev.TaskEvaluator().vote(safe_headline, tags=[tags_str])
+        except jev.JevError as exc:
+            log.warning("JEV article vote unavailable; skipping vote: %s", exc)
+            return 0
     prompt = load_prompt("agent/evaluate_article_quality",
         safe_headline=safe_headline, tags_str=tags_str)
 
@@ -1695,6 +2124,13 @@ def evaluate_comment_quality(comment_text: str, article_headline: str) -> int:
     """
     safe_comment = sanitize_untrusted(comment_text, max_len=500)
     safe_headline = sanitize_untrusted(article_headline, max_len=200)
+
+    if jev.enabled("votes"):
+        try:
+            return jev.TaskEvaluator().vote(safe_headline, comment=safe_comment)
+        except jev.JevError as exc:
+            log.warning("JEV comment vote unavailable; skipping vote: %s", exc)
+            return 0
 
     prompt = load_prompt("agent/evaluate_comment_quality",
         safe_headline=safe_headline, safe_comment=safe_comment)
@@ -1948,6 +2384,12 @@ def _market_prefilter(article: dict) -> bool:
     headline = sanitize_untrusted(str(article.get("headline", "")), max_len=300)
     if not headline:
         return False
+    if jev.enabled("market_prefilter"):
+        try:
+            return jev.TaskEvaluator().market(headline)
+        except jev.JevError as exc:
+            log.warning("JEV market gate unavailable; preserving fail-open policy: %s", exc)
+            return True
     try:
         prompt = load_prompt("agent/market_prefilter", headline=headline)
         raw = llm_ask(prompt, timeout=120, tier="classification", skip_soul=True, tools="")
@@ -2033,6 +2475,11 @@ def batch_evaluate_articles(articles: list[dict]) -> dict[int, int]:
     articles: list of dicts with 'id', 'headline', 'tags' keys."""
     if not articles:
         return {}
+    if jev.enabled("votes"):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            votes = pool.map(lambda a: evaluate_article_quality(a.get("headline", ""),
+                             a.get("tags", [])), articles)
+            return {a["id"]: v for a, v in zip(articles, votes)}
     # Format all articles into one prompt
     lines = []
     for i, a in enumerate(articles):
@@ -2075,6 +2522,11 @@ def batch_evaluate_comments(comments: list[dict]) -> dict[int, int]:
     comments: list of dicts with 'id', 'text', 'headline' keys."""
     if not comments:
         return {}
+    if jev.enabled("votes"):
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            votes = pool.map(lambda c: evaluate_comment_quality(c.get("text", ""),
+                             c.get("headline", "")), comments)
+            return {c["id"]: v for c, v in zip(comments, votes)}
     lines = []
     for i, c in enumerate(comments):
         safe_text = sanitize_untrusted(c.get("text", ""), max_len=300)
@@ -2158,6 +2610,9 @@ def craft_comment(headline: str, tags: list[str], article_url: str = "") -> str:
     result = claude_ask(prompt)
     if not result:
         return ""
+    if result.strip().casefold() == "skip":
+        log.info("Comment model abstained: no useful edge")
+        return ""
     # Take last substantial paragraph if Claude added preamble/thinking
     paragraphs = [p.strip() for p in result.strip().split('\n\n') if len(p.strip()) > 30]
     if paragraphs:
@@ -2228,12 +2683,21 @@ def walk_replies_and_respond(yaps: list, our_yap_ids: set, our_yap_texts: dict,
                     safe_our_text=safe_our_text[:200],
                     safe_reply_author=safe_reply_author,
                     safe_reply_text=safe_reply_text)
-                eval_result = llm_ask(
-                    worth_prompt,
-                    timeout=120, tier="classification",
-                    skip_soul=True, tools="",
-                )
-                should_reply = eval_result.strip().lower().startswith("yes") if eval_result else False
+                if jev.enabled("reply_gate"):
+                    try:
+                        should_reply = jev.TaskEvaluator().continue_reply(
+                            sanitize_untrusted(headline, max_len=200), safe_context,
+                            safe_our_text[:200], safe_reply_text)
+                    except jev.JevError as exc:
+                        log.warning("JEV reply gate unavailable; skipping: %s", exc)
+                        should_reply = False
+                else:
+                    eval_result = llm_ask(
+                        worth_prompt,
+                        timeout=120, tier="classification",
+                        skip_soul=True, tools="",
+                    )
+                    should_reply = eval_result.strip().lower().startswith("yes") if eval_result else False
 
             if should_reply:
                 reply = craft_reply(safe_our_text, safe_reply_text, safe_reply_author, headline)
@@ -2307,6 +2771,47 @@ async def fetch_channel_messages(
     return messages
 
 
+async def read_id_sources(client, db: "AgentDB", since) -> list[dict]:
+    """Cursor-read every ID_SOURCES entry (hourly path).
+
+    get_entity by dialog id needs no username resolution — the account is a
+    member of each source, so the session cache holds the peer. A failed
+    source costs only itself. Labels (not Telegram titles) are the channel
+    keys, so cursor/evaluated state survives Telegram-side renames.
+    """
+    collected: list[dict] = []
+    for src_id, label in ID_SOURCES.items():
+        try:
+            entity = await client.get_entity(src_id)
+        except Exception as e:
+            log.warning(f"  {label}: id-source resolution failed — {e}")
+            continue
+        last_id = db.get_cursor(label)
+        is_group = getattr(entity, "megagroup", False)
+        msgs = await fetch_channel_messages(
+            client, entity, min_id=last_id, limit=50, since=since,
+            channel_name=label, is_group=is_group)
+        if msgs:
+            log.info(f"  {label}: {len(msgs)} new")
+            collected.extend(msgs)
+            _queue_backfill(msgs, db)
+            db.set_cursor(label, max(m["id"] for m in msgs))
+        await asyncio.sleep(0.5)
+    return collected
+
+
+def _drop_already_evaluated(messages: list[dict], db: "AgentDB") -> list[dict]:
+    """Cursor reads overlap with push-evaluated messages — drop the overlap.
+
+    The push handler never advances cursors, so the hourly read re-fetches
+    everything since the last cycle; anything a news pass already evaluated
+    is filtered here instead of being re-billed."""
+    fresh = [m for m in messages if not db.was_evaluated(m["channel"], m["id"])]
+    dropped = len(messages) - len(fresh)
+    if dropped:
+        log.info(f"Skipping {dropped} message(s) already evaluated by push passes")
+    return fresh
+
 
 # Headline-bot user ID — the bot account that posts approved headlines in Bot HQ.
 # Set HEADLINE_BOT_USER_ID env to filter HQ messages to that bot's posts only.
@@ -2367,6 +2872,162 @@ def _provenance_dedup_check(url: str, hint: str, recent_hours: int = 168) -> str
             # the fail-closed posture of the dup pipeline.
             return "reject"
     return "fallback"
+
+
+# ── News channel posting (Bot API) ───────────────────────────────────────
+# Shares the chat bot's token with benthic-bot. Safe: ln-agent only calls
+# sendMessage, never getUpdates, so there is no 409 polling conflict.
+_channel_bot_token: str | None = None
+_channel_token_failed = False
+_channel_send_lock = threading.Lock()
+# Upper bound on an honored Telegram 429 retry_after (seconds).
+_CHANNEL_RETRY_AFTER_CAP = 30
+
+
+def _get_channel_bot_token() -> str | None:
+    """Lazy-load the bot token; CRITICAL once and stay disabled on failure."""
+    global _channel_bot_token, _channel_token_failed
+    if _channel_bot_token or _channel_token_failed:
+        return _channel_bot_token
+    token = os.environ.get("BOT_TOKEN", "").strip()
+    if not token:
+        try:
+            token = Path(os.environ.get("BOT_TOKEN_FILE", "~/.claude/.ln-bot-token")
+                         ).expanduser().read_text().strip()
+        # Deliberately broad. expanduser() raises RuntimeError on an unresolvable
+        # HOME and a non-UTF-8 file raises UnicodeDecodeError (a ValueError) —
+        # neither is an OSError. This loader's only contract is "return None and
+        # latch off", so nothing may escape it into the parallel posting path.
+        except Exception as e:
+            log.critical(f"Channel bot token unreadable ({e}) — "
+                         f"channel posting disabled for this process")
+            _channel_token_failed = True
+            return None
+    if not token:
+        log.critical("Channel bot token empty — channel posting disabled for this process")
+        _channel_token_failed = True
+        return None
+    _channel_bot_token = token
+    return token
+
+
+_CHANNEL_UTM = "utm_source=benthic_news&utm_medium=telegram&utm_campaign=news"
+
+
+def _channel_payloads(headline: str, url: str, ln_url: str | None,
+                      ln_story_url: str | None = None) -> list[dict]:
+    """Ordered sendMessage payloads for one story: richest first.
+
+    ln_story_url (when the story has an LN row — wire or editorial) is the
+    skip-landing tracked redirect from the submit response: it becomes the
+    story link in BOTH variants, so the channel carries only Leviathan links
+    (operator decision 2026-08-08) while readers still land on the source
+    (the redirect 302s straight there) and LN counts the click. Without it,
+    the raw source URL is the story link — the pre-wire format.
+
+    Rich variant (only when the story has a live LN canonical URL) folds the
+    story link into a "Source" anchor — the skip-landing redirect is long and
+    ugly as visible text (operator decision 2026-08-12) — and adds the
+    Leviathan anchor for a countable funnel click. Link previews are disabled
+    on every variant (same decision). Plain variant doubles as the 400
+    fallback: a Telegram entity-parse reject must cost the markup, never the
+    story — so it alone keeps the bare URL.
+    """
+    story_link = ln_story_url or url
+    plain = {"chat_id": BENTHIC_NEWS_CHANNEL, "text": f"{headline}\n\n{story_link}",
+             "link_preview_options": {"is_disabled": True}}
+    if not ln_url:
+        return [plain]
+    sep = "&" if "?" in ln_url else "?"
+    href = html.escape(f"{ln_url}{sep}{_CHANNEL_UTM}", quote=True)
+    story_href = html.escape(story_link, quote=True)
+    rich_text = (f"{html.escape(headline)}\n\n"
+                 f'<a href="{story_href}">Source</a> '
+                 f'⚓ <a href="{href}">Discuss on Leviathan</a>')
+    return [{"chat_id": BENTHIC_NEWS_CHANNEL, "text": rich_text,
+             "parse_mode": "HTML",
+             "link_preview_options": {"is_disabled": True}}, plain]
+
+
+def post_to_channel(headline: str, url: str,
+                    ln_url: str | None = None,
+                    ln_story_url: str | None = None) -> tuple[bool, int | None]:
+    """Post one story to BENTHIC_NEWS_CHANNEL via Bot API sendMessage.
+
+    Returns (sent, message_id). Never raises — a channel failure must not gate
+    the LN leg (and vice versa). Retries network errors, 5xx, and 429 twice;
+    every other 4xx is final (403 = bot not admin, logged with the remediation).
+    ln_url (already validated by the caller) adds an HTML "Discuss on
+    Leviathan" anchor; a 400 on the HTML payload falls back to the plain
+    legacy payload within the same attempt budget.
+
+    The send lock covers only the request and the courtesy spacing, never the
+    waits: Phase 3 posts articles from parallel threads, so holding it across a
+    whole retry budget would serialize every worker behind one flooding article
+    and eat into the cycle deadline.
+    """
+    token = _get_channel_bot_token()
+    if not token:
+        return False, None
+    api_url = f"https://api.telegram.org/bot{token}/sendMessage"
+    payloads = _channel_payloads(headline, url, ln_url, ln_story_url=ln_story_url)
+    p_idx = 0
+    for attempt in range(3):
+        wait = 2 * (attempt + 1)
+        with _channel_send_lock:  # serialize sends only — see docstring
+            try:
+                resp = requests.post(api_url, json=payloads[p_idx], timeout=10)
+            except Exception as e:
+                # requests embeds the full request URL in connection errors, and
+                # that URL carries the bot token. agent.log is rotated on disk and
+                # readable by operator diagnostics that echo output into chat, so
+                # the credential must never be written verbatim.
+                detail = str(e).replace(token, "<token>")
+                log.warning(f"Channel post attempt {attempt + 1}/3 failed: "
+                            f"{type(e).__name__}: {detail}")
+            else:
+                if resp.status_code == 200:
+                    time.sleep(0.5)  # Bot API courtesy spacing — under the lock
+                    try:
+                        return True, int(resp.json()["result"]["message_id"])
+                    except Exception:
+                        log.warning("Channel post sent but response unparseable — no message id")
+                        return True, None
+                if resp.status_code == 403:
+                    log.critical("Channel post 403 — add the bot as admin of "
+                                 f"{BENTHIC_NEWS_CHANNEL} with the 'Post messages' right")
+                    return False, None
+                if resp.status_code == 429:
+                    # The one retryable 4xx: Telegram flood-controls channels at
+                    # ~20 msg/min, and this feature deliberately routes more
+                    # volume to the channel than to LN. Honor the server's
+                    # retry_after, but cap it — an unbounded server-supplied
+                    # sleep would stall this worker for the rest of the cycle.
+                    try:
+                        retry_after = int(resp.json()["parameters"]["retry_after"])
+                    except Exception:
+                        retry_after = 0
+                    if retry_after > 0:
+                        wait = min(retry_after, _CHANNEL_RETRY_AFTER_CAP)
+                    log.warning(
+                        f"Channel post rate-limited (429) — "
+                        + (f"retry in {wait}s" if attempt < 2 else "retry budget exhausted")
+                        + f" (attempt {attempt + 1}/3)")
+                elif resp.status_code == 400 and p_idx + 1 < len(payloads):
+                    # Telegram rejects malformed HTML entities with 400. The
+                    # plain payload cannot fail this way — downgrade and let
+                    # the remaining attempts deliver the story linkless.
+                    log.warning("Channel post 400 on HTML payload — falling back to plain text")
+                    p_idx += 1
+                elif 400 <= resp.status_code < 500:
+                    log.error(f"Channel post rejected: HTTP {resp.status_code}")
+                    return False, None
+                else:
+                    log.warning(f"Channel post HTTP {resp.status_code} "
+                                f"(attempt {attempt + 1}/3)")
+        if attempt < 2:
+            time.sleep(wait)
+    return False, None
 
 
 def fetch_bot_hq_recent_headlines(limit: int = 80, hours: int = 6) -> list[str] | None:
@@ -2456,6 +3117,220 @@ def fetch_bot_hq_recent_headlines(limit: int = 80, hours: int = 6) -> list[str] 
 _ws_wake = asyncio.Event()
 _ws_gap = True  # start pessimistic: anything before process start is unseen
 _ws_connected_at = None  # set on WS connect; supervisor uses it for backoff reset
+
+# _news_wake: set by the Telethon NewMessage push handler when a pre-filtered
+# source message lands in pending_source_messages, so the run_loop sleep can
+# cut short and run a news mini-pass.
+_news_wake = asyncio.Event()
+_jev_decision_lock = asyncio.Lock()
+
+
+async def _blocking(function, *args, **kwargs):
+    """Keep Telegram dispatch live while a synchronous provider/API call runs.
+
+    Cancellation drains the owned call before its caller closes SQLite or starts
+    another publication. Cancelling to_thread alone cannot stop that work.
+    """
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            await task
+        finally:
+            raise
+
+
+def _queue_backfill(messages, db):
+    if not JEV_REALTIME:
+        return
+    for msg in messages:
+        if _pre_filter_message(msg.get("text", ""), is_group=msg.get("is_group", False)):
+            db.add_pending_source_message(msg["channel"], msg["id"], msg["text"], msg["date"])
+    if messages:
+        _news_wake.set()
+
+
+async def _jev_evaluation_worker(stage="evaluate"):
+    """Fast triage and source reading have independent bounded work queues."""
+    db = AgentDB()
+    queue = NewsQueue(db.db_path)
+    evaluator = jev.NewsEvaluator()
+    tasks = []
+    try:
+        while True:
+            if stage == "evaluate":
+                _news_wake.clear()
+                queue.ingest()
+            rows = queue.ready(stage, 2 if stage == "recover" else min(4, NEWS_PASS_MAX_MESSAGES))
+            if not rows:
+                try:
+                    if stage == "evaluate":
+                        await asyncio.wait_for(_news_wake.wait(), timeout=1)
+                    else:
+                        await asyncio.sleep(1)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+
+            def evaluate(row):
+                if db.was_evaluated(row["channel"], row["msg_id"]):
+                    return None
+                message = {"id": row["msg_id"], "channel": row["channel"],
+                           "text": row["text"], "date": row["msg_date"]}
+                if stage == "recover":
+                    return _jev_news_item(message, evaluator, recover=True)
+                return _jev_news_item(message, evaluator)
+
+            async def run_one(row):
+                try:
+                    if stage == "recover":
+                        try:
+                            stamp = datetime.fromisoformat(row["msg_date"].replace("Z", "+00:00"))
+                            expired = stamp.tzinfo is None or datetime.now(timezone.utc) - stamp > timedelta(days=3)
+                        except (ValueError, TypeError, AttributeError):
+                            expired = True
+                        if expired:
+                            queue.finish_unavailable(row)
+                            log.warning("JEV source recovery expired %s#%s", row["channel"], row["msg_id"])
+                            return row, None, True
+                    return row, await _blocking(evaluate, row), False
+                except jev.JevError as exc:
+                    return row, exc, False
+
+            tasks = [asyncio.create_task(run_one(row)) for row in rows]
+            accepted = deferred = recovering = 0
+            for finished in asyncio.as_completed(tasks):
+                row, item, expired = await finished
+                if expired:
+                    continue
+                if isinstance(item, jev.SourceRecoveryNeeded):
+                    queue.move_to_recovery(row)
+                    recovering += 1
+                    continue
+                if isinstance(item, jev.SourceRecoveryUnavailable):
+                    # After three failed attempts, an explicit access refusal
+                    # retires this reader's work. Keep an unavailable outcome,
+                    # never turn a retrieval failure into a news vote.
+                    if item.access_denied and row["attempts"] >= 2:
+                        queue.finish_unavailable(row)
+                        log.warning("NEWS source recovery unavailable attempts=%d "
+                                    "reason=access_denied %s#%s",
+                                    row["attempts"] + 1, row["channel"], row["msg_id"])
+                        continue
+                    log.warning("NEWS source recovery deferred %s#%s: %s",
+                                row["channel"], row["msg_id"], item)
+                    queue.defer(row)
+                    deferred += 1
+                    continue
+                if isinstance(item, jev.JevError):
+                    log.warning("JEV evaluation deferred %s#%s: %s",
+                                row["channel"], row["msg_id"], item)
+                    queue.defer(row)
+                    deferred += 1
+                    continue
+                # Both queues must compare and persist under the same lock;
+                # otherwise simultaneous fast/recovered copies both pass dedup.
+                async with _jev_decision_lock:
+                    if item:
+                        try:
+                            if await _blocking(evaluator.duplicate,
+                                    sanitize_untrusted(item["text"], max_len=800),
+                                    [sanitize_untrusted(t, max_len=800) for t in
+                                     queue.prior_candidates(row["source_id"])]):
+                                item = None
+                        except jev.JevError as exc:
+                            log.warning("JEV source dedup deferred: %s", exc)
+                            queue.defer(row)
+                            deferred += 1
+                            continue
+                    queue.finish_evaluation(row, item)
+                    accepted += item is not None
+            tasks = []
+            log.info("JEV push stage=%s evaluated=%d accepted=%d deferred=%d recovery=%d",
+                     stage, len(rows), accepted, deferred, recovering)
+            await asyncio.sleep(0.1)
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        queue.close()
+        db.close()
+
+
+async def _jev_recovery_worker():
+    await _jev_evaluation_worker("recover")
+
+
+async def _jev_publication_worker():
+    """Serialize news posts while new sources continue to be evaluated."""
+    db = AgentDB()
+    queue = NewsQueue(db.db_path)
+    # One client for the worker's lifetime. It logs in lazily at the first LN
+    # call, after source preparation, and an LN failure costs only the LN leg
+    # (_process_article posts to the channel regardless). A client and login
+    # per queued row held LN's shared nonce limit at 429 and, because login
+    # preceded posting, stopped the channel too (2026-09-28, 2026-10-19).
+    ln = None
+    try:
+        while True:
+            rows = queue.ready("post", 1)
+            if not rows:
+                await asyncio.sleep(1)
+                continue
+            row = rows[0]
+            item = json.loads(row["decision"])
+            phase = "prepare"
+            try:
+                try:
+                    published = datetime.fromisoformat(row["msg_date"].replace("Z", "+00:00"))
+                except (ValueError, TypeError, AttributeError):
+                    log.error("JEV candidate has invalid source time; retiring %s#%s",
+                              row["channel"], row["msg_id"])
+                    queue.finish_post(row)
+                    continue
+                if published.tzinfo is None or datetime.now(timezone.utc) - published > timedelta(days=3):
+                    log.info("JEV candidate expired before publication: %s#%s",
+                             row["channel"], row["msg_id"])
+                    queue.finish_post(row)
+                    continue
+                if db.was_url_posted(item["url"]):
+                    queue.finish_post(row)
+                    continue
+                if ln is None:
+                    _, _, wallet_key = load_credentials()
+                    ln = LNClient(wallet_key)
+                phase = "article_processing"
+                posted = await news_post_pass([item], db, ln)
+                if posted or db.was_url_posted(item["url"]):
+                    queue.finish_post(row)
+                else:
+                    # A held candidate or provider outage keeps its decision;
+                    # retrying never pays for another newsworthiness evaluation.
+                    queue.defer(row)
+                    log.warning("NEWS publication deferred %s#%s", row["channel"], row["msg_id"])
+            except Exception as exc:
+                queue.defer(row)
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                status = status if type(status) is int and 100 <= status <= 599 else "unknown"
+                log.warning("NEWS publication failed stage=%s error=%s http_status=%s "
+                            "source_id=%s; retained for retry",
+                            phase, type(exc).__name__, status, row["source_id"])
+            await asyncio.sleep(0.1)
+    finally:
+        queue.close()
+        db.close()
+
+
+async def _jev_worker_supervisor(worker):
+    while True:
+        try:
+            await worker()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("JEV %s failed; restarting in 10 seconds", worker.__name__)
+            await asyncio.sleep(10)
 
 
 def _set_ws_gap() -> None:
@@ -2586,6 +3461,477 @@ async def _ws_listener_supervisor() -> None:
         backoff = min(backoff * 2, WS_BACKOFF_CAP)
 
 
+# ─── Telegram source push plumbing ───────────────────────────────────────────
+
+def make_source_handler(db: "AgentDB", chan_map: dict, *, edited=False):
+    """Build the new-message or edited-caption push callback.
+
+    chan_map: marked chat id (-100…) -> (channel username, is_group).
+    The handler is deliberately dumb and fast: pre-filter, INSERT, wake.
+    No LLM, no network. Errors are contained — a weird update must never
+    kill the Telethon dispatch loop.
+    """
+    async def _on_source_message(event):
+        try:
+            entry = chan_map.get(event.chat_id)
+            if entry is None:
+                return
+            # channel is the @username from CHANNELS, never a numeric peer id:
+            # pending_source_messages.UNIQUE(channel, msg_id) and the hourly
+            # cycle's channel_cursors/evaluated_messages rows all key off that
+            # exact string, so a numeric id here would silently break dedup.
+            channel, is_group = entry
+            if edited:
+                # Publishers often attach captions just after sending media.
+                # Admit the first eligible version through the same unique key;
+                # edits must not replay queued stories or revive old messages.
+                stamp = event.message.date
+                if stamp.tzinfo is None or not (
+                        -timedelta(minutes=5) <= datetime.now(timezone.utc) - stamp <= timedelta(days=3)):
+                    return
+            text = event.message.text or ""
+            if not _pre_filter_message(text, is_group=is_group):
+                return
+            url_m = re.search(r'https?://\S+', text)
+            # Telegram text is untrusted — validate the URL before it can reach
+            # a prompt or an HTTP call downstream. A rejected URL still queues
+            # the message (the mini-pass can evaluate it), just without a URL.
+            # Trailing sentence punctuation is stripped first, same as the
+            # resolved-URL cleanup in resolve_craft_headline.
+            url = validate_url(
+                url_m.group(0).rstrip('.,;:)]\'"')) if url_m else None
+            if db.add_pending_source_message(
+                    channel, event.message.id, text,
+                    event.message.date.isoformat(),
+                    url=url or None):
+                log.info("PUSH: queued %s#%s update=%s", channel, event.message.id,
+                         "edit" if edited else "new")
+                _news_wake.set()
+        except Exception as e:
+            log.warning(f"PUSH: handler error: {e}")
+    return _on_source_message
+
+
+async def register_source_handlers(client, db: "AgentDB") -> int:
+    """Register new-message and edit handlers covering all resolvable CHANNELS
+    and ID_SOURCES entries.
+
+    Sources added to either list are picked up at the next process restart.
+    Returns the number of sources covered.
+    """
+    from telethon import events, utils
+    from telethon.tl import types
+    chan_map: dict = {}
+    excluded = 0
+    for channel in CHANNELS:
+        if channel in PUSH_EXCLUDED_SOURCES:
+            excluded += 1
+            continue
+        # A cache miss means resolve_channel will hit ResolveUsernameRequest;
+        # a hit costs one local SELECT. Decide BEFORE resolving, because a
+        # successful resolution populates the cache. See PUSH_RESOLVE_PACING.
+        cache_miss = db.get_channel_id(channel) is None
+        # Whole per-channel body is guarded: one unresolvable or malformed
+        # channel must cost only itself, not the entire push registration.
+        try:
+            numeric_id = await resolve_channel(client, channel, db)
+            marked = utils.get_peer_id(types.PeerChannel(numeric_id))
+            chan_map[marked] = (channel, db.get_channel_type(channel) == "group")
+        except Exception as e:
+            log.warning(f"PUSH: {channel}: resolution failed — {e}")
+        if cache_miss:
+            # A failed cold resolution still spent an API call, so it is paced
+            # too — a run of dead usernames must not recreate the burst.
+            await asyncio.sleep(PUSH_RESOLVE_PACING)
+    for src_id, label in ID_SOURCES.items():
+        if label in PUSH_EXCLUDED_SOURCES:
+            excluded += 1
+            continue
+        # Dialog ids are already marked (channels -100…, basic chats -…):
+        # event.chat_id matches them directly, no PeerChannel wrapping. The
+        # session cache holds every member peer, so no pacing is needed.
+        try:
+            entity = await client.get_entity(src_id)
+            chan_map[src_id] = (label, getattr(entity, "megagroup", False))
+        except Exception as e:
+            log.warning(f"PUSH: {label}: id-source resolution failed — {e}")
+    if excluded:
+        log.info(f"PUSH: {excluded} source(s) excluded from push (hourly-only)")
+    if chan_map:
+        client.add_event_handler(make_source_handler(db, chan_map),
+                                 events.NewMessage(chats=list(chan_map.keys())))
+        client.add_event_handler(make_source_handler(db, chan_map, edited=True),
+                                 events.MessageEdited(chats=list(chan_map.keys())))
+    return len(chan_map)
+
+
+async def _refresh_source_updates(client) -> float:
+    """Refresh update delivery and request any gap without scanning each source."""
+    try:
+        async with asyncio.timeout(PUSH_RECOVERY_TIMEOUT):
+            # GetState reactivates update delivery without replacing Telethon's
+            # local cursor. catch_up then requests the missing difference and
+            # dispatches it through the same durable, deduplicating handlers.
+            await client(functions.updates.GetStateRequest(), flood_sleep_threshold=0)
+            await client.catch_up()
+    except FloodWaitError as exc:
+        delay = max(PUSH_RECOVERY_INTERVAL, exc.seconds)
+        log.warning("PUSH: recovery flood wait; retry in %ss", delay)
+        return delay
+    except Exception as exc:
+        log.warning("PUSH: recovery unavailable (%s)", type(exc).__name__)
+    return PUSH_RECOVERY_INTERVAL
+
+
+_news_publication_lock = threading.Lock()
+
+
+def _process_article(item: dict, db: "AgentDB", ln: "LNClient",
+                     hq_headlines: list[str], hq_available: bool,
+                     hq_dedup_hours: int, preattach_markets: list) -> bool:
+    """Full pipeline for one story (blocking; runs in a thread).
+
+    Destination-scoped dedup (spec 2026-08-02): posted_articles gates every
+    destination; provenance + Bot HQ gate ONLY the LN leg of hot stories —
+    an LN dup demotes to channel-only instead of dropping the story.
+    """
+    url = item["url"]
+    hint = item.get("headline_hint", "")
+    heat = item.get("heat", 0)
+    is_hot = heat >= LN_SUBMIT_MIN_HEAT
+
+    # ── Universal gate (both destinations) ──
+
+    # Check DB for duplicate URL with ORIGINAL URL first (cheap, no LLM)
+    if db.was_url_posted(url):
+        log.info(f"Already posted by us (DB): {url}")
+        return False
+
+    # Source-trust gate: reject content farms / SEO aggregators before
+    # spending any LLM tokens. The eval prompt should already filter
+    # these but the model occasionally lets one through (the zine.live
+    # Wilder-World incident on 2026-05-17 was the trigger for this).
+    if is_blocked_source(url):
+        log.info(f"Rejected blocked source: {url}")
+        db.save_posted(url=url, headline="[blocked source]", story_hint=hint,
+                       source_channel=item.get("channel"))
+        return False
+
+    # In Jev mode, the serialized final-headline comparison below owns story
+    # identity. Word overlap confuses new actions and assets with shared topics,
+    # and legacy rejection markers are not evidence that anything was published.
+    if not jev.enabled("news") and hint and db.was_story_posted(hint):
+        db.save_posted(url=url, headline="[self-duplicate]", story_hint=hint,
+                       source_channel=item.get("channel"))
+        return False
+
+    # Hot stories need the LN dedup ground truth; without it they are HELD
+    # (nothing posted or saved) so the LN leg stays retryable. Cold stories
+    # never depended on Bot HQ and proceed.
+    if is_hot and not hq_available:
+        log.warning(f"HELD hot candidate (Bot HQ dedup unavailable): {hint or url}")
+        return False
+
+    # ── LN gate (hot stories only) — a reject demotes, never drops ──
+    ln_eligible = is_hot
+    if is_hot:
+        # Provenance dedup (stage 1, zero tokens) — LN's own /provenance/check.
+        # duplicate / recently-known -> demote here; new / stale / old-known ->
+        # proceed and SKIP the classify-tier HQ prompt below. "fallback" (API error,
+        # kill-switch off, unexpected body) -> the classify-tier HQ path runs unchanged.
+        prov = _provenance_dedup_check(url, hint, recent_hours=hq_dedup_hours)
+        if prov == "reject":
+            log.info(f"LN gate: provenance dup — demoting to channel-only: {hint or url}")
+            ln_eligible = False
+        elif prov == "proceed":
+            log.info(f"Provenance cleared candidate — skipping HQ LLM dup check: {url}")
+        else:
+            # Bot HQ dup check (fallback path) — the classify tier judges the candidate
+            # against recent HQ headlines fetched up front. Only runs when the
+            # provenance API was inconclusive. Headlines and hint are wrapped with
+            # sanitize_untrusted for injection defense.
+            safe_hint = sanitize_untrusted(hint, max_len=200) if hint else ""
+            if not hq_headlines:
+                log.warning(f"Bot HQ dedup context empty — proceeding without HQ check: {url}")
+            elif not safe_hint:
+                # Upstream evaluator didn't produce a headline_hint. HQ dedup relies on
+                # having a topic to match — log so the failure is visible and proceed.
+                log.warning(f"No headline_hint on candidate — skipping HQ dup check: {url}")
+            else:
+                hq_formatted = "\n".join(
+                    f"{i+1}. {sanitize_untrusted(h, max_len=300)}"
+                    for i, h in enumerate(hq_headlines)
+                )
+                safe_url = sanitize_untrusted(url, max_len=500)
+                dup_prompt = load_prompt("agent/duplicate_check",
+                    candidate_hint=safe_hint, url=safe_url,
+                    hq_headlines=hq_formatted, hours=hq_dedup_hours)
+                if jev.enabled("duplicates"):
+                    try:
+                        evaluator = jev.NewsEvaluator()
+                        duplicate = any(evaluator.duplicate(safe_hint,
+                            [sanitize_untrusted(h, max_len=300) for h in hq_headlines[i:i+25]])
+                            for i in range(0, len(hq_headlines), 25))
+                        dup_result = "duplicate" if duplicate else "not_duplicate"
+                    except jev.JevError as exc:
+                        log.warning("JEV HQ dedup unavailable; demoting to wire: %s", exc)
+                        dup_result = "duplicate"
+                else:
+                    dup_result = llm_ask(
+                        dup_prompt,
+                        timeout=120, tier="classification",
+                        skip_soul=True, tools="",
+                    )
+                if check_output_for_injection(dup_result, context="bot_hq_dup_check"):
+                    # Injection is a whole-story reject: hostile content must not
+                    # reach the channel either.
+                    log.warning(f"Injection detected in dup check response — rejecting article")
+                    return False
+                # Fail closed: empty/garbage response → treat as duplicate, which
+                # now costs the LN leg only. "not_duplicate" clears it.
+                dup_lower = dup_result.strip().lower() if dup_result and dup_result.strip() else "duplicate"
+                if "not_duplicate" not in dup_lower:
+                    log.info(f"LN gate: Bot HQ dup — demoting to channel-only: {hint}")
+                    ln_eligible = False
+
+    # No destination can take this story (channel posting off, LN leg either
+    # sub-bar or demoted, and the wire tier disabled) — bail before the
+    # freshness and creative craft calls rather than paying for a headline
+    # nothing can publish. Only reachable in the emergency rollback config,
+    # which is exactly when the provider quota is most likely to be the
+    # reason for the rollback.
+    if not ENABLE_CHANNEL_POSTS and not ln_eligible and not ENABLE_WIRE_SUBMISSIONS:
+        log.info(f"No eligible destination (channel posting off, LN leg ineligible): {url}")
+        return False
+
+    if jev.enabled("news"):
+        resolved_url, headline, freshness = prepare_news_article(url, item.get("text", ""))
+        if freshness == "unavailable":
+            log.warning("HELD candidate: source preparation unavailable")
+            return False
+    else:
+        freshness = "fresh" if check_article_freshness(url, item.get("text", "")) else "stale"
+        resolved_url, headline = url, ""
+
+    if freshness == "stale":
+        log.info(f"Rejected stale article (older than three days): {url}")
+        # Like blocked-source markers, this is a terminal URL decision. An
+        # empty hint prevents an unpublished old story suppressing fresh news;
+        # absent destination/receipt fields exclude it from published history.
+        db.save_posted(url=url, headline="[stale article]", story_hint="",
+                       source_channel=item.get("channel"))
+        return False
+
+    # Resolve the primary source and craft the headline in one creative
+    # call. Phase 3 intentionally generates no automatic comment text.
+    # NOTE: Bot HQ dup check already ran against the original URL above. It uses
+    # topic/entity-based search (not just URL matching), so it catches semantic
+    # duplicates regardless of which URL variant was used. The post-resolve DB
+    # check below catches any remaining exact-URL duplicates.
+    if not jev.enabled("news"):
+        log.info(f"Resolving + crafting headline for: {url}")
+        resolved_url, headline = resolve_craft_headline(url, item.get("text", ""))
+
+    # Use resolved URL if different from original
+    if resolved_url and resolved_url != url:
+        log.info(f"Resolved URL: {url} → {resolved_url}")
+        # Post-resolve DB dedup: catch duplicates via resolved canonical URL
+        if db.was_url_posted(resolved_url):
+            log.info(f"Resolved URL already handled (DB): {resolved_url}")
+            # The durable job still owns the original alias. Retire that URL
+            # too, or a terminal canonical decision repeats creative work.
+            db.save_posted(url=url, headline="[resolved duplicate]", story_hint="",
+                           source_channel=item.get("channel"))
+            return False
+        # Re-check the blocklist against the resolved canonical URL —
+        # a shortlink could redirect into a content farm we never saw.
+        if is_blocked_source(resolved_url):
+            log.info(f"Rejected blocked source after resolve: {resolved_url}")
+            db.save_posted(url=resolved_url, headline="[blocked source]",
+                           story_hint=hint, source_channel=item.get("channel"))
+            db.save_posted(url=url, headline="[blocked source]", story_hint="",
+                           source_channel=item.get("channel"))
+            return False
+        url = resolved_url
+        item["url"] = url
+
+    if not headline:
+        log.warning(f"No valid headline for {url} — skipping")
+        return False
+
+    # Source-language hints can miss translations. Compare the final headline
+    # with successful publications, then hold the lock through publication and
+    # persistence so parallel full-pass workers cannot both see an empty ledger.
+    with _news_publication_lock:
+        if db.was_url_posted(url):
+            return False
+        if jev.enabled("news"):
+            try:
+                duplicate = jev.NewsEvaluator().published_duplicate(
+                    sanitize_untrusted(headline, max_len=600),
+                    [sanitize_untrusted(h, max_len=600) for h in db.recent_published_headlines()])
+            except jev.JevError as exc:
+                log.warning("JEV publication dedup unavailable; holding candidate: %s", exc)
+                return False
+            if duplicate:
+                db.save_posted(url=url, headline="[self-duplicate]", story_hint=headline,
+                               source_channel=item.get("channel"))
+                log.info("JEV final-headline duplicate suppressed")
+                return False
+
+        # ── Post: LN first, then channel. Failures are isolated. ──
+        # The submit response carries the article's public canonical_url AND its
+        # skip-landing tracked redirect (format_news_data's url field) — submitted
+        # (pre-approval) and wire articles are already live on the site (specs
+        # 2026-08-04/08), so the channel message links Leviathan from birth.
+        art_id = None
+        ln_ok = False
+        wire_used = False
+        ln_url = None        # canonical article page → the ⚓ Discuss anchor
+        ln_story_url = None  # skip-landing redirect → the story link
+        if ln_eligible:
+            # Editorial submission (hot stories): main-feed eligible. Pre-attach
+            # an open market when one strongly fits (flag-gated; attach-or-skip;
+            # never blocks the post on a failure).
+            market_id = None
+            if ENABLE_MARKET_MATCH and preattach_markets:
+                market_id = _preattach_market_id(
+                    headline, item.get("tags") or [], item.get("source", ""),
+                    url, preattach_markets)
+            # submit_article is the one LNClient method with no internal try/except:
+            # transport errors, a 200 with a non-JSON body, and a failed re-auth all
+            # propagate. Scoped tightly so a failed LN leg can never take the
+            # channel leg down with it — the story still ships linkless below, and
+            # a save/vote failure after this block must still reach the gather.
+            try:
+                result = ln.submit_article(url, headline, market_id=market_id)
+                if result:
+                    art_id = result.get("article_id")
+                    ln_ok = True  # set after parsing — never claim an unverified submit
+                    # LN's own fields, but they cross a network boundary and land
+                    # in a public message — validate like every other externally
+                    # supplied URL. Invalid/missing → the post goes out with the
+                    # source link / linkless, never with garbage.
+                    news_obj = result.get("news") or {}
+                    ln_url = validate_url(news_obj.get("canonical_url"))
+                    ln_story_url = validate_url(news_obj.get("url"))
+                    if not art_id:
+                        log.critical(
+                            "article_id is None after submit — upvote and article "
+                            f"tracking will be broken. Response keys: {list(result.keys())}")
+            except Exception as e:
+                log.error(f"LN submit failed for {url}: {type(e).__name__}: {e}")
+        elif ENABLE_WIRE_SUBMISSIONS:
+            # Wire row (cold + demoted stories): instant origin='benthic' surface,
+            # never the main feed — so no market pre-attach and no self-upvote.
+            # Same failure isolation as the editorial leg: a wire failure costs
+            # only the LN links, the channel still carries the story.
+            try:
+                result = ln.submit_article(url, headline, wire=True)
+                if result:
+                    art_id = result.get("article_id")
+                    ln_ok = True
+                    wire_used = True
+                    news_obj = result.get("news") or {}
+                    ln_url = validate_url(news_obj.get("canonical_url"))
+                    ln_story_url = validate_url(news_obj.get("url"))
+            except Exception as e:
+                log.error(f"LN wire submit failed for {url}: {type(e).__name__}: {e}")
+
+        channel_sent, tg_msg_id = (False, None)
+        if ENABLE_CHANNEL_POSTS:
+            channel_sent, tg_msg_id = post_to_channel(headline, url, ln_url=ln_url,
+                                                      ln_story_url=ln_story_url)
+            if not channel_sent:
+                log.warning(f"Channel post failed for: {url}")
+
+        if not channel_sent and not ln_ok:
+            return False  # nothing landed — story stays retryable (no save)
+
+        destination = DEST_BOTH if (channel_sent and ln_ok) else (
+            DEST_LN if ln_ok else DEST_CHANNEL)
+        db.save_posted(url=url, headline=headline, story_hint=hint,
+                       ln_article_id=art_id, source_channel=item.get("channel"),
+                       destination=destination, tg_message_id=tg_msg_id,
+                       heat=heat or None)
+
+    # Upvote own EDITORIAL submission (boosts main-feed ranking). Wire rows
+    # never rank the main feed — a self-vote there is pure API noise.
+    if art_id and not wire_used:
+        ln.vote(art_id, weight=1, label="own article")
+        db.save_article_vote(art_id, 1)
+
+    return True
+
+
+async def news_post_pass(relevant: list[dict], db: "AgentDB", ln: "LNClient") -> int:
+    """Shared posting pass: hourly cycle Phase 3 and the news mini-pass.
+
+    Bot HQ context is fetched only when the pass has a hot candidate — cold
+    stories are gated by Benthic's own ledger, not by the LN ecosystem.
+    Returns the posted count.
+    """
+    if not relevant:
+        return 0
+    # Fetch Bot HQ recent headlines ONCE per pass. Feeding this list into the
+    # dup check is more reliable than asking a tool-using model to search
+    # Telegram itself — the latter skipped searches under load and let semantic
+    # duplicates through.
+    # 7-day window catches stories re-posted days later (the 6h cap missed
+    # these). Env override exists for tuning without redeploy. Fetch limit
+    # raised in step so the time window is the binding constraint, not the
+    # message count. `_env_int` falls back on parse failure so a malformed
+    # env value doesn't kill every cycle.
+    hq_dedup_hours = _env_int("HQ_DEDUP_HOURS", 168)
+    hq_fetch_limit = _env_int("HQ_DEDUP_FETCH_LIMIT", 300)
+    has_hot = any(item.get("heat", 0) >= LN_SUBMIT_MIN_HEAT for item in relevant)
+    hq_headlines: list[str] = []
+    hq_available = False
+    if has_hot:
+        # Retry before giving up — Bot HQ is the ground-truth dedup source for
+        # the LN leg, so a transient Telethon/timeout/parse error must not
+        # silently disable it.
+        hq_fetch = None
+        for _hq_attempt in range(3):
+            hq_fetch = await _blocking(fetch_bot_hq_recent_headlines,
+                                      limit=hq_fetch_limit, hours=hq_dedup_hours)
+            if hq_fetch is not None:
+                break
+            if _hq_attempt < 2:
+                await asyncio.sleep(2 * (2 ** _hq_attempt))  # 2s, 4s backoff
+        if hq_fetch is None:
+            # FAIL CLOSED, scoped to LN: without ground truth we can't dedup the
+            # LN ecosystem, so hot candidates are held (nothing posted, nothing
+            # saved) and stay retryable next pass. Cold candidates never
+            # depended on Bot HQ and go to the channel as usual.
+            log.warning("Bot HQ fetch FAILED after 3 attempts — HOLDING hot "
+                        "candidate(s) this pass; cold stories proceed to the channel")
+        else:
+            hq_available = True
+            hq_headlines = hq_fetch
+            log.info(f"Bot HQ dedup context: {len(hq_headlines)} recent headlines "
+                     f"(last {hq_dedup_hours}h)")
+    # Open-market candidates for the pre-attach (flag-gated). Only hot stories
+    # reach LN, so nothing to fetch when the pass has no eligible candidate.
+    preattach_markets = []
+    if ENABLE_MARKET_MATCH and has_hot and hq_available:
+        try:
+            preattach_markets = await _blocking(ln.get_open_markets)
+        except Exception as e:
+            log.warning(f"pre-attach: open-market fetch failed: {e}")
+    # Run all stories in parallel threads
+    results = await asyncio.gather(
+        *[_blocking(_process_article, item, db, ln, hq_headlines,
+                            hq_available, hq_dedup_hours, preattach_markets)
+          for item in relevant],
+        return_exceptions=True,
+    )
+    posted = sum(1 for r in results if r is True)
+    for e in (r for r in results if isinstance(r, Exception)):
+        log.error(f"Article processing error: {e}")
+    return posted
+
+
 async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
     """Vote + comment + yap-vote + reply-walk over a supplied article list.
 
@@ -2631,8 +3977,8 @@ async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
     # Split by type and batch-evaluate
     news_to_vote = [a for a in articles_to_vote if a["type"] == "article"]
     yaps_to_vote = [a for a in articles_to_vote if a["type"] == "yap"]
-    cached_article_votes = batch_evaluate_articles(news_to_vote) if news_to_vote else {}
-    cached_yap_votes = batch_evaluate_comments(
+    cached_article_votes = await _blocking(batch_evaluate_articles, news_to_vote) if news_to_vote else {}
+    cached_yap_votes = await _blocking(batch_evaluate_comments,
         [{"id": y["id"], "text": y["headline"], "headline": ""} for y in yaps_to_vote]
     ) if yaps_to_vote else {}
     log.info(f"Batch pre-evaluation: {len(cached_article_votes)} articles, "
@@ -2673,16 +4019,18 @@ async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
                     yap_vote = cached_yap_votes.get(article_id)
                     if yap_vote is None:
                         yap_text = article.get("headline") or article.get("text", "")
-                        yap_vote = evaluate_comment_quality(yap_text, "")
+                        yap_vote = await _blocking(evaluate_comment_quality, yap_text, "")
                 if yap_vote != 0:
-                    ln.vote(article_id, weight=yap_vote, label="yap")
+                    await _blocking(ln.vote, article_id, weight=yap_vote, label="yap")
                     db.save_yap_vote(article_id, 0, yap_vote, is_own=False)
                     voted += 1
                 await asyncio.sleep(1)
             continue
 
-        # It's a news article
-        if not db.was_article_voted(article_id):
+        # It's a news article. Retain the persisted or newly evaluated weight so
+        # comment eligibility cannot diverge from the article-vote decision.
+        vote_weight = db.get_article_vote(article_id)
+        if vote_weight is None:
             if is_blacklisted:
                 vote_weight = -1
             elif is_whitelisted:
@@ -2691,31 +4039,91 @@ async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
                 # Use batch result, fall back to individual call
                 vote_weight = cached_article_votes.get(article_id)
                 if vote_weight is None:
-                    vote_weight = evaluate_article_quality(headline, tags)
+                    vote_weight = await _blocking(evaluate_article_quality, headline, tags)
             if vote_weight != 0:
-                ln.vote(article_id, weight=vote_weight)
+                await _blocking(ln.vote, article_id, weight=vote_weight)
                 db.save_article_vote(article_id, vote_weight)
                 voted += 1
             await asyncio.sleep(1)
 
-        # Comment (check DB first, then LN API as fallback)
+        # Fetch once and reuse the same top-level yap snapshot for comment
+        # eligibility, yap voting, and reply detection. Malformed API data cannot
+        # establish that another user already joined the conversation.
+        raw_yaps = await _blocking(ln.get_yaps, article_id)
+        if isinstance(raw_yaps, list) and all(
+            isinstance(yap, dict) for yap in raw_yaps
+        ):
+            yaps = raw_yaps
+        elif isinstance(raw_yaps, list):
+            yaps = [yap for yap in raw_yaps if isinstance(yap, dict)]
+            log.warning(f"Ignored malformed yap entries on article {article_id}")
+        else:
+            yaps = []
+            log.warning(f"Ignored malformed yap list on article {article_id}")
+
+        own_yap_present = any(
+            (yap.get("author", {}) or {}).get("id") == ln.user_id
+            for yap in yaps
+        )
+        external_yap_present = any(
+            (yap.get("author", {}) or {}).get("id") not in (None, ln.user_id)
+            for yap in yaps
+        )
+        article_author_id = author.get("id")
+        is_own_article = (
+            db.was_article_posted_by_us(article_id)
+            or article_author_id == ln.user_id
+        )
+
+        # Unsolicited comments are sparse by construction: third-party article,
+        # positive vote, an existing third-party yap, useful creative output, and
+        # an atomic rolling-window reservation are all mandatory.
         if not db.was_commented(article_id):
-            if ln.has_our_comment(article_id):
+            if own_yap_present:
                 log.info(f"Already commented on {article_id} (found on LN)")
                 db.save_comment(article_id, "[existing]")
+            elif is_own_article:
+                log.info(f"Comment skipped on {article_id}: Benthic submission")
+            elif vote_weight <= 0:
+                log.info(f"Comment skipped on {article_id}: non-positive vote")
+            elif not external_yap_present:
+                log.info(f"Comment skipped on {article_id}: no third-party yap")
+            elif not db.has_unsolicited_comment_capacity(
+                ARTICLE_COMMENT_MAX_PER_24H
+            ):
+                log.info(f"Comment skipped on {article_id}: rolling cap reached")
             else:
                 article_url = article.get("url", "")
-                comment = craft_comment(headline, tags, article_url)
+                comment = await _blocking(craft_comment, headline, tags, article_url)
                 if comment and len(comment) > 20:
-                    ln.post_yap(article_id, comment, ["analysis"])
-                    db.save_comment(article_id, comment)
-                    commented += 1
+                    reserved = db.reserve_unsolicited_comment(
+                        article_id, ARTICLE_COMMENT_MAX_PER_24H
+                    )
+                    if reserved:
+                        try:
+                            posted = await _blocking(ln.post_yap, article_id, comment, ["analysis"])
+                        except Exception as exc:
+                            # The request may have reached LN before the transport
+                            # failed. Retaining the slot prevents a cap overrun.
+                            log.warning(
+                                f"Comment publication outcome ambiguous on "
+                                f"{article_id}: {type(exc).__name__}"
+                            )
+                        else:
+                            if posted:
+                                db.confirm_unsolicited_comment(article_id)
+                                db.save_comment(article_id, comment)
+                                commented += 1
+                            else:
+                                db.release_unsolicited_comment(article_id)
+                    else:
+                        log.info(
+                            f"Comment skipped on {article_id}: reservation race lost"
+                        )
             await asyncio.sleep(2)
 
-        # Fetch yaps once for both voting and reply detection.
         # Collect unvoted non-own non-blacklisted yaps for batch evaluation.
         try:
-            yaps = ln.get_yaps(article_id)
             # Immediate votes: own yaps and blacklisted authors (no LLM needed)
             yaps_to_batch = []
             for yap in yaps:
@@ -2725,17 +4133,17 @@ async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
                 author = yap.get("author", {}) or {}
                 is_ours = author.get("id") == ln.user_id
                 if is_ours:
-                    ln.vote(yap_id, weight=1, label="own yap")
+                    await _blocking(ln.vote, yap_id, weight=1, label="own yap")
                     db.save_yap_vote(yap_id, article_id, 1, is_own=True)
                     await asyncio.sleep(1)
                 else:
                     yap_author = (author.get("username") or author.get("display_name") or "").lower()
                     if yap_author in AUTO_DOWNVOTE_USERS:
-                        ln.vote(yap_id, weight=-1, label="yap")
+                        await _blocking(ln.vote, yap_id, weight=-1, label="yap")
                         db.save_yap_vote(yap_id, article_id, -1, is_own=False)
                         await asyncio.sleep(1)
                     elif yap_author in AUTO_UPVOTE_USERS:
-                        ln.vote(yap_id, weight=1, label="yap")
+                        await _blocking(ln.vote, yap_id, weight=1, label="yap")
                         db.save_yap_vote(yap_id, article_id, 1, is_own=False)
                         await asyncio.sleep(1)
                     else:
@@ -2747,14 +4155,14 @@ async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
                         })
             # Batch-evaluate collected yaps in one call instead of N
             if yaps_to_batch:
-                batch_yap_votes = batch_evaluate_comments(yaps_to_batch)
+                batch_yap_votes = await _blocking(batch_evaluate_comments, yaps_to_batch)
                 for yb in yaps_to_batch:
                     yap_vote = batch_yap_votes.get(yb["id"])
                     if yap_vote is None:
                         # Fallback to individual call if batch missed it
-                        yap_vote = evaluate_comment_quality(yb["text"], headline)
+                        yap_vote = await _blocking(evaluate_comment_quality, yb["text"], headline)
                     if yap_vote != 0:
-                        ln.vote(yb["id"], weight=yap_vote, label="yap")
+                        await _blocking(ln.vote, yb["id"], weight=yap_vote, label="yap")
                         db.save_yap_vote(yb["id"], yb["article_id"], yap_vote, is_own=False)
                     await asyncio.sleep(1)
         except Exception as e:
@@ -2770,7 +4178,7 @@ async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
                     our_yap_ids.add(yap["id"])
                     our_yap_texts[yap["id"]] = yap.get("text", "")
 
-            walk_replies_and_respond(yaps, our_yap_ids, our_yap_texts,
+            await _blocking(walk_replies_and_respond, yaps, our_yap_ids, our_yap_texts,
                                     headline, article_id, db, ln)
             await asyncio.sleep(2)
         except Exception as e:
@@ -2782,23 +4190,77 @@ async def vote_comment_pass(ln, db, articles: list, since) -> tuple:
     return voted, commented, phase4_processed
 
 
-async def run_agent():
+async def check_article_replies(ln, db, articles, skip_ids=frozenset()) -> int:
+    """Check only our existing threads, sharing durable reply dedup with engagement."""
+    reply_candidates = 0
+    for article in articles:
+        article_id = article["id"]
+        headline = article.get("headline", "")
+
+        # Skip articles already processed in Phase 4 (avoids redundant API calls)
+        if article_id in skip_ids:
+            continue
+
+        # Only check articles we've actually commented on
+        if not db.was_commented(article_id):
+            continue
+        reply_candidates += 1
+
+        try:
+            yaps = await _blocking(ln.get_yaps, article_id)
+            if not yaps:
+                continue
+
+            # Collect our comments
+            our_yap_ids = set()
+            our_yap_texts = {}
+            for yap in yaps:
+                author = yap.get("author", {}) or {}
+                if author.get("id") == ln.user_id:
+                    our_yap_ids.add(yap["id"])
+                    our_yap_texts[yap["id"]] = yap.get("text", "")
+
+            # Skip if we have no comments (shouldn't happen but guard)
+            if not our_yap_ids:
+                continue
+
+            await _blocking(walk_replies_and_respond, yaps, our_yap_ids, our_yap_texts,
+                                    headline, article_id, db, ln)
+            await asyncio.sleep(1)
+        except Exception as e:
+            log.warning(f"Reply check failed on {article_id}: {e}")
+
+    return reply_candidates
+
+
+async def run_agent(client):
+    """Cursor catch-up in Jev mode; the full legacy cycle otherwise.
+
+    The client is owned by run_loop (see _build_client): this function must
+    neither construct nor disconnect it, or every cycle would tear down the
+    registered NewMessage push handlers along with it.
+    """
     # Reset transient failure counts on every provider at cycle start so a
     # previous cycle's hiccup doesn't keep a provider sidelined indefinitely.
     # (Quota cooldowns are preserved — those represent real lockouts.)
-    _provider_chain.reset_failures()
+    if not JEV_REALTIME:
+        _provider_chain.reset_failures()
 
-    # Load credentials at runtime so errors get logged
-    api_id, api_hash, wallet_key = load_credentials()
+    # Catch-up uses the connected Telegram client and needs no LN credentials.
+    if not JEV_REALTIME:
+        _, _, wallet_key = load_credentials()
 
     db = AgentDB()
-    client = None
     now = datetime.now(timezone.utc)
     run_id = db.start_run()
     try:
-        pruned = db.prune_ws_events(days=7)
-        if pruned:
-            log.info(f"Pruned {pruned} old ws_events rows")
+        if not JEV_REALTIME:
+            pruned = db.prune_ws_events(days=7)
+            if pruned:
+                log.info(f"Pruned {pruned} old ws_events rows")
+            pruned_src = db.prune_pending_source_messages(days=7)
+            if pruned_src:
+                log.info(f"Pruned {pruned_src} old pending_source_messages rows")
     except Exception:
         pass  # table create races / legacy DBs must not kill the cycle
     all_messages = []
@@ -2814,13 +4276,10 @@ async def run_agent():
         ).fetchone()
         since = datetime.fromisoformat(row["started_at"]) if row else now - timedelta(hours=INITIAL_LOOKBACK_HOURS)
 
-        log.info(f"=== Agent run at {now.isoformat()} | lookback: {since.isoformat()} ===")
+        name = "Source catch-up" if JEV_REALTIME else "Agent run"
+        log.info(f"=== {name} at {now.isoformat()} | lookback: {since.isoformat()} ===")
 
         # ─── Phase 1: Read Telegram channels ─────────────────────────────────
-
-        client = TelegramClient(TELEGRAM_SESSION, api_id, api_hash)
-        await asyncio.wait_for(client.start(), timeout=CONNECT_TIMEOUT)
-        log.info("Telegram connected")
 
         # One-time migration: detect group vs channel for all cached entries
         # Uses numeric IDs (no flood wait risk). Runs once — after all channels
@@ -2868,276 +4327,70 @@ async def run_agent():
             if msgs:
                 log.info(f"  {channel}: {len(msgs)} new")
                 all_messages.extend(msgs)
+                _queue_backfill(msgs, db)
                 db.set_cursor(channel, max(m["id"] for m in msgs))
             await asyncio.sleep(0.5)
 
-        # Private channels
+        # ID-keyed sources (private channels/groups) — same cursor semantics
+        # as the public loop, with ID_SOURCES labels as channel keys.
         try:
-            async for dialog in client.iter_dialogs():
-                if dialog.name in PRIVATE_CHANNELS:
-                    last_id = db.get_cursor(dialog.name)
-                    is_group = getattr(dialog.entity, "megagroup", False)
-                    msgs = await fetch_channel_messages(client, dialog.entity, min_id=last_id, limit=50, since=since, is_group=is_group)
-                    if msgs:
-                        for m in msgs:
-                            m["channel"] = dialog.name
-                        all_messages.extend(msgs)
-                        db.set_cursor(dialog.name, max(m["id"] for m in msgs))
+            all_messages.extend(await read_id_sources(client, db, since))
         except Exception as e:
-            log.warning(f"Private channel scan failed: {e}")
+            log.warning(f"ID-source scan failed: {e}")
 
         active = len(set(m["channel"] for m in all_messages))
         group_msgs = sum(1 for m in all_messages if m.get("is_group", False))
         log.info(f"Scanned {len(CHANNELS)} channels, {active} had new messages, "
                  f"{len(all_messages)} total ({group_msgs} from groups)")
 
+        if JEV_REALTIME:
+            # Catch-up only inserts durable source jobs. Engagement, replies,
+            # and maintenance have their own clocks, even on quiet news days.
+            log.info("NEWS source catch-up complete: messages=%d", len(all_messages))
+            return
+
+        # This early return stays keyed on the RAW read. "The channels were
+        # silent" is the only condition that may skip Phases 4-6 (vote/comment,
+        # reply detection, market match) — an hour whose messages were merely
+        # already evaluated by a push mini-pass still has engagement work to do.
         if not all_messages:
             log.info("Nothing new — exiting")
             return  # finally block handles cleanup
 
+        # The push path never advances cursors, so this read overlaps whatever
+        # a news mini-pass already evaluated. Filtered into a SEPARATE name so
+        # only the evaluation is skipped, never the rest of the cycle.
+        fresh_messages = _drop_already_evaluated(all_messages, db)
+
         # ─── Phase 2: Evaluate + story-level dedup via primary LLM ───────────
 
-        relevant = evaluate_and_deduplicate(all_messages, db)
+        relevant = ([] if JEV_REALTIME else
+                    await _blocking(evaluate_and_deduplicate, fresh_messages, db))
 
-        # ─── Phase 3: Check Bot HQ + LN for duplicates, then post via API ───
+        # ─── Phase 3: destination-scoped posting pass (shared with the
+        # news mini-pass) — see news_post_pass ───────────────────────────
 
         ln = LNClient(wallet_key)
-        ln.authenticate()
+        await _blocking(ln.authenticate)
 
-        # Fetch Bot HQ recent headlines ONCE per cycle. Feeding this list into the
-        # dup check (below) is more reliable than asking Sonnet-with-tools to search
-        # Telegram itself — the latter skipped searches under load and let semantic
-        # duplicates through.
-        # 7-day window catches stories re-posted days later (the 6h cap missed
-        # these). Env override exists for tuning without redeploy. Fetch limit
-        # raised in step so the time window is the binding constraint, not the
-        # message count. `_env_int` falls back on parse failure so a malformed
-        # env value doesn't kill every cycle.
-        hq_dedup_hours = _env_int("HQ_DEDUP_HOURS", 168)
-        hq_fetch_limit = _env_int("HQ_DEDUP_FETCH_LIMIT", 300)
-        # Retry before giving up — Bot HQ is the ground-truth dedup source, so a
-        # transient Telethon/timeout/parse error must not silently disable it.
-        hq_fetch = None
-        for _hq_attempt in range(3):
-            hq_fetch = fetch_bot_hq_recent_headlines(limit=hq_fetch_limit, hours=hq_dedup_hours)
-            if hq_fetch is not None:
-                break
-            if _hq_attempt < 2:
-                await asyncio.sleep(2 * (2 ** _hq_attempt))  # 2s, 4s backoff
-        hq_fetch_failed = hq_fetch is None
-        if hq_fetch_failed:
-            # FAIL CLOSED: without ground truth we can't dedup, so HOLD all posting
-            # this cycle rather than risk duplicates (the LLM dup-check also fails
-            # closed). Candidates are re-evaluated next cycle once Bot HQ is reachable.
-            # Previously this failed OPEN (empty list -> every candidate posted) — PR #1 finding.
-            hq_recent_headlines: list[str] = []
-            log.warning(f"Bot HQ fetch FAILED after 3 attempts — HOLDING all posts this cycle "
-                        f"to avoid duplicates (last {hq_dedup_hours}h window)")
-        else:
-            hq_recent_headlines = hq_fetch
-            log.info(f"Bot HQ dedup context: {len(hq_recent_headlines)} recent headlines "
-                     f"(last {hq_dedup_hours}h)")
-
-        # Process articles in parallel — each runs in its own thread
-        def process_article_sync(item):
-            """Full pipeline for one article (blocking). Runs in a thread for parallelism."""
-            url = item["url"]
-            hint = item.get("headline_hint", "")
-
-            # Check DB for duplicate URL with ORIGINAL URL first (cheap, no LLM)
-            if db.was_url_posted(url):
-                log.info(f"Already posted by us (DB): {url}")
-                return False
-
-            # Source-trust gate: reject content farms / SEO aggregators before
-            # spending any LLM tokens. The eval prompt should already filter
-            # these but the model occasionally lets one through (the zine.live
-            # Wilder-World incident on 2026-05-17 was the trigger for this).
-            if is_blocked_source(url):
-                log.info(f"Rejected blocked source: {url}")
-                db.save_posted(url=url, headline="[blocked source]", story_hint=hint,
-                               source_channel=item.get("channel"))
-                return False
-
-            # Self-dedup: check if we already posted the same story from a different source.
-            # Uses word overlap on story_hint AND headline against last 24h of our posts.
-            # Catches "Bhutan Bitcoin" from DL News when we already posted it from Coindesk.
-            if hint and db.was_story_posted(hint):
-                db.save_posted(url=url, headline="[self-duplicate]", story_hint=hint,
-                               source_channel=item.get("channel"))
-                return False
-
-            # Provenance dedup (stage 1, zero tokens) — LN's own /provenance/check.
-            # duplicate / recently-known -> reject here; new / stale / old-known ->
-            # proceed and SKIP the classify-tier HQ prompt below. "fallback" (API error,
-            # kill-switch off, unexpected body) -> the classify-tier HQ path runs unchanged.
-            prov = _provenance_dedup_check(url, hint, recent_hours=hq_dedup_hours)
-            if prov == "reject":
-                log.info(f"Provenance dup check rejected: {hint or url}")
-                db.save_posted(url=url, headline="[duplicate: provenance]", story_hint=hint,
-                               source_channel=item.get("channel"))
-                return False
-
-            # Bot HQ dup check (fallback path) — the classify tier judges the candidate
-            # against recent HQ headlines fetched up front. Only runs when the
-            # provenance API was inconclusive. Headlines and hint are wrapped with
-            # sanitize_untrusted for injection defense.
-            safe_hint = sanitize_untrusted(hint, max_len=200) if hint else ""
-            if prov == "proceed":
-                log.info(f"Provenance cleared candidate — skipping HQ LLM dup check: {url}")
-            elif not hq_recent_headlines:
-                log.warning(f"Bot HQ dedup context empty — proceeding without HQ check: {url}")
-            elif not safe_hint:
-                # Upstream evaluator didn't produce a headline_hint. HQ dedup relies on
-                # having a topic to match — log so the failure is visible and proceed.
-                log.warning(f"No headline_hint on candidate — skipping HQ dup check: {url}")
-            else:
-                hq_formatted = "\n".join(
-                    f"{i+1}. {sanitize_untrusted(h, max_len=300)}"
-                    for i, h in enumerate(hq_recent_headlines)
-                )
-                safe_url = sanitize_untrusted(url, max_len=500)
-                dup_prompt = load_prompt("agent/duplicate_check",
-                    candidate_hint=safe_hint, url=safe_url,
-                    hq_headlines=hq_formatted, hours=hq_dedup_hours)
-                dup_result = llm_ask(
-                    dup_prompt,
-                    timeout=120, tier="classification",
-                    skip_soul=True, tools="",
-                )
-                if check_output_for_injection(dup_result, context="bot_hq_dup_check"):
-                    log.warning(f"Injection detected in dup check response — rejecting article")
-                    return False
-                # Fail closed: empty/garbage response → treat as duplicate (reject).
-                # Only "not_duplicate" explicitly allows the article through.
-                dup_lower = dup_result.strip().lower() if dup_result and dup_result.strip() else "duplicate"
-                if "not_duplicate" not in dup_lower:
-                    log.info(f"Bot HQ dup check rejected: {hint}")
-                    db.save_posted(url=url, headline="[duplicate in HQ]", story_hint=hint,
-                                   source_channel=item.get("channel"))
-                    return False
-
-            # Freshness check (runs against original URL — WebFetch follows redirects
-            # so shortlinks/aggregators still resolve to the actual article for date checking)
-            if not check_article_freshness(url, item.get("text", "")):
-                log.info(f"Rejected stale article (not from today): {url}")
-                return False
-
-            # Resolve primary source + craft headline + TL;DR in ONE Opus call.
-            # The model WebFetches the article, searches Twitter, resolves the canonical
-            # URL, writes headline, and generates TL;DR — all in the same context.
-            # Saves 2 full Opus calls per article vs. doing them separately.
-            # NOTE: Bot HQ dup check already ran against the original URL above. It uses
-            # topic/entity-based search (not just URL matching), so it catches semantic
-            # duplicates regardless of which URL variant was used. The post-resolve DB
-            # check below catches any remaining exact-URL duplicates.
-            log.info(f"Resolving + crafting headline for: {url}")
-            resolved_url, headline, tldr = resolve_craft_headline_tldr(url, item.get("text", ""))
-
-            # Use resolved URL if different from original
-            if resolved_url and resolved_url != url:
-                log.info(f"Resolved URL: {url} → {resolved_url}")
-                # Post-resolve DB dedup: catch duplicates via resolved canonical URL
-                if db.was_url_posted(resolved_url):
-                    log.info(f"Already posted by us (resolved URL in DB): {resolved_url}")
-                    return False
-                # Re-check the blocklist against the resolved canonical URL —
-                # a shortlink could redirect into a content farm we never saw.
-                if is_blocked_source(resolved_url):
-                    log.info(f"Rejected blocked source after resolve: {resolved_url}")
-                    db.save_posted(url=resolved_url, headline="[blocked source]",
-                                   story_hint=hint, source_channel=item.get("channel"))
-                    return False
-                url = resolved_url
-                item["url"] = url
-
-            if not headline:
-                log.warning(f"No valid headline for {url} — skipping")
-                return False
-
-            # Submit via LN API. Pre-attach an open market when one strongly fits
-            # (flag-gated; attach-or-skip; never blocks the post on a failure).
-            from_tsunami = item.get("channel") == "@LeviathanTsunami"
-            market_id = None
-            if ENABLE_MARKET_MATCH and preattach_markets:
-                market_id = _preattach_market_id(
-                    headline, item.get("tags") or [], item.get("source", ""),
-                    url, preattach_markets)
-            result = ln.submit_article(url, headline, market_id=market_id)
-            if not result:
-                return False
-
-            art_id = result.get("article_id")
-            if not art_id:
-                log.critical(f"article_id is None after submit — upvote, TL;DR, and "
-                             f"comment tracking will be broken. Response keys: {list(result.keys())}")
-            db.save_posted(url=url, headline=headline, story_hint=hint,
-                           ln_article_id=art_id, source_channel=item.get("channel"))
-
-            # Upvote own submission
-            if art_id:
-                ln.vote(art_id, weight=1, label="own article")
-                db.save_article_vote(art_id, 1)
-
-            # Tsunami promotion note
-            if from_tsunami and art_id:
-                ln.post_yap(art_id,
-                    "Promoting from Tsunami auto-feed. Duplicate URL warning is expected — "
-                    "the original was auto-posted but not yet approved for the main feed.",
-                    tags=["tldr"])
-                db.save_comment(art_id, "[tsunami promotion note]")
-
-            # TL;DR comment on own post (already generated in the headline call)
-            if art_id and not from_tsunami and tldr:
-                ln.post_yap(art_id, tldr, tags=["tldr"])
-                db.save_comment(art_id, tldr)
-                log.info(f"Added TL;DR to own article {art_id}")
-
-            return True
-
-        # Fetch open-market candidates once, for Phase 3 pre-attach (flag-gated).
-        # Bind to [] at minimum BEFORE the gather, so the closure in
-        # process_article_sync always resolves preattach_markets.
-        preattach_markets = []
-        if ENABLE_MARKET_MATCH and relevant:
-            try:
-                preattach_markets = ln.get_open_markets()
-            except Exception as e:
-                log.warning(f"pre-attach: open-market fetch failed: {e}")
-
-        # Run all articles in parallel threads
-        if relevant and not hq_fetch_failed:
-            results = await asyncio.gather(
-                *[asyncio.to_thread(process_article_sync, item) for item in relevant],
-                return_exceptions=True,
-            )
-            posted_count = sum(1 for r in results if r is True)
-            errors = [r for r in results if isinstance(r, Exception)]
-            if errors:
-                for e in errors:
-                    log.error(f"Article processing error: {e}")
-        elif hq_fetch_failed:
-            # Fail closed (see Bot HQ fetch above): hold posting when the dedup
-            # ground truth is unavailable, rather than risk duplicate posts.
-            posted_count = 0
-            log.warning(f"HELD posting of {len(relevant)} candidate(s) — Bot HQ dedup unavailable this cycle")
-        else:
-            posted_count = 0
+        posted_count = 0 if JEV_REALTIME else await news_post_pass(relevant, db, ln)
         log.info(f"Posted {posted_count} articles")
 
         # ─── Phase 4: Vote + comment on recent articles ──────────────────────
 
         # Force fresh session before Phase 4 — use lock to avoid TOCTOU race
-        with ln._lock:
-            ln._auth_time = 0
-            ln._refresh_if_stale()
+        def refresh_auth():
+            with ln._lock:
+                ln._auth_time = 0
+                ln._refresh_if_stale()
+        await _blocking(refresh_auth)
         log.info("Evaluating recent articles for voting and commenting...")
         voted = 0
         commented = 0
         phase4_processed = set()  # Track articles whose replies were already checked
 
         try:
-            articles = ln.get_recent_articles(per_page=20)
+            articles = await _blocking(ln.get_recent_articles, per_page=20)
             voted, commented, phase4_processed = await vote_comment_pass(
                 ln, db, articles, since)
             log.info(f"Voted on {voted}, commented on {commented} articles")
@@ -3157,45 +4410,9 @@ async def run_agent():
         # to our comments, regardless of when the article was posted.
         # Skips articles already processed in Phase 4 to avoid redundant API calls.
         try:
-            reply_articles = ln.get_recent_articles(per_page=20)
-            reply_candidates = 0
-            for article in reply_articles:
-                article_id = article["id"]
-                headline = article.get("headline", "")
-
-                # Skip articles already processed in Phase 4 (avoids redundant API calls)
-                if article_id in phase4_processed:
-                    continue
-
-                # Only check articles we've actually commented on
-                if not db.was_commented(article_id):
-                    continue
-                reply_candidates += 1
-
-                try:
-                    yaps = ln.get_yaps(article_id)
-                    if not yaps:
-                        continue
-
-                    # Collect our comments
-                    our_yap_ids = set()
-                    our_yap_texts = {}
-                    for yap in yaps:
-                        author = yap.get("author", {}) or {}
-                        if author.get("id") == ln.user_id:
-                            our_yap_ids.add(yap["id"])
-                            our_yap_texts[yap["id"]] = yap.get("text", "")
-
-                    # Skip if we have no comments (shouldn't happen but guard)
-                    if not our_yap_ids:
-                        continue
-
-                    walk_replies_and_respond(yaps, our_yap_ids, our_yap_texts,
-                                            headline, article_id, db, ln)
-                    await asyncio.sleep(1)
-                except Exception as e:
-                    log.warning(f"Reply check failed on {article_id}: {e}")
-
+            reply_articles = await _blocking(ln.get_recent_articles, per_page=20)
+            reply_candidates = await check_article_replies(
+                ln, db, reply_articles, phase4_processed)
             if reply_candidates:
                 log.info(f"Phase 5: checked {reply_candidates} articles for unreplied comments")
         except Exception as e:
@@ -3206,7 +4423,7 @@ async def run_agent():
         # approved article. Isolated, so a failure never wedges the cycle.
         if ENABLE_MARKET_MATCH:
             try:
-                run_market_match_phase(ln, db)
+                await _blocking(run_market_match_phase, ln, db)
             except Exception as e:
                 log.error(f"Market match phase failed: {e}", exc_info=True)
 
@@ -3223,38 +4440,201 @@ async def run_agent():
         except Exception:
             pass
         db.close()
-        if client:
-            try:
-                await asyncio.wait_for(client.disconnect(), timeout=10)
-            except Exception:
-                pass
+        # The shared client is NOT disconnected here — run_loop owns its
+        # lifetime, and a cycle-scoped teardown would drop the push handlers.
+        # Keeping this block await-free also means a deadline cancellation
+        # unwinds promptly instead of waiting on a dying transport.
     log.info(f"=== Done. Posted: {posted_count} | Voted: {voted} | Commented: {commented} ===\n")
 
 
 CYCLE_INTERVAL = 60 * 60  # 1 hour between cycles
+ENGAGEMENT_RECONCILE_INTERVAL = max(60, _env_int("ENGAGEMENT_RECONCILE_INTERVAL", 3600))
+REPLY_CHECK_INTERVAL = max(60, _env_int("REPLY_CHECK_INTERVAL", 600))
+MAINTENANCE_INTERVAL = 24 * 60 * 60
 # 45 min: busy news days were hitting the old 1800s deadline back-to-back
 # (2026-07-02), aborting cycles before Phases 5/6 ran. Still well under the
 # 3600s cycle interval so a hung cycle can never overlap the next one.
 CYCLE_DEADLINE = _env_int("CYCLE_DEADLINE_SECONDS", 2700)
 CONNECT_TIMEOUT = _env_int("CONNECT_TIMEOUT_SECONDS", 60)
+CONNECT_RETRY_INTERVAL = 60
+CLIENT_SHUTDOWN_TIMEOUT = 10
 
 
-async def _run_guarded_cycle():
+class ClientShutdownError(RuntimeError):
+    """Telethon client cleanup did not finish safely before replacement."""
+
+
+async def _run_guarded_cycle(client) -> bool:
     """Run one agent cycle bounded by CYCLE_DEADLINE.
 
-    A hung await, such as a stalled Telegram connect, raises TimeoutError instead
+    A hung await, such as a stalled Telegram read, raises TimeoutError instead
     of freezing the process forever, so the loop self-recovers without relying
     on PM2 to restart a still-online process.
+
+    Returns True on deadline timeout — the wedged-connection signature — so
+    run_loop can rebuild the shared client instead of trusting a possibly
+    dead transport to keep delivering push events.
     """
     try:
-        await asyncio.wait_for(run_agent(), timeout=CYCLE_DEADLINE)
+        await asyncio.wait_for(run_agent(client), timeout=CYCLE_DEADLINE)
     except asyncio.TimeoutError:
-        log.error(f"Agent cycle exceeded {CYCLE_DEADLINE}s deadline — aborted (likely a hung Telegram/network await). Recovering.")
+        log.error(f"Agent cycle exceeded {CYCLE_DEADLINE}s deadline — aborted "
+                  f"(likely a hung Telegram/network await). Rebuilding client.")
+        return True
     except Exception as e:
         log.error(f"Agent cycle failed: {e}", exc_info=True)
+    return False
 
 
-_last_pass_ts = 0.0  # last full cycle OR mini-pass completion (rate-limit anchor)
+async def _build_client() -> TelegramClient:
+    """Create and start the process-lifetime Telethon client (bounded).
+
+    SINGLE-LOOP INVARIANT: this client, the NewMessage handlers registered on
+    it, and run_loop's _news_wake/_ws_wake waiters must all live on the ONE
+    event loop created by `asyncio.run(run_loop())`. asyncio.Event is not
+    thread-safe and is bound to the loop that awaits it, and Telethon's update
+    dispatch runs on the loop that started the client — so a second loop or a
+    Telethon-owning worker thread would silently stop waking the scheduler.
+    Never start this client from anywhere but run_loop.
+    """
+    api_id, api_hash, _ = load_credentials()
+    client = TelegramClient(TELEGRAM_SESSION, api_id, api_hash)
+    try:
+        await asyncio.wait_for(client.start(), timeout=CONNECT_TIMEOUT)
+    except BaseException:
+        # A timed-out or failed start() still leaves a half-open transport and
+        # Telethon's background tasks behind. Drop it before propagating, or
+        # every retry (and every cancellation) leaks another connection.
+        # BaseException on purpose: a cancelled build must clean up too.
+        await _close_client(client)
+        raise
+    log.info("Telegram connected")
+    return client
+
+
+async def _connect_and_register(
+    push_db,
+) -> "tuple[TelegramClient | None, asyncio.Task | None]":
+    """Build the shared client and attach push handlers.
+
+    Returns ``(client, disconnect_watch)`` or ``(None, None)``. Watcher
+    ownership starts before registration so any failure in that window can
+    sequence terminal sender cleanup before client-level disconnect.
+
+    Registration is bounded (PUSH_REGISTER_TIMEOUT) but NOT fatal: a timeout
+    cancels register_source_handlers before it reaches add_event_handler, so
+    the partial map is discarded and this client runs poll-only for its whole
+    lifetime — never half-registered, and never registered twice. Whatever it
+    did resolve is cached in channel_ids, so the next client build is warm.
+    """
+    client = None
+    disconnect_watch = None
+    try:
+        client = await _build_client()
+        disconnect_watch = asyncio.create_task(
+            _wait_for_client_disconnect(client))
+        if ENABLE_SOURCE_PUSH:
+            try:
+                n = await asyncio.wait_for(
+                    register_source_handlers(client, push_db),
+                    timeout=PUSH_REGISTER_TIMEOUT)
+                log.info(f"PUSH: NewMessage handler covering {n} channels")
+            except asyncio.TimeoutError:
+                log.error(
+                    f"PUSH: registration exceeded {PUSH_REGISTER_TIMEOUT}s "
+                    f"(likely a Telegram flood wait on a cold channel cache) — "
+                    f"no push handler for this client; hourly polling continues "
+                    f"and resolutions completed so far are cached.")
+        if not client.is_connected() or disconnect_watch.done():
+            log.error("Telegram client became terminal during connection or "
+                      "push registration; treating this as a failed attempt.")
+            retiring_client, client = client, None
+            retiring_watch, disconnect_watch = disconnect_watch, None
+            await _close_client(retiring_client, retiring_watch)
+            return None, None
+        return client, disconnect_watch
+    except asyncio.CancelledError:
+        # start() already succeeded but ownership has not reached run_loop.
+        # Clean up here or cancellation during registration leaks the session.
+        if client is not None:
+            await _close_client(client, disconnect_watch)
+        raise
+    except ClientShutdownError:
+        # Rebuilding while Telethon's shielded cleanup may still be active can
+        # race the same session file. Escape run_loop and let PM2 restart.
+        if client is not None:
+            await _close_client(client, disconnect_watch)
+        raise
+    except Exception as e:
+        log.error(f"Telegram connect failed: {e}")
+        # A client that started but failed afterwards is already holding a live
+        # Telegram connection — tear it down, or every retry leaks a session.
+        if client is not None:
+            await _close_client(client, disconnect_watch)
+        return None, None
+
+
+async def _wait_for_client_disconnect(client) -> "Exception | None":
+    """Wait for Telethon to exhaust reconnects and consume its result.
+
+    ``client.disconnected`` remains pending during automatic reconnects. It
+    completes only after a terminal disconnect (or an explicit close), and may
+    carry the transport error that ended the connection. Returning that error
+    prevents an unhandled-future warning in the scheduler.
+    """
+    try:
+        await client.disconnected
+    except Exception as exc:
+        return exc
+    return None
+
+
+async def _close_client(client, disconnect_watch=None) -> None:
+    """Finish client shutdown and retire its terminal-disconnect watcher.
+
+    Telethon shields its internal disconnect task. A timeout cancels only that
+    shield, not the real cleanup, so callers must fail-stop instead of starting
+    another client against the same session while cleanup may still be active.
+    """
+    try:
+        # MTProtoSender flips is_connected() false before its terminal cleanup
+        # completes. Wait for client.disconnected in that narrow state so the
+        # client-level disconnect does not invoke a second sender cleanup.
+        if (disconnect_watch is not None
+                and not disconnect_watch.done()
+                and not client.is_connected()):
+            await asyncio.wait_for(
+                asyncio.shield(disconnect_watch),
+                timeout=CLIENT_SHUTDOWN_TIMEOUT)
+        await asyncio.wait_for(
+            client.disconnect(), timeout=CLIENT_SHUTDOWN_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        raise ClientShutdownError(
+            f"Telethon shutdown exceeded {CLIENT_SHUTDOWN_TIMEOUT}s; "
+            "refusing overlapping client replacement"
+        ) from exc
+    except Exception as exc:
+        raise ClientShutdownError(
+            "Telethon shutdown failed; refusing overlapping client replacement"
+        ) from exc
+    finally:
+        if disconnect_watch is not None:
+            if not disconnect_watch.done():
+                disconnect_watch.cancel()
+            await asyncio.gather(disconnect_watch, return_exceptions=True)
+
+
+async def _close_and_rebuild_client(client, disconnect_watch, push_db):
+    """Fully retire one client before constructing its replacement."""
+    await _close_client(client, disconnect_watch)
+    return await _connect_and_register(push_db)
+
+
+# Independent rate anchors — a vote mini-pass must never starve a news pass (and
+# vice versa). Each guarded pass stamps its own anchor at start, and the
+# between-cycle scheduler rate-limits each pass against that anchor alone.
+_last_vote_pass_ts = 0.0  # last full cycle OR vote mini-pass (rate anchor)
+_last_news_pass_ts = 0.0  # last full cycle OR news mini-pass (rate anchor)
 
 
 async def run_mini_pass() -> None:
@@ -3275,8 +4655,8 @@ async def run_mini_pass() -> None:
         db.mark_ws_events_consumed("agent", [e["id"] for e in events])
         _, _, wallet_key = load_credentials()
         ln = LNClient(wallet_key)
-        ln.authenticate()
-        articles = ln.get_recent_articles(per_page=20)
+        await _blocking(ln.authenticate)
+        articles = await _blocking(ln.get_recent_articles, per_page=20)
         queued_ids = {e["news_id"] for e in events}
         targets = [a for a in articles if a.get("id") in queued_ids]
         targets = targets[:MINI_PASS_MAX_ARTICLES]
@@ -3290,8 +4670,8 @@ async def run_mini_pass() -> None:
 
 async def _run_guarded_mini_pass() -> None:
     """Deadline-bounded mini-pass; failures never propagate to run_loop."""
-    global _last_pass_ts
-    _last_pass_ts = time.time()
+    global _last_vote_pass_ts
+    _last_vote_pass_ts = time.time()
     try:
         await asyncio.wait_for(run_mini_pass(), timeout=MINI_PASS_DEADLINE)
     except asyncio.TimeoutError:
@@ -3300,44 +4680,375 @@ async def _run_guarded_mini_pass() -> None:
         log.error(f"Mini-pass failed: {e}", exc_info=True)
 
 
-async def run_loop():
-    """Continuous loop: full cycle every CYCLE_INTERVAL, with WS-triggered
-    mini-passes in between. The WS listener runs as a background task OUTSIDE
-    the cycle watchdog so a hung cycle never kills the stream."""
-    global _last_pass_ts
-    listener = None
-    if ENABLE_WS_EVENTS:
-        listener = asyncio.create_task(_ws_listener_supervisor())
-        log.info("WS: listener task started")
+async def run_news_pass() -> None:
+    """Between-cycle posting pass over push-queued source messages.
+
+    Drains at most NEWS_PASS_MAX_MESSAGES rows (consume-on-drain, BEFORE any
+    LLM work — a deadline abort must not re-drain), drops messages the cycle
+    already evaluated, then runs the same evaluate → news_post_pass pipeline
+    as Phase 2+3. The hourly cycle backfills anything not yet evaluated; a
+    story evaluated here but lost before posting (deadline abort, LN auth
+    failure) is NOT reconsidered — same semantics as a cycle abort between
+    eval and post.
+    """
+    db = AgentDB()
     try:
+        rows = db.get_pending_source_messages(limit=NEWS_PASS_MAX_MESSAGES)
+        if not rows:
+            return
+        db.mark_pending_source_consumed([r["id"] for r in rows])
+        messages = []
+        for r in rows:
+            # Symmetric with the hourly read filter: a row the cycle already
+            # evaluated stays consumed and is never re-evaluated here.
+            if db.was_evaluated(r["channel"], r["msg_id"]):
+                continue
+            # Queue rows may carry url=NULL (validate_url rejected it, or the
+            # text has only a bare domain) — the evaluator re-extracts the URL,
+            # so never depend on r["url"] here.
+            messages.append({
+                "channel": r["channel"], "id": r["msg_id"], "text": r["text"],
+                "date": r["msg_date"],
+                "is_group": db.get_channel_type(r["channel"]) == "group",
+            })
+        if not messages:
+            return
+        # Reused wholesale: evaluate_and_deduplicate pre-filters, sanitizes the
+        # untrusted text at prompt-build time, and parses heat. Never hand-build
+        # a prompt from raw queue text.
+        #
+        # Off the event loop: the provider call is blocking and can run up to
+        # ~900s. Inline it would freeze Telethon push dispatch and the WS
+        # listener that now share this loop, and asyncio.wait_for could not
+        # enforce NEWS_PASS_DEADLINE at all. Accepted caveat: a deadline abort
+        # cannot kill the worker thread — it runs to completion in the
+        # background. That is harmless: save_evaluation is INSERT OR IGNORE on
+        # (channel, msg_id), AgentDB serializes on its own lock, and posting
+        # never runs because this await is cancelled.
+        relevant = await asyncio.to_thread(evaluate_and_deduplicate, messages, db)
+        if not relevant:
+            log.info(f"News pass: {len(messages)} message(s), none newsworthy")
+            return
+        _, _, wallet_key = load_credentials()
+        ln = LNClient(wallet_key)
+        ln.authenticate()
+        posted = await news_post_pass(relevant, db, ln)
+        log.info(f"News pass: {len(messages)} message(s) → {len(relevant)} "
+                 f"newsworthy → {posted} posted")
+    finally:
+        db.close()
+
+
+async def _run_guarded_news_pass() -> None:
+    """Deadline-bounded news pass; failures never propagate to run_loop."""
+    global _last_news_pass_ts
+    _last_news_pass_ts = time.time()
+    try:
+        await asyncio.wait_for(run_news_pass(), timeout=NEWS_PASS_DEADLINE)
+    except asyncio.TimeoutError:
+        log.error(f"News pass exceeded {NEWS_PASS_DEADLINE}s deadline — aborted.")
+    except Exception as e:
+        log.error(f"News pass failed: {e}", exc_info=True)
+
+
+async def run_engagement_pass() -> None:
+    """Reconcile LN engagement independently of Telegram source traffic."""
+    _provider_chain.reset_failures()  # quota cooldowns remain intact
+    db = AgentDB()
+    try:
+        # Only acknowledge events this pass actually covered. Events arriving
+        # during model work remain queued for the subsequent mini-pass.
+        events = db.get_unconsumed_ws_events("agent", limit=1000)
+        _, _, wallet_key = load_credentials()
+        ln = LNClient(wallet_key)
+        await _blocking(ln.authenticate)
+        articles = await _blocking(ln.get_recent_articles, per_page=20)
+        voted, commented, processed = await vote_comment_pass(ln, db, articles, since=None)
+        db.mark_ws_events_consumed("agent", [e["id"] for e in events if e["news_id"] in processed])
+        _clear_ws_gap()
+        log.info("Engagement reconciliation: articles=%d voted=%d commented=%d",
+                 len(articles), voted, commented)
+        if ENABLE_MARKET_MATCH:
+            await _blocking(run_market_match_phase, ln, db)
+    finally:
+        db.close()
+
+
+async def run_reply_pass() -> None:
+    """Check existing comment threads without repeating article voting."""
+    db = AgentDB()
+    try:
+        _, _, wallet_key = load_credentials()
+        ln = LNClient(wallet_key)
+        await _blocking(ln.authenticate)
+        articles = await _blocking(ln.get_recent_articles, per_page=20)
+        checked = await check_article_replies(ln, db, articles)
+        log.info("Reply scan complete: articles=%d", checked)
+    finally:
+        db.close()
+
+
+def run_daily_maintenance() -> None:
+    db = AgentDB()
+    try:
+        ws = db.prune_ws_events(days=7)
+        sources = db.prune_pending_source_messages(days=7)
+        queue = NewsQueue(db.db_path)
+        try:
+            queue.prune()
+        finally:
+            queue.close()
+        log.info("Daily maintenance: pruned_ws=%d pruned_sources=%d", ws, sources)
+    finally:
+        db.close()
+
+
+async def _run_scheduled_pass(name, function, timeout) -> None:
+    started = time.monotonic()
+    try:
+        await asyncio.wait_for(function(), timeout=timeout)
+    except asyncio.TimeoutError:
+        log.error("Scheduled %s exceeded deadline=%ss", name, timeout)
+    except Exception as exc:
+        log.error("Scheduled %s failed: %s", name, type(exc).__name__)
+    else:
+        log.info("Scheduled %s complete elapsed=%.1fs", name, time.monotonic() - started)
+
+
+async def _engagement_worker() -> None:
+    """One owner for engagement/replies; their clocks never depend on catch-up."""
+    next_engagement = next_reply = time.monotonic()
+    last_vote = next_engagement - MINI_PASS_MIN_INTERVAL
+    while True:
+        now = time.monotonic()
+        if now >= next_engagement:
+            await _run_scheduled_pass("engagement", run_engagement_pass, CYCLE_DEADLINE)
+            last_vote = time.monotonic()
+            next_engagement = last_vote + ENGAGEMENT_RECONCILE_INTERVAL
+            continue
+        if now >= next_reply:
+            await _run_scheduled_pass("replies", run_reply_pass, MINI_PASS_DEADLINE)
+            next_reply = time.monotonic() + REPLY_CHECK_INTERVAL
+            continue
+        if (ENABLE_WS_MINI_PASS and _ws_wake.is_set()
+                and now >= last_vote + MINI_PASS_MIN_INTERVAL):
+            _ws_wake.clear()
+            await _run_guarded_mini_pass()
+            last_vote = time.monotonic()
+            continue
+
+        due = [next_engagement, next_reply]
+        if ENABLE_WS_MINI_PASS and _ws_wake.is_set():
+            due.append(last_vote + MINI_PASS_MIN_INTERVAL)
+        delay = max(0.001, min(due) - time.monotonic())
+        if ENABLE_WS_MINI_PASS and not _ws_wake.is_set():
+            try:
+                await asyncio.wait_for(_ws_wake.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+        else:
+            await asyncio.sleep(delay)
+
+
+async def _maintenance_worker() -> None:
+    while True:
+        async def maintain():
+            await _blocking(run_daily_maintenance)
+        await _run_scheduled_pass("maintenance", maintain, 60)
+        await asyncio.sleep(MAINTENANCE_INTERVAL)
+
+
+async def run_loop():
+    """Periodic source catch-up over a persistent Telegram client.
+
+    Jev mode owns independent news, engagement/reply, and maintenance workers.
+    Legacy mode keeps full cycles and between-cycle mini-passes.
+    The WS listener and the push handler run
+    OUTSIDE the cycle watchdog. A deadline timeout or terminal Telethon
+    disconnect rebuilds the client and re-registers the push handlers.
+
+    Everything here — the client, its NewMessage handlers, the WS listener
+    task and both wake Events — lives on the single event loop started by
+    `asyncio.run(run_loop())`. See _build_client for why that is load-bearing.
+    """
+    global _last_vote_pass_ts, _last_news_pass_ts
+    listener = None
+    push_db = None
+    client = None
+    disconnect_watch = None
+    jev_workers = []
+    try:
+        if ENABLE_WS_EVENTS:
+            listener = asyncio.create_task(_ws_listener_supervisor())
+            log.info("WS: listener task started")
+        if ENABLE_SOURCE_PUSH:
+            # Process-lifetime handle: the push handler closes over it and must
+            # outlive every client rebuild.
+            push_db = AgentDB()
+        if JEV_REALTIME:
+            jev_workers = [asyncio.create_task(_jev_worker_supervisor(worker))
+                           for worker in (_jev_evaluation_worker, _jev_recovery_worker,
+                                          _jev_publication_worker, _engagement_worker,
+                                          _maintenance_worker)]
+            log.info("JEV real-time news workers started; all configured sources eligible for push")
+            log.info("Independent schedules: source_catchup=%ss engagement=%ss replies=%ss maintenance=%ss",
+                     CYCLE_INTERVAL, ENGAGEMENT_RECONCILE_INTERVAL,
+                     REPLY_CHECK_INTERVAL, MAINTENANCE_INTERVAL)
         while True:
+            if client is None:
+                client, disconnect_watch = await _connect_and_register(push_db)
+                if client is None:
+                    log.error("Telegram client unavailable — retrying in "
+                              f"{CONNECT_RETRY_INTERVAL}s.")
+                    await asyncio.sleep(CONNECT_RETRY_INTERVAL)
+                    continue
+
+            # Registration may finish just as Telethon exhausts reconnects,
+            # and the between-cycle timer may race the terminal watcher. Never
+            # hand a client already known dead to the full-cycle error-swallowing
+            # read path.
+            if (not client.is_connected()
+                    or (disconnect_watch is not None
+                        and disconnect_watch.done())):
+                log.error("Telegram client terminally disconnected before "
+                          "full cycle — rebuilding client.")
+                retiring_client, client = client, None
+                retiring_watch, disconnect_watch = disconnect_watch, None
+                client, disconnect_watch = await _close_and_rebuild_client(
+                    retiring_client, retiring_watch, push_db)
+                if client is None:
+                    log.error("Client rebuild before full cycle failed — "
+                              f"retrying in {CONNECT_RETRY_INTERVAL}s.")
+                    await asyncio.sleep(CONNECT_RETRY_INTERVAL)
+                    continue
+                # Re-enter the same preflight: a replacement can itself finish
+                # registration just as its transport becomes terminal.
+                continue
+
             cycle_start = time.time()
-            await _run_guarded_cycle()
-            _last_pass_ts = time.time()
+            timed_out = await _run_guarded_cycle(client)
+            if not JEV_REALTIME:
+                # Legacy full cycles own both jobs and their throttles.
+                _last_vote_pass_ts = _last_news_pass_ts = time.time()
+
+            terminally_disconnected = not client.is_connected()
+            if timed_out or terminally_disconnected:
+                # A timed-out or terminally disconnected transport cannot keep
+                # its push handlers alive. Rebuild here, then preserve the normal
+                # between-cycle wait rather than launching a second full cycle.
+                if terminally_disconnected and not timed_out:
+                    log.error("Telegram client disconnected during cycle — "
+                              "rebuilding client.")
+                # Detach ownership before shutdown: if Telethon cleanup fails,
+                # the outer finally must not start a second shielded cleanup.
+                retiring_client, client = client, None
+                retiring_watch, disconnect_watch = disconnect_watch, None
+                client, disconnect_watch = await _close_and_rebuild_client(
+                    retiring_client, retiring_watch, push_db)
+                if client is None:
+                    log.error("Client rebuild after guarded cycle failed — "
+                              f"retrying in {CONNECT_RETRY_INTERVAL}s.")
+                    await asyncio.sleep(CONNECT_RETRY_INTERVAL)
+                    continue
 
             elapsed = time.time() - cycle_start
-            log.info(f"Cycle took {elapsed:.0f}s. Next full cycle in {CYCLE_INTERVAL}s "
-                     f"(WS mini-passes {'enabled' if ENABLE_WS_MINI_PASS else 'disabled'}).")
+            if JEV_REALTIME:
+                log.info("Source catch-up took %.0fs; next scan in %ss", elapsed, CYCLE_INTERVAL)
+            else:
+                log.info(f"Cycle took {elapsed:.0f}s. Next full cycle in {CYCLE_INTERVAL}s "
+                         f"(vote mini-passes {'on' if ENABLE_WS_MINI_PASS else 'off'}, "
+                         f"news mini-passes {'on' if ENABLE_SOURCE_PUSH else 'off'}).")
             next_cycle_at = time.time() + CYCLE_INTERVAL
+            next_recovery_at = time.monotonic() + PUSH_RECOVERY_INTERVAL
 
             while (remaining := next_cycle_at - time.time()) > 0:
-                if not ENABLE_WS_MINI_PASS:
-                    await asyncio.sleep(remaining)
-                    break
-                # Rate limit first: sleep until a mini-pass would be allowed.
-                allowed_in = (_last_pass_ts + MINI_PASS_MIN_INTERVAL) - time.time()
-                if allowed_in > 0:
-                    await asyncio.sleep(min(allowed_in, remaining))
+                # Terminal transport failure outranks queued work. Otherwise a
+                # pass that is continuously refilled faster than its throttle
+                # can prevent the scheduler from ever observing disconnect.
+                if disconnect_watch is not None and disconnect_watch.done():
+                    disconnect_error = disconnect_watch.result()
+                    detail = (f"{type(disconnect_error).__name__}: "
+                              f"{disconnect_error}"
+                              if disconnect_error else "connection closed")
+                    log.error("Telegram client terminally disconnected "
+                              f"between cycles ({detail}) — rebuilding.")
+                    retiring_client, client = client, None
+                    retiring_watch, disconnect_watch = disconnect_watch, None
+                    client, disconnect_watch = await _close_and_rebuild_client(
+                        retiring_client, retiring_watch, push_db)
+                    if client is None:
+                        log.error("Client rebuild after terminal disconnect "
+                                  f"failed — retrying in "
+                                  f"{CONNECT_RETRY_INTERVAL}s.")
+                        await asyncio.sleep(CONNECT_RETRY_INTERVAL)
+                        break
                     continue
-                try:
-                    await asyncio.wait_for(_ws_wake.wait(), timeout=remaining)
-                except asyncio.TimeoutError:
-                    break  # full-cycle time
-                _ws_wake.clear()
-                await _run_guarded_mini_pass()
+
+                now = time.time()
+                if JEV_REALTIME and time.monotonic() >= next_recovery_at:
+                    delay = await _refresh_source_updates(client)
+                    next_recovery_at = time.monotonic() + delay
+                    continue
+                vote_gate = (_last_vote_pass_ts + MINI_PASS_MIN_INTERVAL) - now
+                news_gate = (_last_news_pass_ts + NEWS_PASS_MIN_INTERVAL) - now
+                vote_ready = (ENABLE_WS_MINI_PASS and not JEV_REALTIME and _ws_wake.is_set()
+                              and vote_gate <= 0)
+                news_ready = (ENABLE_SOURCE_PUSH and not JEV_REALTIME and _news_wake.is_set()
+                              and news_gate <= 0)
+                # Both due: run the MORE overdue one first (a gate is "seconds
+                # until allowed", so more overdue = more negative). A fixed
+                # vote-first order starved news for a whole window: a >600s
+                # vote pass returns with its own gate already reopened and
+                # _ws_wake re-set by the listener, so it won every iteration.
+                # Ties keep the old vote-first order.
+                if vote_ready and (not news_ready or vote_gate <= news_gate):
+                    _ws_wake.clear()
+                    await _run_guarded_mini_pass()
+                    continue
+                if news_ready:
+                    _news_wake.clear()
+                    await _run_guarded_news_pass()
+                    continue
+                # Nothing runnable: sleep until a set-but-throttled pass
+                # becomes allowed, an unset wake fires, or full-cycle time.
+                # The 0.1s floor is the anti-spin guard — a gate that lands on
+                # exactly 0 must not turn this into a hot loop.
+                timeout = remaining
+                if JEV_REALTIME:
+                    timeout = min(timeout, max(next_recovery_at - time.monotonic(), 0.1))
+                if ENABLE_WS_MINI_PASS and not JEV_REALTIME and _ws_wake.is_set():
+                    timeout = min(timeout, max(vote_gate, 0.1))
+                if ENABLE_SOURCE_PUSH and not JEV_REALTIME and _news_wake.is_set():
+                    timeout = min(timeout, max(news_gate, 0.1))
+                wake_waiters = []
+                if ENABLE_WS_MINI_PASS and not JEV_REALTIME and not _ws_wake.is_set():
+                    wake_waiters.append(asyncio.create_task(_ws_wake.wait()))
+                if ENABLE_SOURCE_PUSH and not JEV_REALTIME and not _news_wake.is_set():
+                    wake_waiters.append(asyncio.create_task(_news_wake.wait()))
+                waiters = list(wake_waiters)
+                if disconnect_watch is not None:
+                    waiters.append(disconnect_watch)
+                if waiters:
+                    await asyncio.wait(
+                        waiters, timeout=timeout,
+                        return_when=asyncio.FIRST_COMPLETED)
+                    for task in wake_waiters:
+                        if not task.done():
+                            task.cancel()
+                    await asyncio.gather(*wake_waiters, return_exceptions=True)
+                else:
+                    await asyncio.sleep(timeout)
     finally:
+        for task in jev_workers:
+            task.cancel()
+        if jev_workers:
+            await asyncio.gather(*jev_workers, return_exceptions=True)
         if listener:
             listener.cancel()
+        if push_db:
+            push_db.close()
+        if client:
+            await _close_client(client, disconnect_watch)
 
 
 if __name__ == "__main__":

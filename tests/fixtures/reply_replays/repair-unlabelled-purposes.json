@@ -1,0 +1,35 @@
+{
+  "description": "Synthetic source-recovery replay captured an unsupported purpose/outcome expansion during repair.",
+  "composition": {
+    "decision": "reply",
+    "reply": "Aster recommends replaying complete user transcripts against useful answers to test task continuity across the full exchange. It also recommends checking source identity after a correction so the revised answer remains tied to the correct source.",
+    "claims": [
+      {
+        "claim": "Aster recommends replaying complete user transcripts against useful answers.",
+        "evidence_ids": [
+          "F1"
+        ]
+      },
+      {
+        "claim": "Aster recommends checking source identity after a correction.",
+        "evidence_ids": [
+          "F1"
+        ]
+      },
+      {
+        "claim": "The review treats task continuity and source reading as separate requirements.",
+        "evidence_ids": [
+          "F1"
+        ]
+      }
+    ]
+  },
+  "verdict": {
+    "pass": false,
+    "unsupported_claims": [
+      "Replaying complete user transcripts against useful answers is recommended to test task continuity across the full exchange.",
+      "Checking source identity after a correction is recommended so the revised answer remains tied to the correct source."
+    ],
+    "reason": "The focal review supports the two recommendations, but not the added purposes and outcome."
+  }
+}

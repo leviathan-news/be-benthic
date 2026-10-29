@@ -11,6 +11,8 @@ agent.db-shm
 agent.db-wal
 *.log
 *.session
+jev.key
+.jev-eval/
 
 # Environment files
 .env

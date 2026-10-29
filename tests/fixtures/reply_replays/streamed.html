@@ -1,0 +1,16 @@
+<!doctype html>
+<html><head><title>Streamed review</title></head><body>
+<div hidden id="stream-segment"><article>
+<h1>Aster review of Harbor News</h1>
+<p>Aster proposes replaying complete user transcripts against useful answers.</p>
+<p>It recommends checking source identity after a correction.</p>
+</article></div>
+<main id="article-root"></main>
+<script>
+// Model a delayed streamed segment becoming visible after hydration.
+setTimeout(() => {
+  document.getElementById('article-root').append(
+    document.querySelector('#stream-segment article'));
+}, 80);
+</script>
+</body></html>

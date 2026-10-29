@@ -366,3 +366,18 @@ def test_prune_state_is_safe_while_worker_adds(bot, monkeypatch):
     assert len(bot._responded) <= bot._MAX_STATE_SIZE // 2 + 1
     assert len(bot._content_responded) <= bot._MAX_STATE_SIZE // 2 + 2
     assert list(bot._last_reply_to) == [606]
+
+
+@pytest.mark.parametrize('forum, expected', [(False, [10, 11]), (True, [11])])
+def test_dispatch_preserves_nonforum_context_across_reply_threads(bot, monkeypatch, forum, expected):
+    message = _message(bot, 12, 203)
+    message['chat']['is_forum'] = forum
+    message['message_thread_id'] = 9
+    original = _message(bot, 10, 203, 'https://example.com/shared')
+    reply = _message(bot, 11, 203, 'Bruh?')
+    reply['message_thread_id'] = 9
+    received = []
+    monkeypatch.setattr(bot, 'generate_response', lambda msg, **kw: received.extend(m['message_id'] for m in kw['recent_messages']) or False)
+    future = bot._dispatch_one_message(message, {(bot.AGENTS_GROUP_ID, None): [original], (bot.AGENTS_GROUP_ID, 9): [reply]})
+    future.result(timeout=2)
+    assert received == expected

@@ -5,10 +5,12 @@ are bare [photo] markers. These tests cover the capture→marker→attach→prun
 pipeline that lets full-brain calls view recent same-chat photos on demand."""
 
 import importlib.util
+import json
 import os
 import sqlite3
 import sys
 import time
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -158,6 +160,53 @@ def test_seen_document_schema_and_capture_are_metadata_only(bot_env):
     assert "body" not in columns
     assert "content" not in columns
     assert "text" not in columns
+
+
+def test_reply_document_source_schema_is_metadata_only(bot_env):
+    """Reply provenance stores identifiers and time, never document content."""
+    with bot_env._db() as conn:
+        columns = {
+            row[1] for row in conn.execute(
+                "PRAGMA table_info(reply_document_sources)"
+            )
+        }
+
+    assert columns == {
+        "chat_id",
+        "topic_id",
+        "bot_message_id",
+        "document_message_id",
+        "created_at",
+    }
+
+
+def test_reply_document_sources_prune_with_media_retention(
+        bot_env, monkeypatch):
+    """Reply receipts expire with the witnessed-media retention window."""
+    old = (
+        datetime.now(timezone.utc)
+        - timedelta(days=bot_env.PHOTO_RETENTION_DAYS + 1)
+    ).isoformat()
+    current = datetime.now(timezone.utc).isoformat()
+    with bot_env._db() as conn:
+        conn.executemany(
+            "INSERT INTO reply_document_sources VALUES (?,?,?,?,?)",
+            (
+                (-100500, 4, 800, 300, old),
+                (-100500, 4, 801, 301, current),
+            ),
+        )
+        conn.commit()
+    monkeypatch.setattr(bot_env, "_prune_counter", 99)
+    monkeypatch.setattr(bot_env, "_prune_grounding_traces", lambda: None)
+
+    bot_env._prune_chat_history()
+
+    with bot_env._db() as conn:
+        rows = conn.execute(
+            "SELECT bot_message_id FROM reply_document_sources"
+        ).fetchall()
+    assert rows == [(801,)]
 
 
 @pytest.mark.parametrize(
@@ -826,6 +875,204 @@ def _seed_document(
         conn.commit()
 
 
+def _seed_document_trace(
+        bot, *, inbound_id, source_ref, chat_id=-100500,
+        trace_id="document-trace"):
+    """Persist one bounded grounding trace with a test-owned media source."""
+    manifest = json.dumps([{
+        "evidence_id": "P1",
+        "kind": "media",
+        "source_ref": source_ref,
+        "content_hash": "0" * 64,
+        "text_length": 100,
+        "fetch_status": "not_fetched",
+    }])
+    with bot._db() as conn:
+        conn.execute(
+            """INSERT INTO reply_grounding_traces
+               (trace_id, chat_id, message_id, direct, mode,
+                focal_refs_json, evidence_manifest, verifier_result,
+                disposition, created_at)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                trace_id,
+                chat_id,
+                inbound_id,
+                1,
+                "conversation",
+                "[]",
+                manifest,
+                "passed",
+                "reply",
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def _seed_reply_document_source(
+        bot, bot_message_id, document_message_id, *, chat_id=-100500,
+        topic_id=4, created_at=None):
+    """Insert one exact outgoing-reply/document metadata receipt."""
+    with bot._db() as conn:
+        conn.execute(
+            "INSERT INTO reply_document_sources VALUES (?,?,?,?,?)",
+            (
+                chat_id,
+                topic_id,
+                bot_message_id,
+                document_message_id,
+                created_at or datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        conn.commit()
+
+
+def _reply_continuation_message(
+        *, reply_id=801, chat_id=-100500, topic_id=4,
+        username="Benthic_Bot", is_bot=True):
+    """Build the trusted Telegram shape for a direct Benthic continuation."""
+    return {
+        "message_id": 900,
+        "chat": {"id": chat_id},
+        "message_thread_id": topic_id,
+        "text": "You should be able to do it now",
+        "reply_to_message": {
+            "message_id": reply_id,
+            "from": {"username": username, "is_bot": is_bot},
+            "text": "I could not inspect it earlier.",
+        },
+    }
+
+
+def test_send_message_returns_every_successful_chunk_id(
+        bot_env, monkeypatch):
+    """The caller receives every actual Telegram ID from split output."""
+    replies = iter((
+        {"ok": True, "result": {"message_id": 801}},
+        {"ok": True, "result": {"message_id": 802}},
+    ))
+    requests = []
+    monkeypatch.setattr(
+        bot_env, "_split_long_message", lambda text: ["first", "second"]
+    )
+
+    def request(method, data):
+        requests.append((method, dict(data)))
+        return next(replies)
+
+    monkeypatch.setattr(bot_env, "tg_request", request)
+    monkeypatch.setattr(bot_env.time, "sleep", lambda *_: None)
+
+    result = bot_env.send_message(-100500, "body", reply_to=700)
+
+    assert result[bot_env._SENT_MESSAGE_IDS_KEY] == (801, 802)
+    assert requests[0][1]["reply_to_message_id"] == 700
+    assert "reply_to_message_id" not in requests[1][1]
+
+
+def test_send_message_failed_chunk_is_not_reported(bot_env, monkeypatch):
+    """A failed Telegram send never becomes a provenance target."""
+    monkeypatch.setattr(
+        bot_env, "_split_long_message", lambda text: ["only"]
+    )
+    monkeypatch.setattr(
+        bot_env, "tg_request", lambda *args: {"ok": False}
+    )
+
+    result = bot_env.send_message(-100500, "body")
+
+    assert result[bot_env._SENT_MESSAGE_IDS_KEY] == ()
+
+
+def test_record_reply_document_sources_accepts_exact_same_scope_trace(bot_env):
+    """Trusted media source refs bind every sent chunk to the witnessed file."""
+    _seed_document(bot_env, -100500, 301, "SECRET-ID", topic_id=4)
+    _seed_document_trace(
+        bot_env,
+        inbound_id=700,
+        source_ref="telegram:-100500:301:attachment",
+    )
+
+    inserted = bot_env._record_reply_document_sources(
+        -100500, 4, 700, (801, 802)
+    )
+
+    assert inserted == 2
+    with bot_env._db() as conn:
+        rows = conn.execute(
+            "SELECT bot_message_id, document_message_id "
+            "FROM reply_document_sources ORDER BY bot_message_id"
+        ).fetchall()
+    assert rows == [(801, 301), (802, 301)]
+
+
+@pytest.mark.parametrize("source_ref", (
+    "telegram:-100500:301:attachment:extra",
+    "prefix:telegram:-100500:301:attachment",
+    "telegram:-100999:301:attachment",
+    "telegram:-100500:0:attachment",
+))
+def test_record_reply_document_sources_rejects_untrusted_refs(
+        bot_env, source_ref):
+    """Only an anchored attachment ref for the current chat is authoritative."""
+    _seed_document(bot_env, -100500, 301, "SECRET-ID", topic_id=4)
+    _seed_document_trace(
+        bot_env,
+        inbound_id=700,
+        source_ref=source_ref,
+    )
+
+    assert bot_env._record_reply_document_sources(
+        -100500, 4, 700, (801,)
+    ) == 0
+
+
+def test_record_reply_document_sources_rejects_topic_mismatch(bot_env):
+    """A source row in another topic cannot authorize a receipt."""
+    _seed_document(bot_env, -100500, 301, "SECRET-ID", topic_id=4)
+    _seed_document_trace(
+        bot_env,
+        inbound_id=700,
+        source_ref="telegram:-100500:301:attachment",
+    )
+
+    assert bot_env._record_reply_document_sources(
+        -100500, 5, 700, (801,)
+    ) == 0
+
+
+def test_record_reply_document_sources_requires_trace_and_valid_sent_ids(
+        bot_env):
+    """Missing traces and non-integer Telegram IDs fail closed."""
+    assert bot_env._record_reply_document_sources(
+        -100500, 4, 700, (801,)
+    ) == 0
+    _seed_document(bot_env, -100500, 301, "SECRET-ID", topic_id=4)
+    _seed_document_trace(
+        bot_env,
+        inbound_id=700,
+        source_ref="telegram:-100500:301:attachment",
+    )
+
+    assert bot_env._record_reply_document_sources(
+        -100500, 4, 700, (True, 0, "801")
+    ) == 0
+    assert bot_env._record_reply_document_sources(
+        -100500, 4, 700, 801
+    ) == 0
+
+
+def test_group_publication_records_reply_document_source_receipts():
+    """The Telegram group publication seam must persist sent-ID provenance."""
+    import inspect
+
+    source = inspect.getsource(_load_bot_module()._process_one_message)
+
+    assert "_record_reply_document_sources(" in source
+    assert "result.get(_SENT_MESSAGE_IDS_KEY, ())" in source
+
+
 def test_document_selection_prefers_exact_reply_without_keyword(bot_env):
     """An exact reply can select its fresh text document without vague guessing."""
     bot = bot_env
@@ -903,21 +1150,202 @@ def test_document_selection_is_scope_age_and_ambiguity_bounded(
     ) == bot.DocumentSelection((305,), False)
 
 
+def test_direct_reply_to_benthic_receipt_selects_retained_document(bot_env):
+    """An exact Benthic reply receipt survives the generic 30-minute window."""
+    bot = bot_env
+    _seed_document(
+        bot,
+        -100500,
+        310,
+        "DOC310",
+        seconds_ago=3_600,
+        topic_id=4,
+    )
+    _seed_reply_document_source(bot, 801, 310, topic_id=4)
+
+    selected = bot._select_grounding_document_ids(
+        _reply_continuation_message(), direct=True
+    )
+
+    assert selected == bot.DocumentSelection(
+        (310,), False, bot.PHOTO_RETENTION_DAYS * 86_400
+    )
+
+
+def test_vague_direct_reply_without_receipt_selects_nothing(bot_env):
+    """Vague continuation text never selects an ambient document by recency."""
+    _seed_document(bot_env, -100500, 310, "DOC310", topic_id=4)
+
+    assert bot_env._select_grounding_document_ids(
+        _reply_continuation_message(), direct=True
+    ) == bot_env.DocumentSelection()
+
+
+@pytest.mark.parametrize(("direct", "username", "is_bot"), (
+    (False, "Benthic_Bot", True),
+    (True, "Benthic_Bot", False),
+    (True, "someone_else", True),
+))
+def test_reply_receipt_requires_direct_authenticated_benthic_target(
+        bot_env, direct, username, is_bot):
+    """Only a direct reply to trusted Benthic sender metadata may resolve."""
+    _seed_document(bot_env, -100500, 310, "DOC310", topic_id=4)
+    _seed_reply_document_source(bot_env, 801, 310, topic_id=4)
+    current = _reply_continuation_message(
+        username=username, is_bot=is_bot
+    )
+
+    assert bot_env._select_grounding_document_ids(
+        current, direct=direct
+    ) == bot_env.DocumentSelection()
+
+
+def test_reply_receipt_is_scope_and_retention_bounded(bot_env):
+    """Expired and cross-topic receipts provide no document authority."""
+    _seed_document(bot_env, -100500, 310, "DOC310", topic_id=4)
+    expired = (
+        datetime.now(timezone.utc)
+        - timedelta(days=bot_env.PHOTO_RETENTION_DAYS + 1)
+    ).isoformat()
+    _seed_reply_document_source(
+        bot_env, 801, 310, topic_id=4, created_at=expired
+    )
+
+    assert bot_env._select_grounding_document_ids(
+        _reply_continuation_message(), direct=True
+    ) == bot_env.DocumentSelection()
+    assert bot_env._select_grounding_document_ids(
+        _reply_continuation_message(topic_id=5), direct=True
+    ) == bot_env.DocumentSelection()
+
+
+def test_reply_receipt_with_multiple_documents_is_ambiguous(bot_env):
+    """A conflicting multi-document receipt asks for precision instead of guessing."""
+    for message_id in (310, 311):
+        _seed_document(
+            bot_env,
+            -100500,
+            message_id,
+            f"DOC{message_id}",
+            topic_id=4,
+        )
+        _seed_reply_document_source(
+            bot_env, 801, message_id, topic_id=4
+        )
+
+    assert bot_env._select_grounding_document_ids(
+        _reply_continuation_message(), direct=True
+    ) == bot_env.DocumentSelection(
+        (), True, bot_env.PHOTO_RETENTION_DAYS * 86_400
+    )
+
+
 def test_document_renderer_caps_excerpt_and_declares_truncation(
         bot_env, tmp_path):
-    """A large text file exposes only a labeled 16K sanitized excerpt."""
+    """A large text file exposes only a labeled 48 KB sanitized excerpt."""
     path = tmp_path / "downloaded.tmp"
-    path.write_text("x" * 20_000, encoding="utf-8")
+    path.write_text("x" * 60_000, encoding="utf-8")
 
     rendered = bot_env._render_text_document(
-        str(path), "campaign-review.md", 20_000
+        str(path), "campaign-review.md", 60_000
     )
     metadata, body = rendered.split("\n", 1)
 
     assert "filename=campaign-review.md" in metadata
-    assert "bytes=20000" in metadata
+    assert "bytes=60000" in metadata
     assert "truncated=true" in metadata
-    assert body == "x" * 16_000
+    assert body == "x" * 48_000
+
+
+def test_document_renderer_keeps_complete_40k_editorial_review(
+        bot_env, tmp_path):
+    """A witnessed 40 KB Markdown review reaches composition in full."""
+    final_sections = (
+        "\n# 9. Maze Answers to questions - section 7"
+        "\n# 10. Maze ideas - Additional nuggets to incorporate"
+    )
+    document = "x" * (40_442 - len(final_sections)) + final_sections
+    assert len(document.encode("utf-8")) == 40_442
+    path = tmp_path / "review.md"
+    path.write_text(document, encoding="utf-8")
+
+    rendered = bot_env._render_text_document(
+        str(path), "convex-maze-review.md", 40_442
+    )
+    metadata, body = rendered.split("\n", 1)
+
+    assert "truncated=false" in metadata
+    assert body == document
+    assert body.endswith(final_sections)
+
+
+def test_document_renderer_truncates_on_utf8_boundary(
+        bot_env, tmp_path):
+    """The document body cap counts UTF-8 bytes and never splits a code point."""
+    document = "🦑" * 20_000
+    path = tmp_path / "multibyte.md"
+    path.write_text(document, encoding="utf-8")
+
+    rendered = bot_env._render_text_document(
+        str(path), "multibyte.md", len(document.encode("utf-8"))
+    )
+    metadata, body = rendered.split("\n", 1)
+
+    assert "truncated=true" in metadata
+    assert len(body.encode("utf-8")) <= 48_000
+    assert body == "🦑" * 12_000
+
+
+def test_document_renderer_byte_bounds_multibyte_filename(
+        bot_env, tmp_path):
+    """Metadata cannot consume the body reserve through a wide filename."""
+    path = tmp_path / "body.md"
+    path.write_text("complete body", encoding="utf-8")
+
+    rendered = bot_env._render_text_document(
+        str(path), "🦑" * 200, len("complete body")
+    )
+    metadata, body = rendered.split("\n", 1)
+    rendered_name = metadata.split("filename=", 1)[1].split("; bytes=", 1)[0]
+
+    assert len(rendered_name.encode("utf-8")) <= 200
+    assert "truncated=false" in metadata
+    assert body == "complete body"
+
+
+def test_document_renderer_measures_normalized_prompt_text(
+        bot_env, tmp_path):
+    """Unicode normalization cannot expand a complete label into silent loss."""
+    document = "\ufdfa" * 5_000
+    assert len(document.encode("utf-8")) < 48_000
+    path = tmp_path / "normalization.md"
+    path.write_text(document, encoding="utf-8")
+
+    rendered = bot_env._render_text_document(
+        str(path), "normalization.md", len(document.encode("utf-8"))
+    )
+    metadata, body = rendered.split("\n", 1)
+
+    assert "truncated=true" in metadata
+    assert unicodedata.is_normalized("NFKC", body)
+    assert len(body.encode("utf-8")) <= 48_000
+
+
+def test_document_renderer_normalizes_filename_before_byte_bound(
+        bot_env, tmp_path):
+    """Filename normalization cannot consume the reserved document body bytes."""
+    path = tmp_path / "body.md"
+    path.write_text("complete body", encoding="utf-8")
+
+    rendered = bot_env._render_text_document(
+        str(path), "\ufdfa" * 100, len("complete body")
+    )
+    metadata, body = rendered.split("\n", 1)
+    rendered_name = metadata.split("filename=", 1)[1].split("; bytes=", 1)[0]
+
+    assert unicodedata.is_normalized("NFKC", rendered_name)
+    assert len(rendered_name.encode("utf-8")) <= 200
+    assert body == "complete body"
 
 
 def test_attach_recent_document_hides_file_id_and_preserves_origin(
@@ -973,6 +1401,40 @@ def test_attach_recent_document_rechecks_age_and_allowlist(
 
     assert bot._attach_recent_documents((308,), -100500, 4) == ()
     assert bot._attach_recent_documents((309,), -100500, 4) == ()
+
+
+def test_attach_receipt_document_accepts_only_bounded_retention(
+        bot_env, monkeypatch, tmp_path):
+    """The download seam honors a validated receipt age but rejects larger bounds."""
+    bot = bot_env
+    _seed_document(
+        bot,
+        -100500,
+        312,
+        "DOC312",
+        seconds_ago=3_600,
+        topic_id=4,
+    )
+    path = tmp_path / "retained.md"
+    path.write_text("retained body", encoding="utf-8")
+    monkeypatch.setattr(
+        bot, "_download_by_file_id", lambda *args: (str(path), "text")
+    )
+
+    attached = bot._attach_recent_documents(
+        (312,),
+        -100500,
+        4,
+        max_age_seconds=bot.PHOTO_RETENTION_DAYS * 86_400,
+    )
+
+    assert tuple(item.message_id for item in attached) == (312,)
+    assert bot._attach_recent_documents(
+        (312,),
+        -100500,
+        4,
+        max_age_seconds=bot.PHOTO_RETENTION_DAYS * 86_400 + 1,
+    ) == ()
 
 
 @pytest.fixture
@@ -1082,7 +1544,7 @@ def test_generate_response_attaches_and_cleans_up(bot_env, monkeypatch, tmp_path
     bot._apply_media_note(witnessed)
     assert witnessed["text"] == "[photo#123]"        # what the buffer now carries
     msg = {"message_id": 900, "chat": {"id": -100500}, "message_thread_id": 5,
-           "from": {"id": 42, "username": "zero", "first_name": "Zero"},
+           "from": {"id": 42, "username": "op_user", "first_name": "Op"},
            "text": "Benthic check the screenshot above and review his claims"}
     resp = bot.generate_response(msg, is_direct=True, recent_messages=[witnessed])
     assert isinstance(resp, str) and "Winthorpe" in resp

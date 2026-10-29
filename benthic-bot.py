@@ -37,8 +37,11 @@ from typing import Mapping
 from urllib.parse import parse_qs, urlencode, urlparse
 
 from prompt_loader import load_prompt
+from private_conversation import PrivateConversationHistory
+import jev_news as jev
 from providers import ProviderResult
-from reply_grounding import GroundingLimits
+from reply_grounding import GroundingLimits, truncate_utf8
+import task_context as task_provenance
 
 # ─── Configuration ───────────────────────────────────────────────────────────
 
@@ -88,10 +91,12 @@ def _resolve_pm2_bin() -> str:
 
 
 CODEX_BIN = os.environ.get("CODEX_BIN", _resolve_codex_bin())
-CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-5.6-sol")
+CODEX_MODEL = os.environ.get("CODEX_MODEL", "gpt-6-sol")
 CODEX_EFFORT = os.environ.get("CODEX_EFFORT", "xhigh")
+# Chat prose can use a different writer without changing research or gates.
+CODEX_REPLY_MODEL = os.environ.get("CODEX_REPLY_MODEL", "gpt-6-astra")
 CODEX_CLASSIFY_MODEL = os.environ.get(
-    "CODEX_CLASSIFY_MODEL", "gpt-5.6-terra"
+    "CODEX_CLASSIFY_MODEL", "gpt-6-luna"
 )
 CLAUDE_LIMIT_COOLDOWN = int(os.environ.get("CLAUDE_LIMIT_COOLDOWN", str(6 * 60 * 60)))
 
@@ -621,10 +626,10 @@ _GROUNDING_INT_BOUNDS = {
     "GROUNDING_MAX_BACKGROUND_SOURCES": (3, 0, 5),
     "GROUNDING_MAX_FOCAL_URLS": (8, 1, 16),
     "GROUNDING_MAX_SOURCE_REQUESTS": (10, 1, 20),
-    "GROUNDING_MAX_SOURCE_BYTES": (2_097_152, 65_536, 8_388_608),
+    "GROUNDING_MAX_SOURCE_BYTES": (4_194_304, 65_536, 8_388_608),
     # 960s preserves 30s each for fallback/fetch after Sol's 900s window.
     "GROUNDING_SOURCE_COLLECTION_TIMEOUT": (960, 960, 1_800),
-    "GROUNDING_MAX_EVIDENCE_BYTES": (24_000, 4_096, 64_000),
+    "GROUNDING_MAX_EVIDENCE_BYTES": (65_536, 4_096, 65_536),
     "GROUNDING_FETCH_TIMEOUT": (15, 2, 30),
     "GROUNDING_TRACE_RETENTION_DAYS": (14, 1, 30),
     "PHOTO_REFERENCE_MAX_AGE": (1_800, 60, 86_400),
@@ -804,6 +809,7 @@ _state_lock = threading.RLock()
 _PROC_POOL = ThreadPoolExecutor(max_workers=6, thread_name_prefix="msgproc")
 _sender_locks: dict[tuple[int, int], threading.Lock] = {}
 _sender_locks_guard = threading.Lock()
+_private_history = PrivateConversationHistory()
 
 
 def _sender_lock_for(key: tuple[int, int]) -> threading.Lock:
@@ -856,6 +862,11 @@ def _ensure_chat_table():
         if "event_time" not in columns:
             conn.execute("ALTER TABLE chat_history ADD COLUMN event_time TEXT")
             log.info("Migrated chat_history: added event_time column")
+        if "sender_id" not in columns:
+            conn.execute("ALTER TABLE chat_history ADD COLUMN sender_id INTEGER")
+        if "text_complete" not in columns:
+            conn.execute("ALTER TABLE chat_history ADD COLUMN text_complete INTEGER")
+        task_provenance.ensure_schema(conn)
         # Track our own actions (commands sent via [GROUP], bets placed, etc.)
         conn.execute("""CREATE TABLE IF NOT EXISTS own_actions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -945,6 +956,19 @@ def _ensure_chat_table():
             seen_at    TEXT NOT NULL,
             PRIMARY KEY (chat_id, message_id)
         )""")
+        # Bind a sent Benthic message to each exact document used by its
+        # grounding turn. The receipt intentionally excludes file IDs, bodies,
+        # prompts, provider output, and temporary paths.
+        conn.execute("""CREATE TABLE IF NOT EXISTS reply_document_sources (
+            chat_id             INTEGER NOT NULL,
+            topic_id            INTEGER NOT NULL DEFAULT 0,
+            bot_message_id      INTEGER NOT NULL,
+            document_message_id INTEGER NOT NULL,
+            created_at          TEXT NOT NULL,
+            PRIMARY KEY (
+                chat_id, topic_id, bot_message_id, document_message_id
+            )
+        )""")
         conn.execute("""CREATE TABLE IF NOT EXISTS reply_grounding_traces (
             trace_id TEXT PRIMARY KEY,
             chat_id INTEGER NOT NULL,
@@ -1014,8 +1038,13 @@ _TRACE_MEDIA_TELEGRAM_REF_RE = re.compile(
 )
 _TRACE_X_REF_RE = re.compile(r"x:[0-9]{1,19}(?::quote)?", re.ASCII)
 _TRACE_WEB_REF_RE = re.compile(r"web:[0-9a-f]{20}", re.ASCII)
+_TRACE_YOUTUBE_REF_RE = re.compile(
+    r"youtube:([A-Za-z0-9_-]{11})", re.ASCII
+)
 _TRACE_RUNTIME_REF_RE = re.compile(
-    r"runtime:(?:activity|own_actions|positions):[0-9a-f]{20}", re.ASCII
+    r"runtime:(?:activity|own_actions|positions|model_routing|frozen_markets|failure_log|source_failure|task_context|onchain)"
+    r":[0-9a-f]{20}",
+    re.ASCII,
 )
 _TRACE_SANDBOX_REF_RE = re.compile(
     r"sandbox:(0|-?[1-9][0-9]{0,18}):([1-9][0-9]{0,18}):[0-9a-f]{20}",
@@ -1036,6 +1065,11 @@ _TRACE_FAILURE_KINDS = frozenset({
     "providers_failed", "verification_unavailable", "repair_unavailable",
     "verification_failed", "focal_unavailable", "media_unavailable",
     "media_ambiguous",
+    "reference_ambiguous", "reference_unavailable", "referenced_source_unavailable",
+    "task_reference_ambiguous", "task_reference_unavailable",
+    "youtube_captions_unavailable",
+    "telegram_message_unavailable",
+    "market_data_unavailable", "onchain_data_unavailable",
     "research_unavailable", "research_sources_unavailable",
     "research_evidence_insufficient", "source_collection_timeout",
 })
@@ -1043,7 +1077,7 @@ _TRACE_FETCH_STATUSES = frozenset({"ok", "not_fetched", "unavailable", "blocked"
 _TRACE_EFFORTS = frozenset({
     "none", "low", "medium", "high", "xhigh", "ultra", "max", "default",
 })
-_TRACE_TIERS = frozenset({"classification", "default"})
+_TRACE_TIERS = frozenset({"classification", "grounding_verifier", "chat_reply", "default"})
 
 
 class TraceSerializationError(ValueError):
@@ -1099,6 +1133,12 @@ def _trace_source_ref(kind, value):
     if kind in {"current_message", "reply_message", "conversation_message"}:
         return _trace_telegram_source_ref(source_ref, _TRACE_TELEGRAM_REF_RE)
     if kind in {"focal_url", "background_url"}:
+        youtube = _TRACE_YOUTUBE_REF_RE.fullmatch(source_ref)
+        if youtube is not None:
+            digest = hashlib.sha256(
+                youtube.group(1).encode("ascii")
+            ).hexdigest()[:20]
+            return f"youtube_hash:{digest}"
         valid = (
             _TRACE_X_REF_RE.fullmatch(source_ref) is not None
             or _TRACE_WEB_REF_RE.fullmatch(source_ref) is not None
@@ -1281,6 +1321,14 @@ def _serialize_grounding_trace(evidence, result, fetch_statuses):
             )
         elif item.artifact_hash is not None:
             raise TraceSerializationError("unexpected artifact hash")
+        if item.reader is not None:
+            if kind not in {"focal_url", "background_url"} or item.reader not in {"http", "browser"}:
+                raise TraceSerializationError("invalid source reader")
+            manifest_item["reader"] = item.reader
+        if item.truncated is not None:
+            if kind not in {"focal_url", "background_url"} or type(item.truncated) is not bool:
+                raise TraceSerializationError("invalid source truncation flag")
+            manifest_item["truncated"] = item.truncated
         manifest.append(manifest_item)
         if evidence_id in evidence.focal_ids:
             if not (
@@ -1840,12 +1888,12 @@ def save_chat_message(msg: dict, our_reply: str = None):
             conn.execute(
                 """INSERT OR IGNORE INTO chat_history
                    (msg_id, chat_id, topic_id, reply_to_msg_id, sender_username,
-                    sender_is_bot, text, our_reply, timestamp, event_time)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    sender_is_bot, text, our_reply, timestamp, event_time, sender_id, text_complete)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     msg["message_id"],
                     msg.get("chat", {}).get("id", 0),
-                    msg.get("message_thread_id"),
+                    conversation_topic_id(msg) or None,
                     reply_to_msg_id,
                     sender.get("username", sender.get("first_name", "?")),
                     int(sender.get("is_bot", False)),
@@ -1853,8 +1901,25 @@ def save_chat_message(msg: dict, our_reply: str = None):
                     (our_reply or "")[:2000],
                     observed_at,
                     event_time,
+                    sender.get("id") if type(sender.get("id")) is int else None,
+                    int(len(msg.get("text") or msg.get("caption") or "") <= task_provenance.MAX_MESSAGE_CHARS),
                 ),
             )
+            if our_reply is not None:
+                # Task provenance can witness the inbound row before sending.
+                # A confirmed publication must still attach its answer without
+                # replacing the original body or clearing earlier reply text.
+                conn.execute(
+                    "UPDATE chat_history SET our_reply = ? "
+                    "WHERE msg_id = ? AND chat_id = ? AND text = ? "
+                    "AND sender_id IS ?",
+                    (
+                        str(our_reply)[:2000], msg["message_id"],
+                        msg.get("chat", {}).get("id", 0),
+                        (msg.get("text") or msg.get("caption") or "")[:2000],
+                        sender.get("id") if type(sender.get("id")) is int else None,
+                    ),
+                )
             conn.commit()
     except Exception as e:
         log.warning(f"Failed to save chat message: {e}")
@@ -1985,19 +2050,23 @@ def get_chat_history(limit: int = 20, chat_id: int = 0, topic_id: int | None = N
 def _get_structured_chat_history(
         limit: int = 20,
         chat_id: int = 0,
-        topic_id: int | None = None) -> list[dict]:
+        topic_id: int | None = None,
+        is_forum: bool | None = None) -> list[dict]:
     """Return bounded rows without flattening reply or author metadata."""
     try:
         where = ""
         params = []
         if chat_id:
-            where = " WHERE chat_id = ? AND COALESCE(topic_id, 0) = ?"
-            params.extend((chat_id, topic_id or 0))
+            where = " WHERE chat_id = ?"
+            params.append(chat_id)
+            if is_forum is not False:
+                where += " AND COALESCE(topic_id, 0) = ?"
+                params.append(topic_id or 0)
         params.append(limit)
         with _db(row_factory=True) as conn:
             rows = conn.execute(
                 "SELECT msg_id, chat_id, topic_id, reply_to_msg_id, "
-                "sender_username, sender_is_bot, text, our_reply, timestamp, "
+                "sender_username, sender_id, sender_is_bot, text, text_complete, our_reply, timestamp, "
                 "event_time "
                 f"FROM chat_history{where} ORDER BY id DESC LIMIT ?",
                 tuple(params),
@@ -2009,11 +2078,13 @@ def _get_structured_chat_history(
                 "message_id": row["msg_id"],
                 "reply_to_msg_id": row["reply_to_msg_id"],
                 "sender": row["sender_username"] or "?",
+                "sender_id": row["sender_id"],
                 "sender_is_bot": bool(row["sender_is_bot"]),
                 "text": row["text"] or "",
+                "text_complete": task_provenance.history_text_complete(row["text"], row["text_complete"]),
                 "timestamp": canonical_event_time(row["event_time"]),
                 "chat_id": row["chat_id"],
-                "topic_id": row["topic_id"],
+                "topic_id": None if is_forum is False else row["topic_id"],
             })
             if row["our_reply"]:
                 result.append({
@@ -2025,7 +2096,7 @@ def _get_structured_chat_history(
                     "text": row["our_reply"],
                     "timestamp": canonical_event_time(row["timestamp"]),
                     "chat_id": row["chat_id"],
-                    "topic_id": row["topic_id"],
+                    "topic_id": None if is_forum is False else row["topic_id"],
                 })
         return result
     except Exception as exc:
@@ -2081,15 +2152,18 @@ def get_recent_activity() -> str:
                 safe_headline = sanitize_untrusted(a['headline'] or '', max_len=200)
                 lines.append(f"  - {safe_headline} ({a['posted_at'][:10]})")
         if comments:
-            lines.append("\nRECENT COMMENTS I WROTE:")
+            lines.append("\nRECENT COMMENTS I WROTE (Leviathan News article comments, "
+                         "not messages in this Telegram chat):")
             for c in comments:
                 safe_comment = sanitize_untrusted(c['comment_text'] or '', max_len=300)
-                lines.append(f"  - On article {c['ln_article_id']}: {safe_comment}")
+                lines.append(f"  - {str(c['commented_at'])[:10]} on LN article "
+                             f"https://leviathannews.xyz/{int(c['ln_article_id'])}: {safe_comment}")
         if replies:
-            lines.append("\nRECENT REPLIES TO USERS:")
+            lines.append("\nRECENT REPLIES TO USERS ON LEVIATHAN NEWS ARTICLES:")
             for r in replies:
                 safe_reply = sanitize_untrusted(r['reply_text'] or '', max_len=80)
-                lines.append(f"  - On article {r['article_id']}: {safe_reply}")
+                lines.append(f"  - {str(r['replied_at'])[:10]} on LN article "
+                             f"https://leviathannews.xyz/{int(r['article_id'])}: {safe_reply}")
         return "\n".join(lines)
     except Exception as e:
         log.warning(f"Failed to load activity from DB: {e}")
@@ -2098,6 +2172,7 @@ def get_recent_activity() -> str:
 
 _MAX_OWN_ACTIONS_ROWS = 5000  # Keep last 5000 own_actions (trades, messages, replies)
 _MAX_SEEN_DOCUMENTS_ROWS = 500
+_MAX_REPLY_DOCUMENT_SOURCES_ROWS = 500
 
 def _prune_chat_history():
     """Prune bounded history, action, photo, and document metadata tables."""
@@ -2148,6 +2223,26 @@ def _prune_chat_history():
                 log.info(
                     "Pruned %s old seen_documents rows", deleted_documents
                 )
+            # Reply-document receipts are useful only while the corresponding
+            # witnessed document may still be re-fetched. Apply the same age
+            # cutoff and a separate global cap so provenance cannot grow
+            # without bound in active chats.
+            deleted_reply_sources = conn.execute(
+                "DELETE FROM reply_document_sources WHERE created_at < ?",
+                (cutoff,),
+            ).rowcount
+            deleted_reply_sources += conn.execute(
+                "DELETE FROM reply_document_sources WHERE rowid NOT IN "
+                "(SELECT rowid FROM reply_document_sources "
+                "ORDER BY created_at DESC LIMIT ?)",
+                (_MAX_REPLY_DOCUMENT_SOURCES_ROWS,),
+            ).rowcount
+            if deleted_reply_sources > 0:
+                log.info(
+                    "Pruned %s reply_document_sources rows",
+                    deleted_reply_sources,
+                )
+            task_provenance.prune(conn)
             conn.commit()
         _prune_grounding_traces()
     except Exception as e:
@@ -2328,6 +2423,10 @@ def _split_long_message(text: str, max_len: int = 4096) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
+_SENT_MESSAGE_IDS_KEY = "_benthic_sent_message_ids"
+_SENT_MESSAGES_KEY = "_benthic_sent_messages"
+
+
 def send_message(chat_id: int, text: str, thread_id: int = None,
                   reply_to: int = None) -> dict:
     """Send a message, automatically splitting if it exceeds Telegram's 4096-char limit.
@@ -2342,6 +2441,8 @@ def send_message(chat_id: int, text: str, thread_id: int = None,
     text = sanitize_bot_commands(text)
     chunks = _split_long_message(text)
     last_result = {}
+    sent_message_ids = []
+    sent_messages = []
     for chunk in chunks:
         data = {"chat_id": chat_id, "text": chunk}
         if thread_id:
@@ -2349,11 +2450,28 @@ def send_message(chat_id: int, text: str, thread_id: int = None,
         if reply_to:
             data["reply_to_message_id"] = reply_to
         last_result = tg_request("sendMessage", data)
+        # Preserve every Telegram-confirmed output ID so downstream provenance
+        # can bind any split chunk without inferring sequential message IDs.
+        if isinstance(last_result, dict) and last_result.get("ok"):
+            sent_id = _strict_message_id(
+                last_result.get("result", {}).get("message_id")
+            )
+            if sent_id is not None:
+                sent_message_ids.append(sent_id)
+                delivered = last_result.get("result", {})
+                sent_messages.append({
+                    "message_id": sent_id,
+                    "text": delivered.get("text", chunk),
+                    "date": delivered.get("date", int(time.time())),
+                })
         # Only reply_to the original message for the first chunk
         reply_to = None
         if len(chunks) > 1:
             time.sleep(0.3)  # small delay between chunks to avoid rate limits
-    return last_result
+    result = dict(last_result) if isinstance(last_result, dict) else {}
+    result[_SENT_MESSAGE_IDS_KEY] = tuple(sent_message_ids)
+    result[_SENT_MESSAGES_KEY] = tuple(sent_messages)
+    return result
 
 
 # ─── Media Download & Analysis ─────────────────────────────────────────────
@@ -2364,7 +2482,9 @@ MAX_MEDIA_SIZE = 10 * 1024 * 1024  # 10MB max download
 MAX_ATTACHED_PHOTOS = int(os.environ.get("MAX_ATTACHED_PHOTOS", "3"))
 PHOTO_RETENTION_DAYS = int(os.environ.get("PHOTO_RETENTION_DAYS", "7"))
 _MAX_SEEN_PHOTOS_ROWS = 500
-MAX_TEXT_DOCUMENT_CHARS = 16_000
+# Prompt-visible text documents are bounded by encoded size so multilingual
+# content consumes the same deterministic evidence budget as ASCII content.
+MAX_TEXT_DOCUMENT_BYTES = 48_000
 _PHOTO_MARKER_RE = re.compile(r'\[photo#(\d+)\]')
 _GROUNDING_PROVENANCE_TOKEN = object()
 _GROUNDING_PHOTO_ORIGIN_MESSAGE_ID = "_grounding_photo_origin_message_id"
@@ -2529,6 +2649,312 @@ def _strict_message_id(value) -> int | None:
     return value
 
 
+_REPLY_DOCUMENT_SOURCE_REF_RE = re.compile(
+    r"telegram:(-?[0-9]+):([1-9][0-9]*):attachment"
+)
+
+
+def _document_source_ids_from_manifest(
+        manifest: str, chat_id: int) -> tuple[int, ...]:
+    """Extract exact same-chat document IDs from bounded trace metadata.
+
+    The parser accepts only a complete Telegram attachment source reference.
+    Other media, malformed JSON, suffixes, prefixes, and cross-chat references
+    provide no authority to create a reply receipt.
+    """
+    if (
+        not isinstance(manifest, str)
+        or len(manifest) > 262_144
+        or type(chat_id) is not int
+    ):
+        return ()
+    try:
+        items = json.loads(manifest)
+    except (json.JSONDecodeError, UnicodeError):
+        return ()
+    if not isinstance(items, list):
+        return ()
+    source_ids = []
+    for item in items:
+        if not isinstance(item, dict) or item.get("kind") != "media":
+            continue
+        source_ref = item.get("source_ref")
+        if not isinstance(source_ref, str):
+            continue
+        match = _REPLY_DOCUMENT_SOURCE_REF_RE.fullmatch(source_ref)
+        if match is None:
+            continue
+        try:
+            source_chat_id = int(match.group(1))
+            source_message_id = int(match.group(2))
+        except (TypeError, ValueError, OverflowError):
+            continue
+        source_message_id = _strict_message_id(source_message_id)
+        if (
+            source_chat_id == chat_id
+            and source_message_id is not None
+            and source_message_id not in source_ids
+        ):
+            source_ids.append(source_message_id)
+    return tuple(source_ids)
+
+
+def _record_reply_document_sources(
+        chat_id: int, topic_id: int, inbound_message_id: int,
+        sent_message_ids) -> int:
+    """Persist exact outgoing-reply/document receipts from a trusted trace.
+
+    Every identifier is independently validated and the source document must
+    already exist in the same chat/topic metadata index. Storage failures are
+    explicit in logs but never convert an already-published reply into failure.
+    """
+    inbound_id = _strict_message_id(inbound_message_id)
+    if (
+        type(chat_id) is not int
+        or type(topic_id) is not int
+        or inbound_id is None
+        or not isinstance(sent_message_ids, (list, tuple))
+    ):
+        return 0
+    valid_sent_ids = []
+    for value in sent_message_ids:
+        sent_id = _strict_message_id(value)
+        if sent_id is not None and sent_id not in valid_sent_ids:
+            valid_sent_ids.append(sent_id)
+    if not valid_sent_ids:
+        return 0
+    try:
+        with _db(row_factory=True) as conn:
+            trace = conn.execute(
+                "SELECT evidence_manifest FROM reply_grounding_traces "
+                "WHERE chat_id = ? AND message_id = ? "
+                "ORDER BY created_at DESC, rowid DESC LIMIT 1",
+                (chat_id, inbound_id),
+            ).fetchone()
+            if trace is None:
+                return 0
+            source_ids = _document_source_ids_from_manifest(
+                trace["evidence_manifest"], chat_id
+            )
+            if not source_ids:
+                return 0
+            placeholders = ",".join("?" for _ in source_ids)
+            rows = conn.execute(
+                "SELECT message_id FROM seen_documents "
+                "WHERE chat_id = ? AND COALESCE(topic_id, 0) = ? "
+                f"AND message_id IN ({placeholders})",
+                (chat_id, topic_id, *source_ids),
+            ).fetchall()
+            witnessed_ids = {
+                row["message_id"] for row in rows
+                if _strict_message_id(row["message_id"]) is not None
+            }
+            if not witnessed_ids:
+                return 0
+            created_at = datetime.now(timezone.utc).isoformat()
+            inserted = 0
+            for sent_id in valid_sent_ids:
+                for source_id in sorted(witnessed_ids):
+                    cursor = conn.execute(
+                        "INSERT OR IGNORE INTO reply_document_sources "
+                        "(chat_id, topic_id, bot_message_id, "
+                        "document_message_id, created_at) "
+                        "VALUES (?, ?, ?, ?, ?)",
+                        (
+                            chat_id,
+                            topic_id,
+                            sent_id,
+                            source_id,
+                            created_at,
+                        ),
+                    )
+                    inserted += max(cursor.rowcount, 0)
+            conn.commit()
+            return inserted
+    except (sqlite3.Error, TypeError, ValueError, UnicodeError) as exc:
+        log.warning("reply_document_source_storage_failed: %s", exc)
+        return 0
+
+
+_TASK_CONTEXT_TOKEN = object()
+
+
+def _restore_reply_task(msg, *, direct):
+    """Authenticate one task, then classify whether this reply continues it.
+
+    The handled flag prevents rejected receipt decisions from falling through
+    to a second, less authoritative recent-link selector in the same turn.
+    """
+    if not direct or _has_current_media(msg):
+        return None, None, False
+    if task_provenance.has_explicit_source(msg):
+        return None, None, True
+    try:
+        with _db() as conn:
+            candidate = task_provenance.restore(conn, msg)
+    except task_provenance.TaskReceiptUnavailable:
+        return None, "task_reference_unavailable", True
+    except (sqlite3.Error, TypeError, ValueError, UnicodeError):
+        log.warning("reply_task_restore_failed", exc_info=True)
+        return None, "task_reference_unavailable", True
+    if candidate is None:
+        return None, None, False
+
+    def parse(raw):
+        value = json_object(raw)
+        if set(value) != {"decision", "root_message_id"}:
+            raise GroundingFailure("invalid task continuation contract")
+        decision, root_id = value["decision"], value["root_message_id"]
+        if decision == "continue":
+            if type(root_id) is not int or root_id != candidate.root_message_id:
+                raise GroundingFailure("unwitnessed task continuation")
+        elif not isinstance(decision, str) or decision not in {"new_task", "ambiguous"} or root_id is not None:
+            raise GroundingFailure("invalid task continuation decision")
+        return decision
+
+    request_ids = {item.message_id for item in candidate.requests}
+    source_ids = {item.message_id for item in candidate.sources}
+    witnessed = {item.message_id: item for item in (*candidate.requests, *candidate.sources)}
+    prompt = load_prompt(
+        "bot/task_continuation",
+        agent_name=AGENT_NAME,
+        root_message_id=candidate.root_message_id,
+        task_messages=json.dumps([{
+            "message_id": item.message_id,
+            "request": item.message_id in request_ids,
+            "source": item.message_id in source_ids,
+            "text": sanitize_untrusted(item.text, max_len=2000),
+        } for item in witnessed.values()], ensure_ascii=False),
+        reply_target=sanitize_untrusted(_msg_text(msg.get("reply_to_message") or {}), max_len=1000),
+        current_message=sanitize_untrusted(_msg_text(msg), max_len=2000),
+    )
+    receipt = _provider_chain.ask_validated(
+        prompt, validator=lambda raw: _parse_contract(parse, raw),
+        timeout=min(ENGAGEMENT_TIMEOUT, 120), tools="__none__",
+        tier="classification", permission_profile="benthic_bot",
+    )
+    if receipt is None:
+        return None, "task_reference_unavailable", True
+    try:
+        decision = parse(receipt.text)
+    except GroundingFailure:
+        return None, "task_reference_unavailable", True
+    if decision == "continue":
+        return candidate, None, True
+    if decision == "ambiguous":
+        return None, "task_reference_ambiguous", True
+    return None, None, True
+
+
+def _authoritative_task_source(msg, selected, recent_messages):
+    """Resolve a selected ID back to its complete original history witness."""
+    selected_id = _strict_message_id(selected.get("message_id"))
+    if selected_id is None:
+        return None
+    # Recent selectors contain sanitized text for the model. Persist the raw
+    # incoming witness first when available, never the selector's projection.
+    for source in reversed(recent_messages):
+        if (source.get("message_id") == selected_id
+                and any(item["message_id"] == selected_id for item in
+                        conversation_link_candidates(msg, [source], []))):
+            save_chat_message(source)
+            break
+    try:
+        with _db(row_factory=True) as conn:
+            row = conn.execute(
+                "SELECT topic_id, sender_id, sender_username, sender_is_bot, text, "
+                "text_complete, event_time FROM chat_history WHERE chat_id=? AND msg_id=?",
+                (msg.get("chat", {}).get("id"), selected_id),
+            ).fetchone()
+        if row is None or not task_provenance.history_text_complete(row["text"], row["text_complete"]):
+            return None
+        source = {
+            "message_id": selected_id, "chat": dict(msg.get("chat", {})),
+            "message_thread_id": row["topic_id"],
+            "from": {"id": row["sender_id"], "username": row["sender_username"],
+                     "is_bot": bool(row["sender_is_bot"])},
+            "text": row["text"], "event_time": row["event_time"],
+        }
+        eligible = conversation_link_candidates(msg, [source], [])
+        if not any(item["message_id"] == selected_id
+                   and item["text"] == selected.get("text")
+                   and item["event_time"] == selected.get("event_time")
+                   for item in eligible):
+            return None
+        return source
+    except (sqlite3.Error, TypeError, ValueError, UnicodeError):
+        log.warning("reply_task_source_lookup_failed", exc_info=True)
+        return None
+
+
+def _prepare_reply_task(msg, referenced_message, restored, *, is_private, recent_messages=()):
+    """Capture exact witnessed source/request IDs for this generation only.
+
+    The opaque token prevents ingress dictionaries from supplying provenance.
+    Existing public history owns the text; private conversations do not gain a
+    new persistent body store through task continuity.
+    """
+    msg.pop("_reply_task_context", None)
+    msg.pop("_reply_task_token", None)
+    if is_private:
+        return None
+    sources = []
+    if restored is not None:
+        context = restored.continue_with(msg)
+    else:
+        if _CURRENT_HTTP_URL_RE.search(_msg_text(msg)):
+            sources.append(msg)
+        elif referenced_message is not None:
+            source = _authoritative_task_source(msg, referenced_message, recent_messages)
+            if source is None:
+                return None
+            sources.append(source)
+        reply = msg.get("reply_to_message") or {}
+        if (not reply.get("from", {}).get("is_bot")
+                and _CURRENT_HTTP_URL_RE.search(_msg_text(reply))):
+            source = dict(reply)
+            source.setdefault("chat", dict(msg.get("chat", {})))
+            source.setdefault("message_thread_id", conversation_topic_id(msg))
+            sources.append(source)
+        context = task_provenance.create_context(msg, sources)
+    if context is None:
+        return None
+    try:
+        # Background-only URLs and links outside the existing history text
+        # bound cannot authorize a future focal task from an incomplete row.
+        if not all(_classified_message_urls(item.text)[0] for item in context.sources):
+            return None
+    except GroundingFailure:
+        return None
+    # Preserve original author labels in the ordinary history store. Restored
+    # rows already exist and must not be rewritten from a derived structure.
+    save_chat_message(msg)
+    for source in sources:
+        save_chat_message(source)
+    msg["_reply_task_context"] = context
+    msg["_reply_task_token"] = _TASK_CONTEXT_TOKEN
+    return context
+
+
+def _record_reply_task_sources(msg, sent_message_ids):
+    """Bind only Telegram-confirmed creative chunks to this turn's task."""
+    context = msg.get("_reply_task_context")
+    if (msg.get("_reply_task_token") is not _TASK_CONTEXT_TOKEN
+            or not isinstance(context, task_provenance.TaskContext)
+            or not context.valid_for(msg)):
+        return 0
+    try:
+        with _db() as conn:
+            inserted = task_provenance.record(conn, context, sent_message_ids)
+            conn.commit()
+            return inserted
+    except (sqlite3.Error, TypeError, ValueError, UnicodeError):
+        # Publication already happened. Expose storage failure in the log and
+        # leave a later continuation without authority to infer a receipt.
+        log.warning("reply_task_storage_failed", exc_info=True)
+        return 0
+
+
 def _has_photo_media(message: dict) -> bool:
     """Recognize only Telegram-shaped photo payloads."""
     photos = message.get("photo")
@@ -2644,6 +3070,7 @@ class DocumentSelection:
 
     message_ids: tuple[int, ...] = ()
     ambiguous: bool = False
+    max_age_seconds: int = PHOTO_REFERENCE_MAX_AGE
 
 
 def _select_grounding_document_ids(
@@ -2653,6 +3080,74 @@ def _select_grounding_document_ids(
         chat_id, topic_id = _topic_key(msg)
     except (TypeError, ValueError, OverflowError):
         return DocumentSelection()
+    # A direct reply to Benthic may continue the exact document task that
+    # produced the replied-to bot message. Only trusted Telegram bot metadata
+    # and a same-scope persisted receipt can extend selection beyond the
+    # generic recent-document window.
+    reply = msg.get("reply_to_message")
+    reply_from = reply.get("from") if isinstance(reply, dict) else None
+    reply_username = (
+        reply_from.get("username") if isinstance(reply_from, dict) else None
+    )
+    reply_target_id = (
+        _strict_message_id(reply.get("message_id"))
+        if isinstance(reply, dict)
+        else None
+    )
+    receipt_max_age = max(0, PHOTO_RETENTION_DAYS * 86_400)
+    if (
+        direct
+        and reply_target_id is not None
+        and isinstance(reply_from, dict)
+        and reply_from.get("is_bot") is True
+        and isinstance(reply_username, str)
+        and bool(BOT_USERNAME)
+        and reply_username.casefold() == BOT_USERNAME
+        and receipt_max_age > 0
+    ):
+        receipt_cutoff = (
+            datetime.now(timezone.utc)
+            - timedelta(seconds=receipt_max_age)
+        ).isoformat()
+        try:
+            with _db(row_factory=True) as conn:
+                receipt_rows = conn.execute(
+                    "SELECT r.document_message_id "
+                    "FROM reply_document_sources AS r "
+                    "JOIN seen_documents AS d "
+                    "ON d.chat_id = r.chat_id "
+                    "AND COALESCE(d.topic_id, 0) = r.topic_id "
+                    "AND d.message_id = r.document_message_id "
+                    "WHERE r.chat_id = ? AND r.topic_id = ? "
+                    "AND r.bot_message_id = ? AND r.created_at >= ? "
+                    "AND d.seen_at >= ? "
+                    "ORDER BY r.document_message_id",
+                    (
+                        chat_id,
+                        topic_id,
+                        reply_target_id,
+                        receipt_cutoff,
+                        receipt_cutoff,
+                    ),
+                ).fetchall()
+        except Exception as exc:
+            log.debug("reply_document_sources selection failed: %s", exc)
+            receipt_rows = ()
+        receipt_ids = tuple(dict.fromkeys(
+            source_id
+            for row in receipt_rows
+            if (source_id := _strict_message_id(
+                row["document_message_id"]
+            )) is not None
+        ))
+        if len(receipt_ids) == 1:
+            return DocumentSelection(
+                receipt_ids, False, receipt_max_age
+            )
+        if len(receipt_ids) > 1:
+            return DocumentSelection(
+                (), True, receipt_max_age
+            )
     current_id = _strict_message_id(msg.get("message_id"))
     excluded_ids = {current_id} if current_id is not None else set()
     if _has_text_document(msg):
@@ -2678,7 +3173,6 @@ def _select_grounding_document_ids(
         row for row in rows
         if _strict_message_id(row["message_id"]) not in excluded_ids
     ]
-    reply = msg.get("reply_to_message")
     if isinstance(reply, dict) and _has_text_document(reply):
         reply_id = _strict_message_id(reply.get("message_id"))
         if reply_id is None:
@@ -2855,18 +3349,26 @@ def _attach_recent_photos(
 
 def _attach_recent_documents(
         selected_message_ids, chat_id: int,
-        topic_id: int | None) -> tuple[AttachedDocument, ...]:
+        topic_id: int | None, *,
+        max_age_seconds: int = PHOTO_REFERENCE_MAX_AGE,
+        ) -> tuple[AttachedDocument, ...]:
     """Rehydrate one selected text document without returning its file ID."""
     ids = {
         value for value in selected_message_ids
         if _strict_message_id(value) is not None
     }
-    if len(ids) != 1 or (topic_id is not None and type(topic_id) is not int):
+    maximum_age = max(0, PHOTO_RETENTION_DAYS * 86_400)
+    if (
+        len(ids) != 1
+        or (topic_id is not None and type(topic_id) is not int)
+        or type(max_age_seconds) is not int
+        or not 0 <= max_age_seconds <= maximum_age
+    ):
         return ()
     message_id = next(iter(ids))
     cutoff = (
         datetime.now(timezone.utc)
-        - timedelta(seconds=PHOTO_REFERENCE_MAX_AGE)
+        - timedelta(seconds=max_age_seconds)
     ).isoformat()
     try:
         with _db(row_factory=True) as conn:
@@ -2912,16 +3414,28 @@ def _attach_recent_documents(
 
 def _render_text_document(
         path: str, file_name: str, file_size: int | None) -> str:
-    """Render a sanitized 16K excerpt with explicit scope metadata."""
+    """Render a UTF-8-byte-bounded sanitized document with scope metadata."""
     try:
         raw = Path(path).read_text(errors="replace")
     except OSError as exc:
         log.debug("Text document read failed: %s", exc)
         return ""
-    excerpt = sanitize_untrusted(raw, max_len=MAX_TEXT_DOCUMENT_CHARS)
-    safe_name = sanitize_untrusted(file_name, max_len=200) or "file"
+    # Sanitize the complete body before measuring it so the truncation label
+    # describes exactly the prompt-visible representation, not discarded
+    # control characters or invalid surrogate data.
+    normalized = unicodedata.normalize("NFKC", raw)
+    sanitized = sanitize_untrusted(normalized, max_len=len(normalized))
+    # Match the evidence normalizer before measuring completeness. Otherwise
+    # NFKC expansion or marker replacement could cut the tail downstream while
+    # leaving a stale ``truncated=false`` label in the metadata header.
+    sanitized = _PHOTO_MARKER_RE.sub("[photo omitted]", sanitized)
+    excerpt = truncate_utf8(sanitized, MAX_TEXT_DOCUMENT_BYTES)
+    normalized_name = unicodedata.normalize("NFKC", str(file_name or ""))
+    safe_name = truncate_utf8(
+        sanitize_untrusted(normalized_name, max_len=len(normalized_name)), 200
+    ) or "file"
     byte_label = file_size if type(file_size) is int else "unknown"
-    truncated = len(raw) > MAX_TEXT_DOCUMENT_CHARS
+    truncated = len(sanitized.encode("utf-8")) > MAX_TEXT_DOCUMENT_BYTES
     return (
         f"[Attached text document: filename={safe_name}; bytes={byte_label}; "
         f"truncated={'true' if truncated else 'false'}]\n{excerpt}"
@@ -3015,32 +3529,45 @@ def check_thread_depth(msg: dict) -> bool:
 # ─── LLM Provider Layer (chain driven by PROVIDER_ORDER env) ────────────────
 
 from providers import ClaudeProvider, CodexProvider, ProviderChain
+import onchain_evidence
+from ln_archive import archive_url
 from reply_grounding import (
+    _classified_message_urls,
     ComposedReply,
     EvidenceBundle,
     EvidenceItem,
     GroundingFailure,
     ResearchPlan,
     SafeHttpFetcher,
+    TelegramMessageUnavailable,
     TwitterFocalFetcher,
     VerificationVerdict,
+    YouTubeTranscriptFetcher,
+    YouTubeTranscriptUnavailable,
     canonical_event_time,
     canonical_source_url,
     collect_background_candidates,
     collect_evidence,
+    conversation_link_candidates,
+    conversation_topic_id,
     final_disposition,
     json_object,
+    is_private_telegram_url,
     market_data_intent,
     naturalize_public_grounding_protocol,
     parse_composed_reply,
     parse_media_observations,
     parse_research_urls,
     parse_research_plan,
+    parse_telegram_message_url,
     parse_verification,
     parse_x_status_url,
+    parse_youtube_video_url,
     public_grounding_protocol_leaks,
     research_candidate_limit,
     resolve_twitter_fetcher,
+    resolve_telegram_fetcher,
+    telegram_linked_urls,
     with_exact_gecko_token_candidate,
 )
 
@@ -3064,6 +3591,10 @@ _claude_provider = ClaudeProvider(
     cwd=str(BASE_DIR),
     quota_cooldown=CLAUDE_LIMIT_COOLDOWN,
     wrapper=_bot_claude_wrapper,
+    tiers={
+        "classification": {"model": "sonnet", "effort": "low"},
+        "grounding_verifier": {"model": "sonnet", "effort": "low"},
+    },
 )
 _codex_provider = CodexProvider(
     bin=CODEX_BIN,
@@ -3072,9 +3603,16 @@ _codex_provider = CodexProvider(
     # Benthic's independent semantic gates use a stronger classification tier
     # without changing the shared provider defaults used by ln-agent.
     tiers={
+        "chat_reply": {"model": CODEX_REPLY_MODEL, "effort": CODEX_EFFORT},
         "classification": {
             "model": CODEX_CLASSIFY_MODEL,
             "effort": "medium",
+        },
+        # The final factual-support gate needs the higher effort verified by
+        # live attribution fixtures; pre-screen calls stay at medium.
+        "grounding_verifier": {
+            "model": CODEX_CLASSIFY_MODEL,
+            "effort": "high",
         },
     },
     cwd=str(BASE_DIR),
@@ -3083,7 +3621,7 @@ _codex_provider = CodexProvider(
     wrapper=_bot_codex_wrapper,
 )
 _provider_chain = ProviderChain.from_env_order(
-    "PROVIDER_ORDER", default="codex,claude",
+    "PROVIDER_ORDER", default="codex",
     providers={"claude": _claude_provider, "codex": _codex_provider},
 )
 log.info(f"LLM provider chain: {','.join(_provider_chain.names())}")
@@ -3137,11 +3675,63 @@ _NATURAL_BENTHIC_ADDRESS_RE = re.compile(
     rf"^\s*(?:hey(?:\s*,\s*|\s+))?{re.escape(AGENT_NAME.lower())}(?:\s+bot)?(?=\s|[:,!?]|$)",
     re.I,
 )
+_ADDRESS_DECORATION_MAX_CHARS = 8
+_ADDRESS_DECORATIVE_PUNCTUATION = frozenset("•·—–-»›")
+_FROZEN_MARKET_RE = re.compile(
+    r"\b(?:frozen|expired)\s+(?:prediction\s+)?markets?\b",
+    re.I,
+)
+_MARKET_RESOLUTION_RE = re.compile(
+    r"\b(?:resolv(?:e|ed|es|ing)|resolutions?|outcomes?|settle(?:d|ment)?)\b",
+    re.I,
+)
+_FROZEN_MARKET_MAX_ITEMS = 10
+_FROZEN_MARKET_MAX_RESPONSE_BYTES = 256 * 1024
+
+
+def _strip_bounded_address_decoration(text: str) -> str:
+    """Remove one bounded decorative prefix separated from the vocative."""
+    if not isinstance(text, str):
+        return ""
+    candidate = text.lstrip()
+    consumed = 0
+    saw_decoration = False
+    while consumed < min(len(candidate), _ADDRESS_DECORATION_MAX_CHARS):
+        char = candidate[consumed]
+        category = unicodedata.category(char)
+        if category.startswith("S") or char in _ADDRESS_DECORATIVE_PUNCTUATION:
+            saw_decoration = True
+            consumed += 1
+            continue
+        # Emoji variation selectors and enclosing marks are valid only after
+        # a symbol or explicitly allowlisted ornamental punctuation mark.
+        if saw_decoration and category in {"Mn", "Me"}:
+            consumed += 1
+            continue
+        break
+    if (
+        not saw_decoration
+        or consumed >= len(candidate)
+        or not candidate[consumed].isspace()
+    ):
+        return text
+    return candidate[consumed:].lstrip()
 
 
 def _is_natural_benthic_address(text: str) -> bool:
     """Recognize a leading Benthic vocative without matching later mentions."""
-    return bool(_NATURAL_BENTHIC_ADDRESS_RE.match(text or ""))
+    normalized = _strip_bounded_address_decoration(text)
+    return bool(_NATURAL_BENTHIC_ADDRESS_RE.match(normalized))
+
+
+def _is_frozen_market_resolution_request(text: str) -> bool:
+    """Recognize an explicit request to evaluate frozen market outcomes."""
+    if not isinstance(text, str):
+        return False
+    return bool(
+        _FROZEN_MARKET_RE.search(text)
+        and _MARKET_RESOLUTION_RE.search(text)
+    )
 
 
 def _parse_engagement(raw: str) -> EngagementDecision:
@@ -3153,9 +3743,11 @@ def _parse_engagement(raw: str) -> EngagementDecision:
         raise GroundingFailure("engagement response has invalid engage value")
     if (
         not isinstance(value["mode"], str)
-        or value["mode"] not in {"conversation", "grounded"}
+        or value["mode"] not in {"conversation", "grounded", "acknowledgment"}
     ):
         raise GroundingFailure("engagement response has invalid mode")
+    if value["mode"] == "acknowledgment" and value["engage"]:
+        raise GroundingFailure("acknowledgment cannot request engagement")
     return EngagementDecision(value["engage"], value["mode"])
 
 
@@ -3243,19 +3835,41 @@ def _decide_engagement(
         reply_target=_engagement_reply_target(msg),
         reply_hint=reply_hint,
     )
-    receipt = _provider_chain.ask_validated(
-        prompt,
-        validator=lambda value: _parse_contract(_parse_engagement, value),
-        timeout=ENGAGEMENT_TIMEOUT,
-        tools="__none__",
-        tier="classification",
-    )
-    if receipt is None:
-        return EngagementDecision(
-            is_direct,
-            "grounded" if (force_grounded or is_direct) else "conversation",
+    if jev.enabled("engagement"):
+        try:
+            result = jev.TaskEvaluator().engagement({
+                "current_message": safe_text[:300], "sender": sender_label,
+                "reply_target": _engagement_reply_target(msg),
+                "recent_messages": recent_lines, "reply_hint": reply_hint,
+                "direct_request": is_direct,
+            })
+            decision = _parse_engagement(json.dumps(result))
+        except jev.JevError as exc:
+            log.warning("JEV engagement unavailable: %s", exc)
+            return EngagementDecision(is_direct, "grounded" if is_direct else "conversation")
+    else:
+        receipt = _provider_chain.ask_validated(
+            prompt,
+            validator=lambda value: _parse_contract(_parse_engagement, value),
+            timeout=ENGAGEMENT_TIMEOUT,
+            tools="__none__",
+            tier="classification",
         )
-    decision = _parse_engagement(receipt.text)
+        if receipt is None:
+            return EngagementDecision(
+                is_direct,
+                "grounded" if (force_grounded or is_direct) else "conversation",
+            )
+        decision = _parse_engagement(receipt.text)
+    if decision.mode == "acknowledgment":
+        # A direct reply can close the conversation without requesting work.
+        # Only an explicit acknowledgment of the complete current text can
+        # override the direct-response default. Questions, unseen tails and
+        # attachments can contain requests despite a mistaken classification.
+        has_question = any(mark in safe_text for mark in ("?", "？", "¿", "؟"))
+        if not force_grounded and len(safe_text) <= 300 and not has_question:
+            return EngagementDecision(False, "conversation")
+        return EngagementDecision(is_direct, "grounded")
     engage = True if is_direct else decision.engage
     if force_grounded:
         return EngagementDecision(engage, "grounded")
@@ -3312,12 +3926,147 @@ def _render_evidence(evidence, kinds=None):
             "content_hash": item.content_hash,
             "artifact_hash": item.artifact_hash,
             "url": _render_evidence_url(item.url) if item.url else None,
+            "reader": item.reader,
+            "truncated": item.truncated,
         })
     return json.dumps(rows, ensure_ascii=False, separators=(",", ":"))
 
 
+
+def _render_requested_task(evidence):
+    """Carry conversation intent and authenticated requests through every stage.
+
+    Read only the fitted, sanitized evidence. A quoted bot answer or forged
+    runtime-looking text cannot become a prior user request by naming an ID.
+    """
+    current = next((item for item in evidence.items
+                    if item.kind == "current_message" and item.evidence_id == "M0"), None)
+    by_ref = {item.source_ref: item for item in evidence.items
+              if item.kind == "reply_message"}
+    prior = []
+    complete = True
+    context = evidence.task_context
+    if isinstance(context, task_provenance.TaskContext):
+        for request in context.requests:
+            if request.message_id == evidence.message_id:
+                continue
+            ref = f"telegram:{context.chat_id}:{request.message_id}"
+            item = by_ref.get(ref)
+            if item is None:
+                complete = False
+                continue
+            prior.append({"evidence_id": item.evidence_id, "text": item.text})
+    return load_prompt(
+        "bot/requested_task",
+        agent_name=AGENT_NAME,
+        turn_context=json.dumps({
+            "direct": evidence.direct,
+            "mode": evidence.mode,
+        }, ensure_ascii=True, separators=(",", ":")),
+        task_messages=json.dumps({
+            "current_request": {"evidence_id": "M0", "text": current.text if current else ""},
+            "prior_human_requests": prior,
+            "history_complete": complete,
+        }, ensure_ascii=False, separators=(",", ":")),
+    )
+
+
+def _collect_onchain_evidence(msg, context, *, permission_profile, deadline):
+    """Resolve a witnessed task, then run fixed read-only code before composing."""
+    if msg.get("from", {}).get("is_bot"):
+        return None
+    from reply_grounding import _evidence_item, _fit_evidence
+    texts = [_msg_text(msg)]
+    reply = msg.get("reply_to_message") or {}
+    if not reply.get("from", {}).get("is_bot"):
+        texts.append(_msg_text(reply))
+    if context is not None:
+        if not isinstance(context, task_provenance.TaskContext) or not context.valid_for(msg):
+            return None
+        texts.extend(source.text for source in context.sources)
+    allowed_tokens = set(re.findall(r"\b0x[0-9a-fA-F]{40}\b", "\n".join(
+        texts + ([request.text for request in context.requests] if context else [])
+    )))
+    focal, background = [], []
+    for text in texts:
+        try:
+            current_focal, current_background = _classified_message_urls(text)
+        except GroundingFailure:
+            # Let ordinary collection produce its existing typed source error.
+            # An optional adapter must not abort unrelated malformed-link turns.
+            return None
+        focal.extend(current_focal)
+        background.extend(current_background)
+    candidates = onchain_evidence.pool_candidates(url for url in focal if url not in background)
+    if not candidates:
+        return None
+    chat_id = int(msg.get("chat", {}).get("id", 0))
+    message_id = int(msg.get("message_id", 0))
+    items = [_evidence_item("M0", "current_message", sanitize_untrusted(_msg_text(msg), max_len=8000),
+                            f"telegram:{chat_id}:{message_id}")]
+    if context is not None:
+        for index, request in enumerate(context.requests, 2):
+            if request.message_id != message_id:
+                items.append(_evidence_item(f"R{index}", "reply_message",
+                    sanitize_untrusted(request.text, max_len=8000),
+                    f"telegram:{chat_id}:{request.message_id}"))
+    task = EvidenceBundle(uuid.uuid4().hex, chat_id, message_id, True, "grounded", (),
+                          _fit_evidence(items, GROUNDING_LIMITS.max_evidence_bytes), task_context=context)
+    def failure(code):
+        return make_item({"status": "error", "failure": code,
+                          "scope": "This turn could not retrieve pool swap history; no absence is established."})
+    def make_item(result):
+        text = onchain_evidence.receipt_text(result)
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        return EvidenceItem("", "runtime_receipt", text, "runtime:onchain:" + digest[:20], content_hash=digest)
+    now = datetime.now(timezone.utc)
+    remaining = deadline - time.monotonic()
+    if remaining < 145:
+        return failure("rpc_timeout")
+    prompt = load_prompt("bot/onchain_plan", requested_task=_render_requested_task(task),
+                       now_utc=now.isoformat(), candidates=json.dumps([asdict(c) for c in candidates]),
+                       source_context=json.dumps([
+                           sanitize_untrusted(value, max_len=2000) for value in texts[1:9]
+                       ], ensure_ascii=False))
+    def valid(raw):
+        try:
+            onchain_evidence.parse_plan(raw, candidates, now=now, allowed_tokens=allowed_tokens)
+            return True
+        except (ValueError, TypeError, KeyError):
+            return False
+    receipt = _provider_chain.ask_validated(
+        prompt, validator=valid, tools="__none__", tier="classification",
+        timeout=min(ENGAGEMENT_TIMEOUT, remaining - 140), deadline=deadline - 140,
+        permission_profile=permission_profile,
+    )
+    if receipt is None:
+        return failure("planner_unavailable")
+    plan = onchain_evidence.parse_plan(receipt.text, candidates, now=now, allowed_tokens=allowed_tokens)
+    if plan is None:
+        return None
+    if deadline - time.monotonic() < 140:
+        return failure("rpc_timeout")
+    try:
+        request = onchain_evidence.build_request(plan, timeout=95)
+        outcome = _run_sandbox(onchain_evidence.worker_code(request), msg, msg.get("from", {}))
+        if outcome.status != "ok":
+            return failure("sandbox_unavailable")
+        result = onchain_evidence.validate_result(outcome.output, request)
+    except (ValueError, TypeError, KeyError, OSError):
+        return failure("invalid_rpc_data")
+    log.info("On-chain collection status=%s complete=%s", result["status"],
+             result.get("coverage", {}).get("complete", False))
+    return make_item(result)
+
+
 def _render_evidence_url(value):
-    """Expose only trusted 4H aggregation metadata from source URL queries."""
+    """Preserve validated archive filters and exact 4H aggregation metadata."""
+    try:
+        archive = archive_url(value)
+    except (TypeError, ValueError):
+        archive = None
+    if archive is not None:
+        return archive
     parsed = urlparse(value)
     clean = parsed._replace(query="", fragment="")
     path = parsed.path.lower()
@@ -3380,7 +4129,16 @@ def _discover_background_sources(evidence, limits, *, deadline=None):
         (item.text for item in evidence.items if item.kind == "current_message"),
         "",
     )
-    has_market_intent = market_data_intent(current)
+    frozen_market_context = next((
+        item.text
+        for item in evidence.items
+        if item.kind == "runtime_receipt"
+        and item.source_ref.startswith("runtime:frozen_markets:")
+    ), "")
+    has_frozen_market_intent = bool(frozen_market_context)
+    has_market_intent = (
+        not has_frozen_market_intent and market_data_intent(current)
+    )
     excluded_urls = tuple(dict.fromkeys(
         tuple(
             item.url
@@ -3390,10 +4148,19 @@ def _discover_background_sources(evidence, limits, *, deadline=None):
     ))
     prompt = load_prompt(
         "bot/grounding_research",
+        now_utc=datetime.now(timezone.utc).isoformat(),
         max_sources=candidate_limit,
         current_message=current,
+        requested_task=_render_requested_task(evidence),
         focal_evidence=_render_evidence(evidence, {"focal_url"}),
+        trusted_runtime_context=frozen_market_context or "(none)",
         research_contract=(
+            "FROZEN MARKET RESOLUTION MODE. Return only a JSON object with "
+            "exactly source_urls. Find outcome evidence for every listed "
+            "market where possible, using no more than one strongest source "
+            "per market. The LN market listing establishes the question and "
+            "status only; it is not outcome evidence."
+            if has_frozen_market_intent else
             "MARKET MODE. Resolve the exact EVM network and contract first. "
             "Return only a JSON object with exactly network, asset_id, and "
             "sources. Each sources item has exactly url and role; role is "
@@ -3431,6 +4198,9 @@ def _discover_background_sources(evidence, limits, *, deadline=None):
         validator = lambda raw: _parse_contract(
             parse_research_urls, raw, discovery_limits, excluded_urls
         )
+    log.info("Grounding research start chat_id=%s message_id=%s input_hash=%s",
+             evidence.chat_id, evidence.message_id,
+             hashlib.sha256(prompt.encode()).hexdigest()[:16])
     receipt = _provider_chain.ask_validated(
         prompt,
         validator=validator,
@@ -3548,6 +4318,8 @@ def _compose_grounded_reply(turn):
     prompt = load_prompt(
         "bot/grounded_response",
         **turn.prompt_values,
+        chat_voice=load_prompt("bot/chat_voice"),
+        requested_task=_render_requested_task(turn.evidence),
         conversation_evidence=_render_evidence(
             turn.evidence,
             {"current_message", "reply_message", "conversation_message"},
@@ -3563,6 +4335,7 @@ def _compose_grounded_reply(turn):
             parse_composed_reply, raw, turn.evidence
         ),
         timeout=300,
+        tier="chat_reply",
         tools="__none__",
         permission_profile=turn.permission_profile,
     )
@@ -3571,8 +4344,52 @@ def _compose_grounded_reply(turn):
     return parse_composed_reply(receipt.text, turn.evidence), receipt
 
 
+def _is_source_task_deferral(text):
+    """Recognize an acknowledgment/promise with no public source answer.
+
+    Claim rows alone are untrusted metadata. A source-supported row cannot
+    turn apology-only public prose into completed work.
+    """
+    value = str(text or "").strip().lower().replace("’", "'")
+    value = re.sub(
+        r"^(?:(?:sorry|apologies|my mistake|my bad|you're right|you are right|"
+        r"i missed (?:it|that|the context))[\s,.!;:]*)+", "", value,
+    )
+    if not value:
+        return True
+    return re.fullmatch(
+        r"(?:i(?:'ll| will)|let me|i (?:need to|should))\s+"
+        r"(?:read|check|look at|look into|search for|review|analy[sz]e)\s+"
+        r"(?:it|that|this|the (?:link|source|article|discussion|page|context))"
+        r"(?:\s+(?:now|again|first|properly))?[\s.!]*",
+        value,
+    ) is not None
+
+
 def _verify_grounded_reply(evidence, composed, *, permission_profile):
     """Verify every candidate assertion against typed evidence without tools."""
+    recovered_source = any(
+        item.evidence_id == "R2" for item in evidence.items
+    )
+    source_task = bool(evidence.focal_source_urls or evidence.task_context) or recovered_source
+    # The focal page may identify a pool while a separately collected trade
+    # record answers the actual question. Require source support here; the
+    # independent verifier enforces task relevance and focal attribution.
+    source_ids = {item.evidence_id for item in evidence.items
+                  if item.kind in {"focal_url", "background_url"}
+                  or onchain_evidence.usable_receipt(item)}
+    missing_source_claim = source_task and not any(
+        source_ids.intersection(claim.evidence_ids) for claim in composed.claims
+    )
+    if ((recovered_source and missing_source_claim)
+            or (source_task and _is_source_task_deferral(composed.reply))):
+        return VerificationVerdict(
+            False, (),
+            "The requested source was collected. Answer its content with "
+            "at least one source-supported claim; an apology, promise to look, "
+            "or request to resend the available link does not complete the task.",
+            repair_policy="source_claims",
+        ), None
     leaks = public_grounding_protocol_leaks(composed.reply)
     if leaks:
         return VerificationVerdict(
@@ -3582,6 +4399,8 @@ def _verify_grounded_reply(evidence, composed, *, permission_profile):
         ), None
     prompt = load_prompt(
         "bot/grounding_verifier",
+        agent_name=AGENT_NAME,
+        requested_task=_render_requested_task(evidence),
         evidence=_render_evidence(evidence),
         composition=json.dumps(asdict(composed), ensure_ascii=False),
     )
@@ -3590,19 +4409,70 @@ def _verify_grounded_reply(evidence, composed, *, permission_profile):
         validator=lambda raw: _parse_contract(parse_verification, raw),
         timeout=300,
         tools="__none__",
-        tier="classification",
+        tier="grounding_verifier",
         permission_profile=permission_profile,
+        primary_contract_retries=1,
     )
+    if receipt is not None and missing_source_claim:
+        return VerificationVerdict(
+            False, (),
+            "The requested source task has no source-supported public claim. "
+            "Answer a useful supported part of that task.",
+            repair_policy="source_claims",
+        ), receipt
     return (
         (parse_verification(receipt.text), receipt)
         if receipt else (None, None)
     )
 
 
+def _source_claim_repair(evidence, repaired):
+    """Render a source-completion repair from its parsed collected-source claims.
+
+    The model's free prose can add purposes or outcomes absent from its own
+    evidence-bound claims. This narrow policy discards that prose. Claim
+    values still require the ordinary independent final semantic verifier.
+    """
+    source_ids = frozenset(item.evidence_id for item in evidence.items
+                           if item.kind in {"focal_url", "background_url"}
+                           or onchain_evidence.usable_receipt(item))
+    claims = tuple(
+        claim for claim in repaired.claims
+        if source_ids.intersection(claim.evidence_ids)
+        and not public_grounding_protocol_leaks(claim.claim)
+        and not _is_source_task_deferral(claim.claim)
+    )
+    abstention = ComposedReply("uncertain" if evidence.direct else "skip", "", ())
+    if not claims:
+        return abstention
+    paragraphs = [claim.claim for claim in claims]
+    for failure in evidence.source_failures:
+        # A transport receipt supports a scoped runtime limitation, not a
+        # model claim about the unavailable page or an exhaustive search.
+        source_url = _render_evidence_url(failure.canonical_url)
+        if not source_url:
+            return abstention
+        paragraphs.append(
+            f"I couldn't retrieve usable content from {source_url}, "
+            "so I can't assess or compare that source."
+        )
+    reply = "\n\n".join(paragraphs)
+    if len(reply) > 12_000:
+        return abstention
+    return ComposedReply("reply", reply, claims)
+
+
 def _repair_grounded_reply(turn, composed, verdict):
     """Perform the pipeline's single evidence-constrained repair attempt."""
+    repair_action = turn.prompt_values["action"]
+    if verdict.repair_policy == "source_claims":
+        # Projection discards free reply prose. Scope must travel with the
+        # supported claim or the final verifier must reject the result.
+        repair_action += "\n\n" + load_prompt("bot/source_claim_repair")
     prompt = load_prompt(
         "bot/grounding_repair",
+        chat_voice=load_prompt("bot/chat_voice"),
+        requested_task=_render_requested_task(turn.evidence),
         soul_block=turn.prompt_values["soul_block"],
         identity=turn.prompt_values["identity"],
         no_slop=turn.prompt_values["no_slop"],
@@ -3613,7 +4483,7 @@ def _repair_grounded_reply(turn, composed, verdict):
             "unsupported_claims": verdict.unsupported_claims,
             "reason": verdict.reason,
         }, ensure_ascii=False),
-        action=turn.prompt_values["action"],
+        action=repair_action,
     )
     receipt = _provider_chain.ask_validated(
         prompt,
@@ -3621,6 +4491,7 @@ def _repair_grounded_reply(turn, composed, verdict):
             parse_composed_reply, raw, turn.evidence
         ),
         timeout=300,
+        tier="chat_reply",
         tools="__none__",
         permission_profile=turn.permission_profile,
     )
@@ -3628,10 +4499,13 @@ def _repair_grounded_reply(turn, composed, verdict):
         return None, None
     repaired = parse_composed_reply(receipt.text, turn.evidence)
     if repaired.decision == "reply":
-        repaired = replace(
-            repaired,
-            reply=naturalize_public_grounding_protocol(repaired.reply),
-        )
+        if verdict.repair_policy == "source_claims":
+            repaired = _source_claim_repair(turn.evidence, repaired)
+        else:
+            repaired = replace(
+                repaired,
+                reply=naturalize_public_grounding_protocol(repaired.reply),
+            )
     return repaired, receipt
 
 
@@ -4078,10 +4952,32 @@ def _generate_legacy_response(msg: dict, is_direct: bool, recent_messages: list,
     return response
 
 
-def _make_grounding_url_fetcher():
+# Typed GroundingFailure messages are code-authored statics or bounded
+# templates ("HTTP status 403"), but the failure log's privacy contract says
+# exception text is never trusted at the boundary: only messages matching
+# this conservative shape (no dots, slashes, or equals — nothing URL- or
+# key=value-shaped can pass) are logged verbatim.
+_LOGGABLE_GROUNDING_REASON_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9 -]{0,63}")
+
+
+def _loggable_grounding_reason(exc):
+    """Return an allowlisted typed failure reason, never free exception text."""
+    message = str(exc)
+    if _LOGGABLE_GROUNDING_REASON_RE.fullmatch(message):
+        return message
+    return "unclassified-failure"
+
+
+def _make_grounding_url_fetcher(*, telegram_scope=None):
     """Build one turn-local, cached URL fetcher for focal and background evidence."""
     http_fetcher = SafeHttpFetcher(limits=GROUNDING_LIMITS)
+    if os.environ.get("GROUNDING_BROWSER_READER", "1") == "1":
+        from browser_reader import BrowserSourceReader
+        http_fetcher.renderer = BrowserSourceReader()
     twitter_fetcher = None
+    youtube_fetcher = None
+    telegram_lookups = 0
+    focal_urls_seen = set()
     cache = {}
     failed_cache = set()
     requests_used = 0
@@ -4110,13 +5006,43 @@ def _make_grounding_url_fetcher():
         if time.monotonic() >= deadline:
             raise GroundingFailure("source collection deadline exceeded")
 
-    def fetch(url, focal):
+    def consume_resource_request():
+        # Browser assets are real requests and share the turn's existing
+        # request budget. Rendering cannot quietly multiply network authority.
+        nonlocal requests_used
+        require_time()
+        if requests_used >= GROUNDING_LIMITS.max_source_requests:
+            raise GroundingFailure("source request budget exceeded")
+        requests_used += 1
+
+    http_fetcher.resource_request_consumer = consume_resource_request
+
+    def fetch(url, focal, *, _telegram_path=()):
         """Fetch one source once and preserve typed grounding failures."""
-        nonlocal twitter_fetcher, requests_used, response_bytes_used
+        nonlocal youtube_fetcher, twitter_fetcher
+        nonlocal requests_used, response_bytes_used
+        nonlocal telegram_lookups
         canonical = canonical_source_url(url)
+        private_telegram = is_private_telegram_url(canonical)
+        if private_telegram and (
+            not focal or telegram_scope is None
+            or telegram_scope[0] not in ALLOWED_GROUPS
+        ):
+            raise TelegramMessageUnavailable("Telegram message outside current chat scope")
+        if private_telegram:
+            _, linked_chat, _, linked_message = parse_telegram_message_url(canonical)
+            telegram_key = (linked_chat, linked_message)
+            if telegram_key in _telegram_path:
+                raise TelegramMessageUnavailable("Telegram message reference cycle")
+        if focal and canonical not in focal_urls_seen:
+            if len(focal_urls_seen) >= GROUNDING_LIMITS.max_focal_urls:
+                raise GroundingFailure("too many focal URLs")
+            focal_urls_seen.add(canonical)
         if canonical in cache:
             return cache[canonical]
         if canonical in failed_cache:
+            if private_telegram:
+                raise TelegramMessageUnavailable("Telegram message unavailable from cached failure")
             raise GroundingFailure("source unavailable from cached failure")
         require_time()
         if requests_used >= GROUNDING_LIMITS.max_source_requests:
@@ -4139,10 +5065,49 @@ def _make_grounding_url_fetcher():
                 request_response_bytes += amount
 
         source_type = (
-            "x" if parse_x_status_url(canonical) is not None else "http"
+            "telegram" if private_telegram else
+            "youtube"
+            if parse_youtube_video_url(canonical) is not None
+            else "x"
+            if parse_x_status_url(canonical) is not None
+            else "http"
         )
         try:
-            if source_type == "x":
+            if source_type == "telegram":
+                if telegram_lookups and not _telegram_path:
+                    raise TelegramMessageUnavailable("Only one Telegram reference chain per turn")
+                if telegram_lookups >= 3:
+                    raise TelegramMessageUnavailable("Telegram message reference limit exceeded")
+                telegram_lookups += 1
+                telegram_fetcher = resolve_telegram_fetcher(timeout=GROUNDING_LIMITS.fetch_timeout)
+                telegram_fetcher.collection_deadline = deadline
+                telegram_fetcher.response_byte_consumer = consume_request_response_bytes
+                source = telegram_fetcher.fetch(
+                    canonical, scope=telegram_scope,
+                    max_response_bytes=remaining_bytes,
+                )
+            elif source_type == "youtube":
+                if youtube_fetcher is None:
+                    youtube_fetcher = YouTubeTranscriptFetcher(
+                        python=sys.executable,
+                        script=str(
+                            BASE_DIR / "scripts" / "youtube_caption_fetch.py"
+                        ),
+                        timeout=GROUNDING_LIMITS.fetch_timeout,
+                    )
+                    youtube_fetcher.collection_deadline = deadline
+                youtube_fetcher.response_byte_consumer = (
+                    consume_request_response_bytes
+                )
+                youtube_fetcher.timeout = min(
+                    float(GROUNDING_LIMITS.fetch_timeout),
+                    max(0.001, deadline - time.monotonic()),
+                )
+                source = youtube_fetcher.fetch(
+                    canonical,
+                    max_response_bytes=remaining_bytes,
+                )
+            elif source_type == "x":
                 if twitter_fetcher is None:
                     twitter_fetcher = resolve_twitter_fetcher(
                         timeout=GROUNDING_LIMITS.fetch_timeout
@@ -4179,21 +5144,42 @@ def _make_grounding_url_fetcher():
                 raise GroundingFailure("source response size is invalid")
             if charged_bytes < response_bytes:
                 consume_response_bytes(response_bytes - charged_bytes)
-        except GroundingFailure:
+            if source_type == "telegram":
+                # A reminder may link to another reminder. Follow only a
+                # single branch, retaining the ingress scope and shared budgets.
+                linked_urls = telegram_linked_urls(source.text)
+                if sum(is_private_telegram_url(value) for value in linked_urls) > 1:
+                    raise TelegramMessageUnavailable("Telegram message reference is ambiguous")
+                quoted = []
+                quoted_refs = {source.source_ref}
+                for value in linked_urls:
+                    linked = fetch(value, True, _telegram_path=(*_telegram_path, telegram_key))
+                    # Evidence collection consumes one flat quoted level. Keep
+                    # every authenticated breadcrumb and the final public source.
+                    for item in (linked, *linked.quoted):
+                        if item.source_ref not in quoted_refs:
+                            quoted_refs.add(item.source_ref)
+                            quoted.append(replace(item, quoted=()))
+                source = replace(source, quoted=tuple(quoted))
+        except GroundingFailure as exc:
             failed_cache.add(canonical)
             log.warning(
                 "Grounding source fetch failed code=grounding_fetch_failed "
-                "type=%s role=%s",
+                "type=%s role=%s reason=%s",
                 source_type,
                 "focal" if focal else "background",
+                _loggable_grounding_reason(exc),
             )
             raise
         cache[canonical] = source
-        log.info(
-            "Grounding source fetch success type=%s source_ref=%s",
-            source_type,
-            source.source_ref,
-        )
+        if source_type == "youtube":
+            log.info("Grounding source fetch success type=youtube")
+        else:
+            log.info(
+                "Grounding source fetch success type=%s source_ref=%s",
+                source_type,
+                source.source_ref,
+            )
         return source
 
     fetch.collection_deadline = deadline
@@ -4223,29 +5209,83 @@ def _minimal_failure_bundle(msg, *, direct, mode):
 
 
 def _response_for_grounding_result(result, *, direct):
-    """Map internal grounding dispositions to the existing generator contract."""
+    """Map internal grounding dispositions to the existing generator contract.
+
+    Failure lines are static, reason-bearing strings — each names its typed
+    blocker (2026-08-12 dev group: a bare default forced a "why?" round-trip)
+    but is never composed prose, so nothing here needs verification.
+    """
     if result.decision == "reply":
         return result.reply
     if not direct or result.decision == "skip":
         return False
     if result.decision == "provider_error":
-        return "I couldn't generate a reliable reply right now."
+        return (
+            "My language-model providers aren't responding, so I can't "
+            "generate a reliable reply right now."
+        )
+    if result.failure_kind == "youtube_captions_unavailable":
+        return (
+            "I couldn't access public captions for that video, so I can't "
+            "summarize it reliably."
+        )
+    if result.failure_kind == "telegram_message_unavailable":
+        return (
+            "I couldn't read that Telegram message in this chat and topic. "
+            "Reply directly to it and mention me, or paste its text."
+        )
     if result.failure_kind == "focal_unavailable":
-        return "I can't verify that source right now."
+        return (
+            "I couldn't retrieve usable content from that link, so I can't "
+            "verify it."
+        )
+    if result.failure_kind == "referenced_source_unavailable":
+        return (
+            "I found the link in this chat, but couldn't read usable content "
+            "from the page. I can't assess it reliably from the URL alone."
+        )
+    if result.failure_kind == "reference_ambiguous":
+        return (
+            "I found more than one possible recent link. Reply to the one "
+            "you mean so I can read the right source."
+        )
+    if result.failure_kind == "reference_unavailable":
+        return "I couldn't identify the referenced link reliably in this chat's recent context."
+    if result.failure_kind == "task_reference_ambiguous":
+        return "I couldn't tell whether you want to continue the previous source task. Please clarify what you'd like me to do."
+    if result.failure_kind == "task_reference_unavailable":
+        return "I couldn't reliably recover which source task this reply refers to. Please clarify the task you'd like me to continue."
     if result.failure_kind == "media_unavailable":
-        return "I can't inspect that attachment reliably right now."
+        return (
+            "I couldn't retrieve that attachment, so I can't inspect it "
+            "reliably."
+        )
     if result.failure_kind == "media_ambiguous":
         return (
             "I found multiple recent text attachments. Reply to the exact "
             "file or name it so I don't guess."
         )
+    if result.failure_kind == "market_data_unavailable":
+        return "I couldn't retrieve the frozen-market list reliably right now."
+    if result.failure_kind == "onchain_data_unavailable":
+        return "I couldn't retrieve the pool's on-chain history reliably, so I can't identify its historical buyers yet."
     if result.failure_kind == "research_sources_unavailable":
-        return (
-            "I found sources, but couldn't retrieve any of them safely "
-            "enough to use."
-        )
+        return "I found sources, but couldn't use any of them."
     if result.failure_kind == "research_evidence_insufficient":
         return "I couldn't gather enough evidence to answer that reliably."
+    if result.failure_kind == "verification_failed":
+        return (
+            "I drafted a reply, but it failed my fact-check against the "
+            "evidence, so I'm withholding it."
+        )
+    if result.failure_kind in ("verification_unavailable",
+                               "repair_unavailable"):
+        return "I couldn't fact-check my draft reliably, so I'm withholding it."
+    if result.failure_kind == "research_unavailable":
+        return (
+            "Background research was unavailable, so I can't answer that "
+            "reliably."
+        )
     if result.failure_kind and "timeout" in result.failure_kind:
         return "I couldn't verify that in time."
     return "I can't verify that well enough to answer reliably."
@@ -4255,7 +5295,7 @@ def _grounding_prompt_values(
         msg, recent_messages, *, operator, is_private, is_direct,
         sender_label, safe_text):
     """Build trusted prompt blocks and bounded runtime context for one turn."""
-    msg_topic_id = msg.get("message_thread_id")
+    msg_topic_id = conversation_topic_id(msg) or None
     if operator:
         security_block = load_prompt(
             "bot/security_operator", sender_label=sender_label,
@@ -4303,8 +5343,9 @@ def _current_media_item(msg, media_context):
     if not media_context:
         return ()
     clean = sanitize_untrusted(
-        media_context, max_len=MAX_TEXT_DOCUMENT_CHARS + 512
+        media_context, max_len=MAX_TEXT_DOCUMENT_BYTES + 512
     )
+    clean = truncate_utf8(clean, MAX_TEXT_DOCUMENT_BYTES + 512)
     chat_id = int(msg.get("chat", {}).get("id", 0))
     message_id = _selected_current_media_origin(msg)
     if message_id is None:
@@ -4316,6 +5357,33 @@ def _current_media_item(msg, media_context):
         source_ref=f"telegram:{chat_id}:{message_id}:attachment",
         content_hash=hashlib.sha256(clean.encode("utf-8")).hexdigest(),
     ),)
+
+
+def _model_routing_runtime_item():
+    """Expose configured reply models before composition, without claiming call provenance."""
+    routes = []
+    for provider in _provider_chain.providers:
+        call = provider.resolved_call(tier="chat_reply")
+        # Select public metadata only. Provider objects also contain paths,
+        # wrappers and other configuration that must never become evidence.
+        try:
+            name, model, effort, _ = _trace_receipt_columns(ProviderResult(
+                "", provider.name, call.model, call.effort, call.tier,
+            ))
+        except TraceSerializationError:
+            log.warning("Model routing receipt unavailable: invalid provider metadata")
+            return None
+        routes.append({"provider": name, "model": model, "effort": effort})
+    if not routes:
+        return None
+    text = json.dumps({
+        "scope": "configured_reply_models", "providers": routes,
+    }, ensure_ascii=True, separators=(",", ":"))
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return EvidenceItem(
+        evidence_id="", kind="runtime_receipt", text=text,
+        source_ref=f"runtime:model_routing:{digest[:20]}", content_hash=digest,
+    )
 
 
 def _runtime_context_items(prompt_values):
@@ -4335,7 +5403,280 @@ def _runtime_context_items(prompt_values):
             source_ref=f"runtime:{name}:{digest[:20]}",
             content_hash=digest,
         ))
+    routing = _model_routing_runtime_item()
+    if routing is not None:
+        items.append(routing)
     return tuple(items)
+
+
+def _validated_market_timestamp(value, *, required):
+    """Return one exact API timestamp after proving it is timezone-aware."""
+    if value is None and not required:
+        return None
+    if type(value) is not str or not value or value != value.strip():
+        raise ValueError("invalid market timestamp")
+    if canonical_event_time(value) is None:
+        raise ValueError("invalid market timestamp")
+    return value
+
+
+def _fetch_frozen_markets() -> tuple[dict, ...] | None:
+    """Return a bounded, strictly validated public frozen-market snapshot."""
+    query = urlencode({
+        "status": "frozen",
+        "limit": _FROZEN_MARKET_MAX_ITEMS,
+    })
+    request = urllib.request.Request(
+        f"{LN_API}/predictions/markets/?{query}",
+        headers={"Accept": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=15) as response:
+            body = response.read(_FROZEN_MARKET_MAX_RESPONSE_BYTES + 1)
+        if len(body) > _FROZEN_MARKET_MAX_RESPONSE_BYTES:
+            raise ValueError("frozen market response exceeded byte limit")
+        payload = json.loads(body)
+        if not isinstance(payload, dict):
+            raise ValueError("frozen market response is not an object")
+        rows = payload.get("results")
+        if (
+            not isinstance(rows, list)
+            or len(rows) > _FROZEN_MARKET_MAX_ITEMS
+        ):
+            raise ValueError("frozen market results are invalid")
+
+        seen_ids = set()
+        validated = []
+        for row in rows:
+            if not isinstance(row, dict):
+                raise ValueError("frozen market row is invalid")
+            market_id = row.get("id")
+            question = row.get("question")
+            if (
+                type(market_id) is not int
+                or not 1 <= market_id <= (1 << 63) - 1
+                or market_id in seen_ids
+            ):
+                raise ValueError("frozen market id is invalid")
+            if (
+                type(question) is not str
+                or not question
+                or question != question.strip()
+                or len(question.encode("utf-8")) > 2_000
+                or sanitize_untrusted(question, max_len=2_000) != question
+            ):
+                raise ValueError("frozen market question is invalid")
+            if row.get("status") != "frozen":
+                raise ValueError("market row is not frozen")
+            expires_at = _validated_market_timestamp(
+                row.get("expires_at"), required=False
+            )
+            frozen_at = _validated_market_timestamp(
+                row.get("frozen_at"), required=True
+            )
+            seen_ids.add(market_id)
+            validated.append({
+                "id": market_id,
+                "question": question,
+                "status": "frozen",
+                "expires_at": expires_at,
+                "frozen_at": frozen_at,
+            })
+        return tuple(sorted(validated, key=lambda market: market["id"]))
+    except Exception as exc:
+        log.warning(
+            "Frozen market lookup failed type=%s",
+            type(exc).__name__,
+        )
+        return None
+
+
+def _frozen_market_runtime_item(markets) -> EvidenceItem:
+    """Bind one validated frozen-market lookup to the grounded turn."""
+    payload = {
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+        "markets": list(markets),
+    }
+    rendered = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    text = "FROZEN PREDICTION MARKETS (trusted live LN API snapshot):\n" + rendered
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return EvidenceItem(
+        evidence_id="",
+        kind="runtime_receipt",
+        text=text,
+        source_ref=f"runtime:frozen_markets:{digest[:20]}",
+        content_hash=digest,
+    )
+
+
+# Fresh-reference window for the failure log, mirroring the 30-minute
+# PHOTO_REFERENCE_MAX_AGE convention for "recent" in-chat references.
+_FAILURE_RECEIPT_MAX_AGE = 1800
+_FAILURE_RECEIPT_MAX_ROWS = 2
+
+# Human gloss per typed failure reason (_TRACE_FAILURE_KINDS). Values are
+# trusted static strings — they become receipt text verbatim.
+_FAILURE_REASON_GLOSS = {
+    "focal_unavailable": (
+        "a link shared in the conversation could not be fetched "
+        "or had no usable content"),
+    "verification_failed": (
+        "a drafted reply failed factual verification twice and was withheld"),
+    "verification_unavailable": "the verification stage was unavailable",
+    "repair_unavailable": "the repair stage was unavailable",
+    "providers_failed": "the language-model providers were unavailable",
+    "research_unavailable": "background research was unavailable",
+    "research_sources_unavailable": (
+        "background research sources were unavailable"),
+    "research_evidence_insufficient": "research found no usable evidence",
+    "source_collection_timeout": "source collection ran out of time",
+    "media_unavailable": (
+        "a referenced image or document could not be retrieved"),
+    "media_ambiguous": "the referenced image or document was ambiguous",
+    "youtube_captions_unavailable": (
+        "public captions for a referenced video were unavailable"),
+    "market_data_unavailable": "market data was unavailable",
+}
+
+
+def _failure_log_runtime_item(chat_id, topic_id):
+    """Bundle Benthic's recent same-chat/topic reply failures as one receipt.
+
+    Lets a follow-up like "why not?" receive a verifiable, receipt-backed
+    explanation: only typed trace metadata (never model output, URLs, or user
+    content) becomes runtime-receipt evidence. Topic scope is recovered by
+    joining chat_history (traces store no topic); a trace without a matching
+    chat row positively matches only topicless turns. Receipt absence must
+    never break a turn, so any DB problem degrades to ().
+    Spec: docs/superpowers/specs/2026-08-11-benthic-failure-receipt-evidence-design.md
+    """
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(seconds=_FAILURE_RECEIPT_MAX_AGE)
+    ).isoformat()
+    try:
+        with _db() as conn:
+            rows = conn.execute(
+                """SELECT t.created_at, t.mode, t.disposition,
+                          t.failure_reason
+                   FROM reply_grounding_traces t
+                   LEFT JOIN chat_history ch
+                     ON ch.chat_id = t.chat_id AND ch.msg_id = t.message_id
+                   WHERE t.chat_id = ? AND t.disposition != 'reply'
+                     AND t.created_at >= ?
+                     AND COALESCE(ch.topic_id, 0) = ?
+                   ORDER BY t.created_at DESC LIMIT ?""",
+                (int(chat_id), cutoff, int(topic_id or 0),
+                 _FAILURE_RECEIPT_MAX_ROWS),
+            ).fetchall()
+    except sqlite3.Error:
+        log.debug("Failure-receipt lookup unavailable", exc_info=True)
+        return ()
+    lines = []
+    for created_at, mode, disposition, failure_reason in rows:
+        entry = (
+            f"- {str(created_at)[:19]}Z mode={mode} outcome={disposition}"
+        )
+        if failure_reason:
+            entry += f" reason={failure_reason}"
+            gloss = _FAILURE_REASON_GLOSS.get(failure_reason)
+            if gloss:
+                entry += f" ({gloss})"
+        lines.append(entry)
+    if not lines:
+        return ()
+    text = sanitize_untrusted(
+        "RECENT BENTHIC REPLY-ATTEMPT FAILURES "
+        "(trusted runtime log, this chat):\n" + "\n".join(lines),
+        max_len=2_000,
+    )
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return (EvidenceItem(
+        evidence_id="",
+        kind="runtime_receipt",
+        text=text,
+        source_ref=f"runtime:failure_log:{digest[:20]}",
+        content_hash=digest,
+    ),)
+
+
+def _resolve_conversation_reference(msg, recent_messages, persisted):
+    """Resolve an implied source reference by selecting a witnessed message ID."""
+    reply = msg.get("reply_to_message") or {}
+    if (_has_current_media(msg) or _has_current_media(reply)
+            or _CURRENT_HTTP_URL_RE.search(_msg_text(msg))
+            or _CURRENT_HTTP_URL_RE.search(_msg_text(reply))):
+        return None, None
+    candidates = conversation_link_candidates(msg, recent_messages, persisted)
+    if not candidates:
+        return None, None
+    by_id = {row["message_id"]: row for row in candidates}
+    previous = by_id.get(int(msg.get("message_id") or 0) - 1)
+    sender_id = msg.get("from", {}).get("id")
+    if (previous is not None and type(sender_id) is int
+            and previous.get("from", {}).get("id") == sender_id
+            and not previous.get("reply_to_message_id")
+            and not msg.get("reply_to_message")
+            and 0 < len(_msg_text(msg).strip()) <= 300
+            and _CURRENT_HTTP_URL_RE.fullmatch(previous["text"].strip())):
+        current_time = canonical_event_time(msg.get("event_time", msg.get("date")))
+        delta = (datetime.fromisoformat(current_time)
+                 - datetime.fromisoformat(previous["event_time"])).total_seconds()
+        if 0 <= delta <= 30:
+            # Telegram may deliver URL and caption in different polling
+            # batches. Exact adjacency and sender/scope/time checks preserve
+            # that fragment relationship without asking an LLM to guess it.
+            return previous, None
+
+    def parse(raw):
+        value = json_object(raw)
+        if set(value) != {"decision", "message_id"}:
+            raise GroundingFailure("invalid context reference contract")
+        decision, message_id = value["decision"], value["message_id"]
+        if not isinstance(decision, str):
+            raise GroundingFailure("invalid context reference decision")
+        if decision == "select":
+            if type(message_id) is not int or message_id not in by_id:
+                raise GroundingFailure("unwitnessed context reference")
+        elif decision not in {"none", "ambiguous", "unavailable"} or message_id is not None:
+            raise GroundingFailure("invalid context reference decision")
+        return value
+
+    candidate_rows = [{
+        "message_id": row["message_id"],
+        "author": sanitize_untrusted(row["from"].get("username") or "?", max_len=64),
+        "timestamp": row["event_time"],
+        "text": sanitize_untrusted(row["text"], max_len=2000),
+    } for row in candidates]
+    # This stage selects only an existing ID. It cannot invent URLs, execute
+    # instructions, rewrite the user's task, or grant source text authority.
+    prompt = load_prompt(
+        "bot/context_reference",
+        agent_name=AGENT_NAME,
+        current_message=sanitize_untrusted(_msg_text(msg), max_len=2000),
+        current_author=sanitize_untrusted(msg.get("from", {}).get("username") or "?", max_len=64),
+        current_timestamp=canonical_event_time(msg.get("event_time", msg.get("date"))),
+        reply_target=sanitize_untrusted(_msg_text(reply), max_len=1000),
+        candidates=json.dumps(candidate_rows, ensure_ascii=False),
+    )
+    receipt = _provider_chain.ask_validated(
+        prompt, validator=lambda raw: _parse_contract(parse, raw),
+        timeout=ENGAGEMENT_TIMEOUT, tools="__none__",
+        tier="classification", permission_profile="benthic_bot",
+    )
+    if receipt is None:
+        return None, "reference_unavailable"
+    selected = parse(receipt.text)
+    if selected["decision"] == "select":
+        return by_id[selected["message_id"]], None
+    if selected["decision"] == "none":
+        return None, None
+    return None, "reference_" + selected["decision"]
 
 
 def _generate_grounded_response(
@@ -4384,6 +5725,32 @@ def _generate_grounded_response(
         log.info("Grounding engagement SKIP sender_id=%s", sender.get("id", 0))
         return False
 
+    frozen_resolution = (
+        is_direct and _is_frozen_market_resolution_request(safe_text)
+    )
+    frozen_markets = ()
+    if frozen_resolution:
+        # Frozen-market outcome requests always require current factual evidence,
+        # even when the general engagement classifier labels them conversational.
+        engagement = EngagementDecision(True, "grounded")
+        frozen_markets = _fetch_frozen_markets()
+        if frozen_markets is None:
+            bundle = _minimal_failure_bundle(
+                msg, direct=is_direct, mode="grounded"
+            )
+            turn = GroundingTurn(
+                bundle,
+                {},
+                "benthic_bot_operator" if operator else "benthic_bot",
+            )
+            result = _terminal_result(
+                turn, "market_data_unavailable", ()
+            )
+            _save_grounding_trace(bundle, result)
+            return _response_for_grounding_result(
+                result, direct=is_direct
+            )
+
     profile = "benthic_bot_operator" if operator else "benthic_bot"
     prompt_values = _grounding_prompt_values(
         msg,
@@ -4394,6 +5761,19 @@ def _generate_grounded_response(
         sender_label=sender_label,
         safe_text=safe_text,
     )
+    if frozen_resolution:
+        # Resolution recommendations depend on the live market snapshot and
+        # fetched outcome sources, not portfolio state or unrelated activity.
+        for name in ("activity", "own_actions", "positions", "memory_notes"):
+            prompt_values[name] = ""
+        prompt_values["action"] += (
+            " For each listed frozen market with sufficient outcome support, "
+            "recommend YES, NO, or REFUND; include its market ID, a concise "
+            "reason, and the actual supporting source URL. Leave unsupported "
+            "markets explicitly uncertain. These are recommendations only: "
+            "never emit or execute /resolve, /cancelmarket, or another admin "
+            "command."
+        )
     if operator:
         _write_build_route(
             int(msg.get("chat", {}).get("id", 0)),
@@ -4407,22 +5787,56 @@ def _generate_grounded_response(
     history_limit = 100 if any(
         value in text.lower() for value in context_keywords
     ) else 50
+    if frozen_resolution:
+        # Up to twenty ingress messages plus twenty-five persisted rows leave
+        # bounded trace capacity for ten source items and the market receipt.
+        history_limit = min(history_limit, 25)
     chat_id = int(msg.get("chat", {}).get("id", 0))
     topic_id = msg.get("message_thread_id")
     persisted = _get_structured_chat_history(
         limit=history_limit,
         chat_id=0 if is_private and operator else chat_id,
         topic_id=None if is_private and operator else topic_id,
+        is_forum=msg.get("chat", {}).get("is_forum"),
     )
 
     selected_ids = _select_grounding_photo_ids(msg, recent_messages)
+    restored_task, task_reference_failure, task_reference_handled = (
+        _restore_reply_task(msg, direct=is_direct)
+        if not (is_private or frozen_resolution or document_selection.message_ids or selected_ids)
+        else (None, None, False)
+    )
+    referenced_message, reference_failure = (
+        (None, task_reference_failure) if task_reference_handled or frozen_resolution or document_selection.message_ids or selected_ids
+        else _resolve_conversation_reference(msg, recent_messages, persisted)
+    )
+    if reference_failure:
+        bundle = _minimal_failure_bundle(msg, direct=is_direct, mode="grounded")
+        result = _terminal_result(GroundingTurn(bundle, prompt_values, profile), reference_failure, ())
+        _save_grounding_trace(bundle, result)
+        return _response_for_grounding_result(result, direct=is_direct)
+    task_context = _prepare_reply_task(
+        msg, referenced_message, restored_task, is_private=is_private,
+        recent_messages=recent_messages,
+    )
+    if restored_task is not None and task_context is None:
+        bundle = _minimal_failure_bundle(msg, direct=is_direct, mode="grounded")
+        result = _terminal_result(GroundingTurn(bundle, prompt_values, profile), "reference_unavailable", ())
+        _save_grounding_trace(bundle, result)
+        return _response_for_grounding_result(result, direct=is_direct)
+    if referenced_message is not None or restored_task is not None:
+        engagement = EngagementDecision(True, "grounded")
+
     current_media_requested = _has_current_media(msg)
     previous_photos = (
         _attach_recent_photos(selected_ids, chat_id, topic_id)
         if selected_ids else ()
     )
     previous_documents = _attach_recent_documents(
-        document_selection.message_ids, chat_id, topic_id
+        document_selection.message_ids,
+        chat_id,
+        topic_id,
+        max_age_seconds=document_selection.max_age_seconds,
     )
     current_photo = ()
     if media_path and media_type == "image":
@@ -4476,8 +5890,45 @@ def _generate_grounded_response(
             _save_grounding_trace(bundle, result)
             return _response_for_grounding_result(result, direct=is_direct)
 
-        url_fetcher = _make_grounding_url_fetcher()
+        telegram_scope = None
+        if is_direct and not is_private and chat_id in ALLOWED_GROUPS:
+            # Ordinary supergroup replies also carry message_thread_id. Only
+            # forum chats make that ID an authenticated history boundary.
+            telegram_scope = (
+                chat_id,
+                int(topic_id or 1) if msg.get("chat", {}).get("is_forum") else 0,
+            )
+        url_fetcher = _make_grounding_url_fetcher(telegram_scope=telegram_scope)
         runtime_items = _runtime_context_items(prompt_values)
+        onchain_item = None
+        if not (frozen_resolution or media_items):
+            onchain_item = _collect_onchain_evidence(
+                msg, task_context, permission_profile=profile,
+                deadline=getattr(url_fetcher, "collection_deadline", None)
+                or time.monotonic() + GROUNDING_LIMITS.source_collection_timeout,
+            )
+            if onchain_item is not None:
+                runtime_items += (onchain_item,)
+        runtime_items += _failure_log_runtime_item(
+            chat_id, msg.get("message_thread_id") or 0
+        )
+        if frozen_resolution:
+            runtime_items += (
+                _frozen_market_runtime_item(frozen_markets),
+            )
+        turn_limits = (
+            replace(
+                GROUNDING_LIMITS,
+                max_background_sources=min(
+                    GROUNDING_LIMITS.max_source_requests,
+                    max(
+                        GROUNDING_LIMITS.max_background_sources,
+                        len(frozen_markets),
+                    ),
+                ),
+            )
+            if frozen_resolution else GROUNDING_LIMITS
+        )
         try:
             evidence = collect_evidence(
                 msg,
@@ -4488,41 +5939,68 @@ def _generate_grounded_response(
                 url_fetcher=url_fetcher,
                 media_items=media_items,
                 runtime_receipts=runtime_items,
-                limits=GROUNDING_LIMITS,
+                referenced_message=referenced_message,
+                task_context=task_context,
+                limits=turn_limits,
                 allow_cross_chat_context=is_private and operator,
+            )
+        except (YouTubeTranscriptUnavailable, TelegramMessageUnavailable) as exc:
+            bundle = _minimal_failure_bundle(
+                msg, direct=is_direct, mode=engagement.mode
+            )
+            turn = GroundingTurn(bundle, prompt_values, profile)
+            result = _terminal_result(
+                turn,
+                "telegram_message_unavailable" if isinstance(exc, TelegramMessageUnavailable)
+                else "youtube_captions_unavailable",
+                (),
+            )
+            _save_grounding_trace(bundle, result)
+            return _response_for_grounding_result(
+                result, direct=is_direct
             )
         except GroundingFailure:
             bundle = _minimal_failure_bundle(
                 msg, direct=is_direct, mode=engagement.mode
             )
             turn = GroundingTurn(bundle, prompt_values, profile)
-            result = _terminal_result(turn, "focal_unavailable", ())
+            result = _terminal_result(
+                turn, "onchain_data_unavailable" if onchain_item is not None else
+                "referenced_source_unavailable" if referenced_message is not None or restored_task is not None
+                else "focal_unavailable", (),
+            )
             _save_grounding_trace(bundle, result)
             return _response_for_grounding_result(result, direct=is_direct)
 
         background_urls = ()
-        research_failure_kind = None
+        research_failure_kind = (
+            "onchain_data_unavailable" if onchain_item is not None
+            and not onchain_evidence.usable_receipt(onchain_item) else None
+        )
         collection_deadline = None
         initial_background_refs = {
             item.source_ref
             for item in evidence.items
             if item.kind == "background_url"
         }
-        if engagement.mode == "grounded":
+        if (
+            engagement.mode == "grounded"
+            and not (frozen_resolution and not frozen_markets)
+        ):
             collection_deadline = getattr(
                 url_fetcher, "collection_deadline", None
             )
             if collection_deadline is None:
                 discovery = _discover_background_sources(
-                    evidence, GROUNDING_LIMITS
+                    evidence, turn_limits
                 )
             else:
                 discovery = _discover_background_sources(
                     evidence,
-                    GROUNDING_LIMITS,
+                    turn_limits,
                     deadline=collection_deadline,
                 )
-            research_failure_kind = discovery.failure_kind
+            research_failure_kind = discovery.failure_kind or research_failure_kind
             if research_failure_kind is not None:
                 log.info(
                     "Grounding research unavailable code=%s",
@@ -4533,7 +6011,7 @@ def _generate_grounded_response(
                     evidence,
                     discovery.urls,
                     url_fetcher,
-                    GROUNDING_LIMITS,
+                    turn_limits,
                     research_plan=discovery.plan,
                 )
                 market_incomplete = (
@@ -4569,7 +6047,9 @@ def _generate_grounded_response(
                     background_urls=background_urls,
                     media_items=media_items,
                     runtime_receipts=runtime_items,
-                    limits=GROUNDING_LIMITS,
+                    referenced_message=referenced_message,
+                    task_context=task_context,
+                    limits=turn_limits,
                     trace_id=evidence.trace_id,
                     allow_cross_chat_context=is_private and operator,
                 )
@@ -4599,6 +6079,9 @@ def _generate_grounded_response(
             and research_failure_kind is None
         ):
             research_failure_kind = "research_evidence_insufficient"
+        if (onchain_item is not None and not onchain_evidence.usable_receipt(onchain_item)
+                and research_failure_kind != "source_collection_timeout"):
+            research_failure_kind = "onchain_data_unavailable"
         turn = GroundingTurn(
             evidence,
             prompt_values,
@@ -4758,8 +6241,26 @@ def _load_market_cache() -> dict:
         log.debug(f"Market cache load failed: {e}")
         return {}
 
-def _save_market_cache(snapshot: dict, decision: str) -> None:
+def _save_market_cache(
+        snapshot: dict, decision: str, *,
+        preserve_analyzed_at: bool = False) -> None:
+    """Atomically persist a market snapshot and its real analysis timestamp.
+
+    Closure-only refreshes retain the previous timestamp because they do not
+    run an LLM analysis and must not postpone the periodic staleness check.
+    """
     try:
+        analyzed_at = time.time()
+        if preserve_analyzed_at:
+            previous = _load_market_cache().get("analyzed_at")
+            if (
+                type(previous) not in (int, float)
+                or previous < 0
+                or previous != previous
+                or previous == float("inf")
+            ):
+                raise ValueError("market cache analysis timestamp is invalid")
+            analyzed_at = previous
         # Atomic write: temp file + rename. Protects against crash mid-write
         # corrupting the cache file (would cause a harmless re-analyze on
         # next cycle, but still worth avoiding).
@@ -4767,28 +6268,31 @@ def _save_market_cache(snapshot: dict, decision: str) -> None:
         tmp.write_text(json.dumps({
             "snapshot": snapshot,
             "decision": decision,
-            "analyzed_at": time.time(),
+            "analyzed_at": analyzed_at,
         }))
         tmp.replace(_MARKET_ANALYSIS_CACHE)
     except Exception as e:
         log.debug(f"Failed to save market cache: {e}")
 
-def _analysis_warranted(current: dict) -> tuple[bool, str]:
+def _analysis_warranted(current: dict) -> tuple[bool, str, bool]:
     """Decide whether to run the expensive Opus+tools LLM analysis.
-    Returns (warranted, reason). Cheap check — no LLM, no network."""
+    Returns (warranted, reason, refresh_cache). Cheap check — no LLM or network.
+    ``refresh_cache`` removes closure-only IDs without marking an LLM analysis."""
     cache = _load_market_cache()
     prev = cache.get("snapshot", {})
     analyzed_at = cache.get("analyzed_at", 0)
     if not prev:
-        return True, "no cached analysis"
+        return True, "no cached analysis", False
     if time.time() - analyzed_at > MARKET_CACHE_MAX_AGE:
-        return True, f"cache stale ({int((time.time() - analyzed_at) / 3600)}h old)"
+        return (
+            True,
+            f"cache stale ({int((time.time() - analyzed_at) / 3600)}h old)",
+            False,
+        )
     new_markets = set(current) - set(prev)
     if new_markets:
-        return True, f"new markets: {sorted(new_markets)}"
+        return True, f"new markets: {sorted(new_markets)}", False
     closed_markets = set(prev) - set(current)
-    if closed_markets:
-        return True, f"markets closed: {sorted(closed_markets)}"
     max_delta = 0.0
     delta_market = None
     for mid, snap in current.items():
@@ -4801,8 +6305,20 @@ def _analysis_warranted(current: dict) -> tuple[bool, str]:
                 max_delta = delta
                 delta_market = mid
     if max_delta >= MARKET_PRICE_DELTA_PCT:
-        return True, f"price moved {max_delta:.1f}% on #{delta_market} (threshold {MARKET_PRICE_DELTA_PCT}%)"
-    return False, f"no material change (max move {max_delta:.1f}%)"
+        return (
+            True,
+            f"price moved {max_delta:.1f}% on #{delta_market} "
+            f"(threshold {MARKET_PRICE_DELTA_PCT}%)",
+            False,
+        )
+    if closed_markets:
+        return (
+            False,
+            "markets closed without open-market change: "
+            f"{sorted(closed_markets)}",
+            True,
+        )
+    return False, f"no material change (max move {max_delta:.1f}%)", False
 
 
 # Cached positions string — refreshed every 5 minutes, included in every
@@ -4984,8 +6500,15 @@ def _check_breaking_news():
     gate_prompt = load_prompt("bot/breaking_news_gate",
                               headline=safe_headline,
                               origin=str(candidate.get("origin") or "unknown"))
-    verdict = llm_ask(gate_prompt, timeout=120, tools="",
-                      tier="classification")
+    if jev.enabled("breaking_news"):
+        try:
+            verdict = "NOTABLE" if jev.TaskEvaluator().notable(safe_headline) else "SKIP"
+        except jev.JevError as exc:
+            log.warning("JEV breaking-news gate unavailable; skipping: %s", exc)
+            verdict = "SKIP"
+    else:
+        verdict = llm_ask(gate_prompt, timeout=120, tools="",
+                          tier="classification")
     if not verdict or "NOTABLE" not in verdict.strip().upper():
         log.info(f"Breaking-news gate: SKIP for #{candidate['news_id']} "
                  f"({safe_headline[:60]})")
@@ -5078,8 +6601,14 @@ def _check_markets(recent_messages: list[dict]):
         # Cheap gate: skip the Opus+tools call if nothing material has changed
         # since last analysis. Price delta threshold + staleness ceiling ensure
         # we still re-analyze periodically when markets truly are stable.
-        warranted, reason = _analysis_warranted(snapshot)
+        warranted, reason, refresh_cache = _analysis_warranted(snapshot)
         if not warranted:
+            if refresh_cache:
+                _save_market_cache(
+                    snapshot,
+                    "MARKETS_CLOSED",
+                    preserve_analyzed_at=True,
+                )
             log.info(f"Market check: skipped — {reason}")
             return
         log.info(f"Market check: running full analysis — {reason}")
@@ -5455,7 +6984,7 @@ def _poll_agent_chat(recent_messages: list[dict]) -> list[dict]:
                 "username": m.get("from_username", "unknown"),
                 "is_bot": True,  # assume bot (most API messages are from bots)
             },
-            "chat": {"id": AGENTS_GROUP_ID, "type": "supergroup"},
+            "chat": {"id": AGENTS_GROUP_ID, "type": "supergroup", "is_forum": True},
             "text": text,
             # Normalize to Unix timestamp (int) for consistency with Telegram messages.
             # API returns ISO strings; sort() crashes if int and str dates are mixed.
@@ -6476,13 +8005,46 @@ def _dispatch_one_message(msg: dict, recent_by_chat: dict[tuple, list[dict]]):
         chat_recent = []
     else:
         # Use (chat_id, topic_id) key for topic-scoped context.
-        msg_topic = msg.get("message_thread_id")
-        chat_recent = recent_by_chat.get((cid, msg_topic), [])
+        if chat.get("is_forum") is False:
+            # Include legacy in-memory reply-thread keys as well as the normal
+            # chat buffer. Only actual forums require topic isolation.
+            chat_recent = [m for (gid, _), rows in recent_by_chat.items()
+                           if gid == cid for m in rows]
+            chat_recent.sort(key=lambda m: m.get("message_id", 0))
+            chat_recent = chat_recent[-50:]
+        else:
+            msg_topic = conversation_topic_id(msg) or None
+            chat_recent = recent_by_chat.get((cid, msg_topic), [])
 
     # Copy the context list so workers never read the live recent_by_chat buffer.
     future = _PROC_POOL.submit(_process_one_message, msg, list(chat_recent), is_direct, is_private)
     future.add_done_callback(_log_processing_failure)
     return future
+
+
+def _send_private_reply(msg: dict, text: str) -> dict:
+    """Remember only text confirmed delivered to this operator's private chat."""
+    result = send_message(msg["chat"]["id"], text, reply_to=msg["message_id"])
+    if not _is_operator(msg.get("from", {})):
+        return result
+    # Earlier chunks can succeed even if the final send fails. Use the exact
+    # confirmed chunk text after publication gates, never the original draft.
+    delivered_messages = result.pop(_SENT_MESSAGES_KEY, None)
+    if delivered_messages is None:
+        delivered_messages = [result.get("result") or {}] if result.get("ok") else []
+    for delivered in delivered_messages:
+        if (type(delivered.get("message_id")) is not int
+                or delivered["message_id"] <= 0 or not isinstance(delivered.get("text"), str)):
+            continue
+        _private_history.append(msg["chat"]["id"], msg["from"]["id"], {
+            "message_id": delivered["message_id"],
+            "chat": {"id": msg["chat"]["id"], "type": "private"},
+            "from": {"username": BOT_USERNAME or AGENT_NAME, "is_bot": True},
+            "date": delivered.get("date", int(time.time())),
+            "text": delivered["text"],
+        })
+    return result
+
 
 
 def _process_one_message(msg: dict, chat_recent: list[dict], is_direct: bool, is_private: bool) -> None:
@@ -6518,6 +8080,14 @@ def _process_one_message(msg: dict, chat_recent: list[dict], is_direct: bool, is
         with _state_lock:
             if msg["message_id"] in _responded:
                 return
+
+        if is_private and operator:
+            # Read after the sender lock: a queued follow-up must see the
+            # preceding delivered reply, not the dispatch-time snapshot.
+            # Put this conversation last so the recent-message window includes
+            # it even when the operator also has cross-group background.
+            chat_recent = chat_recent + _private_history.snapshot(cid, sender_id)
+            _private_history.append(cid, sender_id, msg)
 
         # Download media if present (photos, docs, etc.)
         # PDFs are never downloaded (security) — just noted in context.
@@ -6594,7 +8164,7 @@ def _process_one_message(msg: dict, chat_recent: list[dict], is_direct: bool, is
                             api_result = _try_api_command(part)
                             if api_result is not None:
                                 # API handled it — send the result text to the DM as confirmation
-                                send_message(chat["id"], api_result, reply_to=msg["message_id"])
+                                _send_private_reply(msg, api_result)
                                 sent_count += 1
                                 continue
                             group_result = send_message(AGENTS_GROUP_ID, part,
@@ -6614,7 +8184,7 @@ def _process_one_message(msg: dict, chat_recent: list[dict], is_direct: bool, is
                         confirm = f"Sent {sent_count} message(s) to agents group (topic {topic_id})."
                         if preamble:
                             confirm = f"{preamble}\n\n{confirm}"
-                        send_message(chat["id"], confirm, reply_to=msg["message_id"])
+                        _send_private_reply(msg, confirm)
                         with _state_lock:
                             _responded.add(msg["message_id"])
                             _last_reply_to[sender["id"]] = time.time()
@@ -6630,13 +8200,13 @@ def _process_one_message(msg: dict, chat_recent: list[dict], is_direct: bool, is
                         api_result = _try_api_command(part)
                         if api_result is not None:
                             # Trade routed through API — send result back to DM
-                            r = send_message(chat["id"], api_result, reply_to=msg["message_id"])
+                            r = _send_private_reply(msg, api_result)
                             if r.get("ok"):
                                 any_dm_ok = True
                                 save_own_action(part, cid, "trade")
                             continue
                         # Regular text — send as DM
-                        result = send_message(chat["id"], part, reply_to=msg["message_id"])
+                        result = _send_private_reply(msg, part)
                         if result.get("ok"):
                             any_dm_ok = True
                             save_own_action(part, cid, "dm_reply")
@@ -6669,6 +8239,19 @@ def _process_one_message(msg: dict, chat_recent: list[dict], is_direct: bool, is
                             continue
                         result = send_message(chat["id"], part, thread_id=thread_id,
                                     reply_to=msg["message_id"] if is_direct else None)
+                        # Bind every Telegram-confirmed chunk to exact document
+                        # sources from this inbound turn's trusted grounding
+                        # trace. Command-result messages are handled above and
+                        # deliberately do not inherit creative provenance.
+                        _record_reply_document_sources(
+                            chat["id"],
+                            thread_id or 0,
+                            msg["message_id"],
+                            result.get(_SENT_MESSAGE_IDS_KEY, ()),
+                        )
+                        _record_reply_task_sources(
+                            msg, result.get(_SENT_MESSAGE_IDS_KEY, ())
+                        )
                         if result.get("ok"):
                             any_ok = True
                             atype = "trade" if part.strip().startswith(("/buy", "/sell")) else "group_reply"
@@ -6801,6 +8384,9 @@ def _process_api_mention(api_msg: dict, agents_recent: list[dict]) -> None:
                     continue
                 result = send_message(AGENTS_GROUP_ID, part,
                                     thread_id=api_topic)
+                _record_reply_task_sources(
+                    api_msg, result.get(_SENT_MESSAGE_IDS_KEY, ())
+                )
                 if result.get("ok"):
                     any_ok = True
                     atype = "trade" if part.strip().startswith(("/buy", "/sell")) else "api_reply"
@@ -6976,6 +8562,9 @@ def poll():
                     continue
 
                 chat = msg.get("chat", {})
+                # Bot API omits false optional flags. Record the known chat
+                # kind before reply thread IDs reach any context selector.
+                chat.setdefault("is_forum", False)
                 sender = msg.get("from", {})
                 # Persist the media marker onto the msg itself, then read the
                 # (possibly marker-prefixed) text — the context buffer, merge,
@@ -6991,7 +8580,7 @@ def poll():
                 # For non-forum groups/DMs, tid is None — this is intentional:
                 # (chat_id, None) is the canonical key for non-topic chats.
                 cid = chat.get("id", 0)
-                tid = msg.get("message_thread_id")
+                tid = conversation_topic_id(msg) or None
                 ctx_key = (cid, tid)
                 if cid in ALLOWED_GROUPS and text:
                     if ctx_key not in recent_by_chat:
@@ -7002,8 +8591,9 @@ def poll():
                 # Capture witnessed media file_ids before should_respond so a
                 # later related turn can rehydrate exact allowed media.
                 if msg.get("photo") or msg.get("document"):
-                    _record_seen_photo(cid, tid, msg)
-                    _record_seen_document(cid, tid, msg)
+                    media_tid = msg.get("message_thread_id")
+                    _record_seen_photo(cid, media_tid, msg)
+                    _record_seen_document(cid, media_tid, msg)
 
                 if not should_respond(msg):
                     continue

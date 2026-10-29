@@ -257,6 +257,51 @@ def test_codex_failure_records_breaker():
     assert not p.is_available()
 
 
+def test_codex_failure_logs_returncode_and_stderr_tail(caplog):
+    """Codex prints the session banner first and the real error LAST; the
+    failure log must carry the returncode and the stderr tail, or the cause
+    is invisible (every failure since v0.146 logged only banner + prompt echo)."""
+    p = CodexProvider(bin="/bin/echo")
+    stderr = (
+        "OpenAI Codex v0.147.0\n--------\nworkdir: /x\nmodel: gpt-5.6-luna\n"
+        + "prompt echo " * 100
+        + "\nERROR: stream disconnected before completion: upstream 502"
+    )
+    mock_result = type(
+        "R", (), {"returncode": 1, "stdout": "", "stderr": stderr}
+    )()
+    caplog.set_level(logging.ERROR, logger="providers")
+    with patch("subprocess.run", return_value=mock_result):
+        p.ask("test", timeout=1)
+    assert "rc=1" in caplog.text
+    assert "stream disconnected before completion: upstream 502" in caplog.text
+
+
+def test_codex_empty_output_with_zero_exit_logs_rc0(caplog):
+    """rc=0 with empty output (the wrapper sanctions returning empty) must be
+    distinguishable in logs from a crashed CLI."""
+    p = CodexProvider(bin="/bin/echo")
+    mock_result = type(
+        "R", (), {"returncode": 0, "stdout": "", "stderr": "banner only"}
+    )()
+    caplog.set_level(logging.ERROR, logger="providers")
+    with patch("subprocess.run", return_value=mock_result):
+        p.ask("test", timeout=1)
+    assert "rc=0" in caplog.text
+
+
+def test_codex_empty_output_identifies_stage_without_echoing_prompt(caplog):
+    p = CodexProvider(bin="/bin/echo")
+    result = subprocess.CompletedProcess([], 0, "", "PRIVATE PROMPT\nwarning: tools.view_image")
+    caplog.set_level(logging.ERROR, logger="providers")
+    with patch("subprocess.run", return_value=result):
+        assert p.ask("private task", timeout=1, tools="__research__") == ""
+    assert "code=empty_output" in caplog.text
+    assert "mode=__research__" in caplog.text
+    assert "input_hash=" in caplog.text
+    assert "PRIVATE PROMPT" not in caplog.text
+
+
 def test_codex_permission_profile_from_constructor_locks_down_sandbox_bypass():
     """A configured profile selects Codex permissions and omits sandbox bypass."""
     p = CodexProvider(bin="/bin/echo", permission_profile="benthic_agent")
@@ -355,21 +400,37 @@ def test_opencode_available_when_configured():
     assert p.is_available()
 
 
+def test_opencode_failure_logs_returncode_and_stderr_tail(caplog):
+    """Same head+tail failure logging as Codex — the error is at stderr's end."""
+    p = OpenCodeProvider(bin="/bin/echo", model="some/model")
+    stderr = "banner\n" + "echo " * 300 + "\nERROR: upstream unavailable"
+    mock_result = type(
+        "R", (), {"returncode": 1, "stdout": "", "stderr": stderr}
+    )()
+    caplog.set_level(logging.ERROR, logger="providers")
+    with patch("subprocess.run", return_value=mock_result):
+        p.ask("test", timeout=1)
+    assert "rc=1" in caplog.text
+    assert "ERROR: upstream unavailable" in caplog.text
+
+
 # ─── ProviderChain ──────────────────────────────────────────────────────────
 
 
 class ReceiptProvider:
-    def __init__(self, name, answers, model="model", effort="low"):
+    def __init__(self, name, answers, model="model", effort="low", tier=None):
         self.name = name
         self.answers = iter(answers)
         self.tiers = {}
         self.breaker = CircuitBreaker(max_failures=3, name=name)
-        self.call = ProviderCall(model=model, effort=effort, tier=None)
+        self.call = ProviderCall(model=model, effort=effort, tier=tier)
+        self.ask_calls = 0
 
     def is_available(self):
         return self.breaker.is_available()
 
     def ask(self, prompt, *, timeout=3600, **kwargs):
+        self.ask_calls += 1
         return next(self.answers)
 
     def resolved_call(self, **kwargs):
@@ -396,6 +457,109 @@ def test_validated_call_rejects_nonempty_invalid_primary():
     )
     assert result.provider == "secondary"
     assert primary.breaker._failures == 1
+
+
+def test_primary_contract_retry_accepts_second_valid_primary_response():
+    """One opted-in retry stays on the resolved primary before fallback."""
+    primary = ReceiptProvider(
+        "codex",
+        ["not-json", '{"pass":true}'],
+        model="gpt-5.6-terra",
+        effort="medium",
+        tier="classification",
+    )
+    fallback = ReceiptProvider("claude", ['{"pass":true}'])
+
+    result = ProviderChain([primary, fallback]).ask_validated(
+        "prompt",
+        validator=lambda text: text.startswith("{"),
+        timeout=300,
+        primary_contract_retries=1,
+    )
+
+    assert result == ProviderResult(
+        '{"pass":true}',
+        "codex",
+        "gpt-5.6-terra",
+        "medium",
+        "classification",
+    )
+    assert primary.ask_calls == 2
+    assert fallback.ask_calls == 0
+    assert primary.breaker._failures == 0
+
+
+def test_primary_contract_retry_defaults_to_zero():
+    """Ordinary validated calls preserve the existing immediate fallback."""
+    primary = ReceiptProvider("primary", ["not-json", '{"pass":true}'])
+    fallback = ReceiptProvider("fallback", ['{"pass":true}'])
+
+    result = ProviderChain([primary, fallback]).ask_validated(
+        "prompt",
+        validator=lambda text: text.startswith("{"),
+        timeout=300,
+    )
+
+    assert result.provider == "fallback"
+    assert primary.ask_calls == 1
+    assert fallback.ask_calls == 1
+
+
+def test_primary_contract_retry_does_not_bypass_opened_breaker():
+    """The invalid attempt may open the breaker, which cancels its retry."""
+    primary = ReceiptProvider("primary", ["not-json", '{"pass":true}'])
+    primary.breaker.record_failure()
+    primary.breaker.record_failure()
+    fallback = ReceiptProvider("fallback", ['{"pass":true}'])
+
+    result = ProviderChain([primary, fallback]).ask_validated(
+        "prompt",
+        validator=lambda text: text.startswith("{"),
+        timeout=300,
+        primary_contract_retries=1,
+    )
+
+    assert result.provider == "fallback"
+    assert primary.ask_calls == 1
+    assert fallback.ask_calls == 1
+    assert not primary.is_available()
+
+
+def test_primary_contract_retry_never_retries_valid_or_empty_output():
+    """Only non-empty contract-invalid primary output spends retry budget."""
+    valid = ReceiptProvider("valid", ['{"pass":true}', "unused"])
+    empty = ReceiptProvider("empty", ["", "unused"])
+    fallback = ReceiptProvider("fallback", ['{"pass":true}'])
+
+    valid_result = ProviderChain([valid]).ask_validated(
+        "prompt",
+        validator=lambda text: text.startswith("{"),
+        primary_contract_retries=1,
+    )
+    empty_result = ProviderChain([empty, fallback]).ask_validated(
+        "prompt",
+        validator=lambda text: text.startswith("{"),
+        primary_contract_retries=1,
+    )
+
+    assert valid_result.provider == "valid"
+    assert empty_result.provider == "fallback"
+    assert valid.ask_calls == 1
+    assert empty.ask_calls == 1
+    assert fallback.ask_calls == 1
+
+
+@pytest.mark.parametrize("value", (True, -1, 1.5, "1"))
+def test_primary_contract_retry_rejects_invalid_configuration(value):
+    """Retry counts are strict non-negative integers, excluding booleans."""
+    chain = ProviderChain([ReceiptProvider("primary", ['{"pass":true}'])])
+
+    with pytest.raises(ValueError, match="primary_contract_retries"):
+        chain.ask_validated(
+            "prompt",
+            validator=lambda text: True,
+            primary_contract_retries=value,
+        )
 
 
 def test_validated_call_uses_at_most_one_fallback():
@@ -726,7 +890,7 @@ def test_codex_media_sentinel_attaches_only_exact_allowed_paths(tmp_path):
     command = captured["cmd"]
     assert "--ignore-user-config" in command
     assert 'web_search="disabled"' in command
-    assert "tools.view_image=false" in command
+    assert "tools.view_image=false" not in command
     assert [
         command[index + 1]
         for index, value in enumerate(command[:-1])
@@ -737,7 +901,7 @@ def test_codex_media_sentinel_attaches_only_exact_allowed_paths(tmp_path):
         for index, value in enumerate(command[:-1])
         if value == "--disable"
     }
-    assert {"shell_tool", "browser_use", "apps", "image_generation"} <= disabled
+    assert {"shell_tool", "browser_use", "apps", "image_generation", "view_image"} <= disabled
     assert "--dangerously-bypass-approvals-and-sandbox" not in command
     assert not any(
         value.startswith("default_permissions=") for value in command
@@ -830,7 +994,8 @@ def test_codex_research_sentinel_enables_web_without_shell():
     assert "shell_tool" in disabled
     assert "apps" in disabled
     assert "browser_use" in disabled
-    assert "tools.view_image=false" in command
+    assert "tools.view_image=false" not in command
+    assert "view_image" in disabled
 
 
 def test_opencode_declines_unenforceable_research_sentinel():
@@ -1006,18 +1171,17 @@ def test_claude_no_tier_falls_through_to_defaults():
     assert p.resolved_call().model == "opus"
 
 
-def test_codex_tier_classification_uses_luna_low_effort():
-    """tier='classification' on Codex uses the shared cheap model and low effort.
-    2026-07-10: gpt-5.3-codex-spark -> gpt-5.6-luna (5.6 family adoption)."""
+def test_codex_tier_classification_uses_luna_medium_effort():
+    """tier='classification' on Codex uses the shared Luna model at medium effort."""
     p = CodexProvider(bin="/bin/echo", model="gpt-5.5", effort="xhigh")
     calls, fake = _captured_subprocess_args()
     with patch("subprocess.run", side_effect=fake):
         p.ask("test", timeout=1, tier="classification")
     cmd = calls[0]
-    # -c model_reasoning_effort=low expected
-    assert any("model_reasoning_effort=low" in c for c in cmd)
+    # -c model_reasoning_effort=medium expected
+    assert any("model_reasoning_effort=medium" in c for c in cmd)
     # classification tier intentionally overrides the construction model.
-    assert "gpt-5.6-luna" in cmd
+    assert "gpt-6-luna" in cmd
     assert "gpt-5.5" not in cmd
 
 
@@ -1038,16 +1202,14 @@ def test_codex_disables_plugins_and_project_docs():
     assert any("project_doc_max_bytes=0" in c for c in cmd)
 
 
-def test_codex_construction_defaults_are_56_sol_xhigh():
-    """No model/effort args -> the 5.6 flagship at xhigh (2026-07-11 downshift
-    from ultra to stretch the shared sol+luna quota pool). luna calls go
-    through the classification tier preset above, never these defaults."""
+def test_codex_construction_defaults_are_6_sol_xhigh():
+    """No model/effort args use Sol at xhigh; Luna uses the tier preset."""
     p = CodexProvider(bin="/bin/echo")
     calls, fake = _captured_subprocess_args()
     with patch("subprocess.run", side_effect=fake):
         p.ask("test", timeout=1)
     cmd = calls[0]
-    assert "gpt-5.6-sol" in cmd
+    assert "gpt-6-sol" in cmd
     assert any("model_reasoning_effort=xhigh" in c for c in cmd)
 
 
@@ -1111,7 +1273,7 @@ def test_codex_no_web_search_for_empty_tools_sentinel():
 
 
 def test_codex_none_tools_sentinel_builds_hard_text_only_command():
-    """The explicit sentinel must remove every Codex 0.144 tool surface."""
+    """The explicit sentinel disables image reads using the current CLI gate."""
     captured = {}
 
     def fake_run(*args, **kwargs):
@@ -1144,7 +1306,7 @@ def test_codex_none_tools_sentinel_builds_hard_text_only_command():
     assert cmd[cmd.index("--sandbox") + 1] == "read-only"
     assert "approval_policy=never" in cmd
     assert 'web_search="disabled"' in cmd
-    assert "tools.view_image=false" in cmd
+    assert "tools.view_image=false" not in cmd
     assert "--dangerously-bypass-approvals-and-sandbox" not in cmd
     assert "--add-dir" not in cmd
     assert not any(value.startswith("default_permissions=") for value in cmd)
@@ -1169,6 +1331,7 @@ def test_codex_none_tools_sentinel_builds_hard_text_only_command():
         "remote_plugin",
         "shell_tool",
         "tool_suggest",
+        "view_image",
     }
 
     command_cwd = Path(cmd[cmd.index("-C") + 1])
@@ -1207,7 +1370,7 @@ def test_chain_forwards_tier_kwarg():
     with patch("subprocess.run", side_effect=fake):
         chain.ask("test", timeout=1, tier="classification")
     cmd = calls[0]
-    assert any("model_reasoning_effort=low" in c for c in cmd)
+    assert any("model_reasoning_effort=medium" in c for c in cmd)
 
 
 def test_unknown_tier_silently_falls_through_to_defaults():

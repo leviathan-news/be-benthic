@@ -2,7 +2,7 @@
 
 White-label news curation agent for [Leviathan News](https://leviathannews.xyz) — a decentralized crypto/DeFi news platform where contributors earn $SQUID tokens. Fork it, set `AGENT_NAME`, and run your own instance.
 
-The agent monitors Telegram news channels, evaluates newsworthiness via a provider chain (Codex primary, Claude fallback by default — swappable via `PROVIDER_ORDER`), crafts headlines, submits articles, votes, comments, and replies — all autonomously in a continuous loop.
+The agent monitors Telegram news channels (hourly plus real-time push), evaluates newsworthiness via a provider chain (Codex by default — Claude/OpenCode adapters are opt-in via `PROVIDER_ORDER`), crafts headlines, posts to an optional Telegram news channel, submits the hottest stories to Leviathan, votes, comments, and replies — all autonomously in a continuous loop.
 
 ## How It Works
 
@@ -20,7 +20,7 @@ Channels      Deduplicate       LN API        Comment          Responses
   └─ Cache IDs    │  verification  │  headline     │  others' yaps  │  replies
                   └─ JSON output   ├─ Submit       └─ Self-upvote   └─ Sentinel
                                    ├─ Self-upvote                      verify
-                                   └─ TL;DR comment
+                                   └─ Channel post
 ```
 
 Two additions run alongside the classic 5-phase cycle: a flag-gated **Phase 6
@@ -30,17 +30,29 @@ prediction markets for approved articles, and a **live-news WebSocket listener**
 throttled between-cycle **mini-pass** votes/comments minutes after approval
 instead of up to an hour later.
 
+**Real-time sources and routing.** With `ENABLE_SOURCE_PUSH` (default on), a
+Telethon push handler queues new source messages between cycles and a
+throttled **news mini-pass** evaluates and posts them within minutes. Every
+story carries an evaluator **heat** score (1–10): stories at or above
+`LN_SUBMIT_MIN_HEAT` (default 8) are submitted to Leviathan; when
+`BENTHIC_NEWS_CHANNEL` is set, every curated story is also posted to that
+Telegram channel with Leviathan links. With no channel configured, only
+the hot leg runs (set `LN_SUBMIT_MIN_HEAT=1` to submit every newsworthy
+story, the pre-channel behavior).
+
 ## Features
 
 - **Provider-agnostic LLM dispatch** (`providers.py`): Codex / Claude / OpenCode interchangeably. `PROVIDER_ORDER` env picks the primary; the rest are fallbacks. Each provider has its own circuit breaker — failures in one don't penalize the others.
-- **Semantic tier abstraction**: caller code says `tier="classification"` for cheap/fast calls; each provider maps that to its own model+effort (Claude→sonnet/low, Codex→same model at low effort). No Claude-specific model names leak into provider-neutral call sites.
+- **Semantic tier abstraction**: caller code says `tier="classification"` for cheap/fast calls; each provider maps that to its own model+effort (Codex→`gpt-6-luna`/medium, Claude→sonnet/low). No provider-specific model names leak into provider-neutral call sites.
+- **Opt-in Jev evaluator** (`jev_news.py`): bounded typed decisions (newsworthiness, witnessed-URL choice, heat, duplicates, votes, market/reply/engagement gates) from TypeSafe's Jev model, enabled per task via `JEV_TASKS`. Jev never writes public prose and never silently falls back to Codex.
 - **6-layer prompt injection defense**: input sanitization, XML boundary tags, output injection detection, NFKD Unicode normalization, URL validation, independent sentinel verification on replies
-- **Wallet-based auth**: EIP-191 signature flow with thread-safe session management (30-min refresh, RLock)
+- **LN auth**: `X-API-Key` (`LN_API_KEY` / `LN_API_KEY_FILE`) or EIP-191 wallet signature flow, with thread-safe session management (30-min refresh, RLock) and login backoff that respects LN's shared nonce limits
 - **Headline validation**: 10 automated checks (character count, sentence case, passive voice, articles, etc.) via bundled bash validator
 - **Story deduplication**: four layers — local DB URL check, self-dedup word-overlap against own last-24h posts, provenance-API short-circuit (positive matches trusted, absence falls through), deterministic Bot HQ fetch + classification-tier semantic match
 - **Anti-AI-detection**: banned phrase filtering to avoid patterns that get content deprioritized
 - **Cursor-based Telegram pagination**: with numeric ID caching to avoid flood waits
-- **Evidence-grounded replies** (`reply_grounding.py`): the chat bot composes public replies from typed evidence bundles (focal URLs, bounded research, media observations), verifies every claim against evidence, repairs once, and re-verifies — no failure path may substitute stale context for missing evidence
+- **Evidence-grounded replies** (`reply_grounding.py`): the chat bot composes public replies from typed evidence bundles (focal URLs, bounded research, media observations, full-text documents, public YouTube captions, exact private Telegram message links in allowed groups, onchain pool scans), verifies every claim against evidence, repairs once, and re-verifies — no failure path may substitute stale context for missing evidence
+- **Optional browser reader** (`browser_reader.py`, `browser-reader/`): renders JS-only pages in a disposable, network-less, read-only container whose every request goes back through the same pinned, budgeted HTTP fetcher; without Docker or the image, those pages simply fail as unavailable sources
 - **Runtime-mediated sandbox**: chat models emit a `[SANDBOX]` code block; trusted bot Python intent-gates and executes it in a locked-down Docker container (bounded output, credential-free env), then a tools-disabled pass synthesizes the answer
 - **Breaking-news reactions**: the bot drains the WS event queue and pings the group about genuinely notable stories (hard rate/freshness gates + classification notability gate before any creative call)
 - **Codex lockdown policy** (`codex-policy/`): permission profiles + execpolicy rules that deny every `~/.claude` secret inside the Codex sandbox while allowlisted wrapper scripts run outside it
@@ -62,12 +74,16 @@ Installed via `pip install -r requirements.txt`:
 - [Pillow](https://pillow.readthedocs.io/) — image processing (media analysis in chat bot)
 - [websockets](https://websockets.readthedocs.io/) — live-news WS listener
 
+Optional, for YouTube caption grounding (hash-pinned):
+`pip install --require-hashes -r requirements/youtube-transcript.lock`.
+Without it, YouTube links fail as unavailable captions.
+
 ### External Runtime Dependencies
 
 You need **at least one** LLM provider. Configure the priority via `PROVIDER_ORDER`:
 
-- **[Codex CLI](https://github.com/openai/codex)** (`codex`) — primary by default. Auto-detected or set `CODEX_BIN`. Default model: `gpt-5.6-sol` at `xhigh` reasoning effort.
-- **[Claude CLI](https://docs.anthropic.com/en/docs/claude-code)** (`claude`) — fallback by default. Must be on `$PATH` or set `CLAUDE_BIN`.
+- **[Codex CLI](https://github.com/openai/codex)** (`codex`) — the default (and only default) provider. Auto-detected or set `CODEX_BIN`. Default model: `gpt-6-sol` at `xhigh` reasoning effort.
+- **[Claude CLI](https://docs.anthropic.com/en/docs/claude-code)** (`claude`) — legacy adapter, opt-in via `PROVIDER_ORDER=codex,claude`. Must be on `$PATH` or set `CLAUDE_BIN`.
 - **[OpenCode CLI](https://opencode.ai/)** (optional) — additional fallback. Set `OPENCODE_BIN` and `OPENCODE_MODEL` to enable.
 - **Telegram API credentials** — `api_id` and `api_hash` from [my.telegram.org](https://my.telegram.org)
 - **Ethereum wallet** — private key for LN API authentication (EIP-191 signing)
@@ -126,14 +142,14 @@ See [.env.example](.env.example) for a complete template with `export` lines you
 | `BOT_HQ_GROUP_ID` | — (skip HQ dedup) | Telegram group ID used as ground truth for duplicate detection |
 | `CLAUDE_BIN` | auto-detected | Path to Claude CLI binary |
 | `CODEX_BIN` | auto-detected | Path to Codex CLI binary |
-| `CODEX_MODEL` | `gpt-5.6-sol` | Model for Codex |
+| `CODEX_MODEL` | `gpt-6-sol` | Model for Codex |
 | `CODEX_EFFORT` | `xhigh` | Codex reasoning effort: `low` / `medium` / `high` / `xhigh` |
 | `OPENCODE_BIN` | auto-detected | Path to OpenCode CLI binary |
 | `OPENCODE_MODEL` | — (disabled) | OpenCode model (e.g. `anthropic/claude-sonnet-4-5`). Required to enable. |
-| `PROVIDER_ORDER` | `codex,claude` | Comma-separated provider priority (first available is primary). Add `opencode` explicitly (with `OPENCODE_MODEL`) to enable OpenCode. |
+| `PROVIDER_ORDER` | `codex` | Comma-separated provider priority (first available is primary). Add `opencode` explicitly (with `OPENCODE_MODEL`) to enable OpenCode. |
 | `CLAUDE_LIMIT_COOLDOWN` | `21600` (6h) | Seconds to skip Claude after quota/rate-limit error |
 | `CHANNELS` | `[]` | JSON array of Telegram channels, e.g. `'["@chan1","@chan2"]'` |
-| `PRIVATE_CHANNELS` | `[]` | JSON array of private channel display names |
+| `ID_SOURCES` | `{}` | JSON object of private channels/groups without a stable @username: `'{"-1001234567890": "Feed label"}'` (the label keys cursors and queue rows) |
 | `HEADLINE_BOT_USER_ID` | `0` (any) | Optional Telegram user ID of the headline bot. When set, Bot HQ dedup filters to messages from that user only. |
 | `CYCLE_INTERVAL` | `3600` (1h) | Seconds between cycles |
 | `INITIAL_LOOKBACK_HOURS` | `1` | Hours to look back on first run |
@@ -147,6 +163,20 @@ See [.env.example](.env.example) for a complete template with `export` lines you
 | `ENABLE_WS_EVENTS` / `ENABLE_WS_MINI_PASS` | `1` / `1` | Live-news WS listener + between-cycle mini-pass |
 | `ENABLE_MARKET_MATCH` | `0` | Flag-gated market-match phase |
 | `CYCLE_DEADLINE_SECONDS` | `3300` | Watchdog deadline for one full cycle |
+| `LN_API_KEY` / `LN_API_KEY_FILE` | — / `~/.claude/.ln-api-key` | LN `squid_` API key; replaces wallet login when present |
+| `LN_TELEGRAM_SESSION` | `~/.claude/agent_session.session` | Telethon session for ln-agent (give it its own authorization) |
+| `BENTHIC_NEWS_CHANNEL` | — (off) | Telegram channel (`@name` or id) for curated posts; the bot must be an admin |
+| `ENABLE_CHANNEL_POSTS` | `1` | Channel posting switch (effective only with a channel) |
+| `LN_SUBMIT_MIN_HEAT` | `8` | Heat (1–10) needed for an editorial LN submission; `1` = submit every newsworthy story |
+| `ENABLE_WIRE_SUBMISSIONS` | `0` | Submit cold/demoted stories as LN wire rows (staff-only on LN) |
+| `ENABLE_SOURCE_PUSH` | `1` | Real-time Telethon push + news mini-pass (`0` = hourly only) |
+| `PUSH_EXCLUDED_SOURCES` | — | Comma list of channels/ID_SOURCES labels kept hourly-only |
+| `NEWS_PASS_MIN_INTERVAL` / `NEWS_PASS_DEADLINE` / `NEWS_PASS_MAX_MESSAGES` | `900` / `1200` / `25` | News mini-pass throttle (interval `1` in Jev real-time mode) |
+| `PUSH_RESOLVE_PACING` / `PUSH_REGISTER_TIMEOUT` | `0.3` / `300` | Push registration pacing and bound (seconds) |
+| `ARTICLE_COMMENT_MAX_PER_24H` | `3` | Rolling cap on unsolicited analysis comments (`0` disables) |
+| `ENGAGEMENT_RECONCILE_INTERVAL` / `REPLY_CHECK_INTERVAL` | `3600` / `600` | Jev-mode engagement and reply worker intervals |
+| `JEV_TASKS` | — (off) | Comma list: `news`, `votes`, `duplicates`, `market_prefilter`, `reply_gate`, `breaking_news`, `engagement` |
+| `JEV_API_KEY_FILE` / `TYPESAFE_API_KEY` | `jev.key` beside `jev_news.py` / — | TypeSafe key for Jev (never logged) |
 
 Telegram user-session credentials live at fixed paths: `~/.claude/telegram-creds.json` and `~/.claude/agent_session.session`. Advanced tuning knobs (WS backoff, mini-pass caps, market-match confidence, grounding limits) are documented in [.env.example](.env.example).
 
@@ -212,13 +242,13 @@ The agent processes untrusted input (Telegram messages, user comments) and produ
 3. **`check_output_for_injection()`** — validates output for signs of successful injection (secret leakage, "ignore previous instructions", AI self-identification)
 4. **NFKD Unicode normalization** — defeats homoglyph bypass attempts in injection detection
 5. **`validate_url()`** — rejects control characters, non-HTTP schemes, oversized URLs in LLM-returned content
-6. **Sentinel verification** — independent Sonnet-based semantic check on reply output before posting (different model for cross-verification)
+6. **Sentinel verification** — independent classification-tier semantic check (`gpt-6-luna` under the Codex default) on reply output before posting — a different model from the creative one
 
 Fail-safe defaults: freshness checks fail open (article already passed evaluation), duplicate checks fail closed (unknown = reject).
 
 ## Database
 
-Agent state lives in `agent.db` (SQLite, WAL mode). Tables: `channel_cursors`, `channel_ids`, `evaluated_messages`, `posted_articles`, `commented_articles`, `voted_articles`, `voted_yaps`, `replied_yaps`, `runs`, `chat_history`, `notes`, `own_actions`, `knowledge`, `market_decisions`, `ws_events`, `build_tasks`, `reply_grounding_traces`, `seen_photos`, `seen_documents`.
+Agent state lives in `agent.db` (SQLite, WAL mode). Tables: `channel_cursors`, `channel_ids`, `evaluated_messages`, `posted_articles`, `commented_articles`, `unsolicited_article_comments`, `voted_articles`, `voted_yaps`, `replied_yaps`, `runs`, `pending_source_messages`, `jev_news_jobs`, `chat_history`, `notes`, `own_actions`, `knowledge`, `market_decisions`, `ws_events`, `build_tasks`, `reply_grounding_traces`, `reply_document_sources`, `reply_task_messages`, `seen_photos`, `seen_documents`.
 
 ```bash
 # Inspect counts
@@ -260,6 +290,16 @@ be-benthic/
 ├── benthic-bot.py           # Telegram chat bot (shared brain + memory)
 ├── benthic-builder.py       # Optional Codex-powered build daemon
 ├── reply_grounding.py       # Evidence-grounding contracts for bot replies
+├── task_context.py          # Authenticated multi-turn task continuity
+├── private_conversation.py  # Bounded process-local DM history
+├── browser_reader.py        # Optional container-rendered page reader
+├── browser-reader/         # Reader image (Dockerfile, seccomp, worker)
+├── onchain_evidence.py      # Onchain pool-scan evidence contracts
+├── onchain_worker.py        # Read-only pool scanner run inside the sandbox
+├── ln_archive.py            # Bounded LN archive search projection
+├── jev_news.py              # Opt-in Jev evaluator adapter
+├── jev_queue.py             # Durable Jev evaluation/publication queue
+├── jev_sources.py           # Bounded source reads for Jev triage
 ├── appserver_client.py      # JSON-RPC client for `codex app-server`
 ├── providers.py             # Provider-agnostic LLM dispatch (Claude/Codex/OpenCode + chain)
 ├── prompt_loader.py         # Shared prompt template loader
@@ -271,10 +311,13 @@ be-benthic/
 ├── prompts/                 # External prompt templates with {placeholders}
 │   ├── agent/               # News agent prompts
 │   ├── bot/                 # Chat bot prompts + knowledge topics
+│   ├── jev/                 # Jev news policy (typed questions)
 │   └── _shared/             # Shared blocks (anti-slop ruleset)
 ├── scripts/
 │   ├── twitter_fetch.py     # No-op stub (replace with your own)
-│   └── eval_reply_grounding.py  # Grounding-pipeline eval harness
+│   ├── youtube_caption_fetch.py # Pinned public-caption helper
+│   ├── codex_usage_report.py    # Codex usage → operator DM
+│   └── eval_*.py            # Offline/live eval harnesses (grounding, replays, voice, Jev, onchain)
 ├── skills/
 │   ├── telegram-explorer/
 │   │   ├── SKILL.md          # Telegram skill definition
@@ -293,6 +336,7 @@ be-benthic/
 ├── tests/                   # pytest test suite (includes provider chain unit tests)
 ├── ecosystem.config.js      # PM2 deployment config
 ├── requirements.txt         # Python dependencies
+├── requirements/            # Optional hash-pinned locks (YouTube captions)
 ├── requirements-dev.txt     # Dev dependencies (pytest)
 ├── .env.example             # Environment variable template
 ├── CLAUDE.md                # Claude Code context (architecture, conventions)
@@ -309,7 +353,7 @@ pip install -r requirements-dev.txt
 python -m pytest tests/ -v
 ```
 
-1,100+ tests covering the provider chain, evidence-grounding pipeline, sandbox directives, build queue, breaking news, market matching, dedup layers, and the security-critical functions (`sanitize_untrusted()`, `check_output_for_injection()`, `validate_url()`, `validate-headline.sh`, `AgentDB`, prompt templates, GitHub client enforcement).
+1,900+ tests covering the provider chain, evidence-grounding pipeline, channel routing, source push, Jev adapter, sandbox directives, build queue, breaking news, market matching, dedup layers, and the security-critical functions (`sanitize_untrusted()`, `check_output_for_injection()`, `validate_url()`, `validate-headline.sh`, `AgentDB`, prompt templates, GitHub client enforcement).
 
 ## Chat Bot
 
@@ -355,9 +399,12 @@ python -m pytest tests/ -v
 | `ALLOWED_GROUPS` | No | JSON array of additional group IDs: `'[-100123456789]'` |
 | `OPERATOR_IDS` | No | JSON array of Telegram user IDs: `'[12345678]'` |
 | `AGENT_DIR` | No | Agent directory for operator Bash tool restrictions (default: script directory) |
-| `PROVIDER_ORDER` | No | Comma-separated provider priority (default: `codex,claude`; add `opencode` explicitly to enable it) |
-| `CODEX_MODEL` / `CODEX_EFFORT` | No | Codex model + reasoning effort (defaults: `gpt-5.6-sol` / `xhigh`) |
-| `CODEX_CLASSIFY_MODEL` | No | Codex classification-tier model (default `gpt-5.6-terra`) |
+| `PROVIDER_ORDER` | No | Comma-separated provider priority (default: `codex`; add `claude` / `opencode` explicitly to enable them) |
+| `CODEX_MODEL` / `CODEX_EFFORT` | No | Codex model + reasoning effort (defaults: `gpt-6-sol` / `xhigh`) |
+| `CODEX_REPLY_MODEL` | No | Model for grounded chat composition and repair (default `gpt-6-astra`) |
+| `CODEX_CLASSIFY_MODEL` | No | Codex classification-tier model (default `gpt-6-luna`) |
+| `GROUNDING_BROWSER_READER` | No | Container page reader for JS-only pages (default `1`; `0` = static reads only) |
+| `USAGE_REPORT_CHAT_ID` | For `scripts/codex_usage_report.py` | Operator's Telegram user id for Codex usage reports (never a group) |
 | `BENTHIC_DB` / `BENTHIC_LOG_FILE` | No | Override DB / log paths (also used by the test suite) |
 | `ENABLE_REPLY_GROUNDING` | No | Evidence-grounded reply pipeline (default on; `0` = emergency rollback) |
 | `OPENCODE_MODEL` | No | OpenCode model to enable it (e.g. `anthropic/claude-sonnet-4-5`) |
@@ -371,7 +418,7 @@ export AGENTS_GROUP_ID="-100XXXXXXXXXX"
 
 # Optional: set operator and provider
 export OPERATOR_IDS='[YOUR_TELEGRAM_USER_ID]'
-export PROVIDER_ORDER=opencode,codex  # if you don't have Claude CLI
+export PROVIDER_ORDER=codex,opencode  # optional extra fallback (needs OPENCODE_MODEL)
 
 # Run directly
 python3 benthic-bot.py

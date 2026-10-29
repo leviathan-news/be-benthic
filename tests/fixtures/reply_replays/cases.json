@@ -1,0 +1,274 @@
+[
+  {
+    "name": "split_url_caption",
+    "history": [
+      {
+        "id": 100,
+        "text": "https://replays.iana.org/shared-conversation",
+        "seconds_ago": 20
+      }
+    ],
+    "turns": [
+      {
+        "id": 101,
+        "text": "Benthic, explain Aster's two practical recommendations in that shared review of Harbor News.",
+        "seconds_ago": 10,
+        "expect": {
+          "required_groups": [
+            [
+              "replay",
+              "transcript"
+            ],
+            [
+              "source identity",
+              "correct source",
+              "source attribution"
+            ]
+          ],
+          "forbidden": [
+            "buying new servers",
+            "send the link again",
+            "resend",
+            "paste the link",
+            "I need a little more context"
+          ],
+          "required_focal_urls": [
+            "https://replays.iana.org/shared-conversation"
+          ],
+          "verifier_pass": true
+        }
+      }
+    ]
+  },
+  {
+    "name": "correction_after_reload",
+    "history": [],
+    "turns": [
+      {
+        "id": 200,
+        "text": "Benthic, explain the two practical recommendations in this review: https://replays.iana.org/shared-conversation",
+        "seconds_ago": 7200,
+        "expect": {
+          "required_groups": [
+            [
+              "replay",
+              "transcript"
+            ],
+            [
+              "source identity",
+              "correct source",
+              "source attribution"
+            ]
+          ],
+          "forbidden": [
+            "buying new servers",
+            "send the link again",
+            "resend",
+            "paste the link",
+            "I need a little more context"
+          ],
+          "required_focal_urls": [
+            "https://replays.iana.org/shared-conversation"
+          ],
+          "verifier_pass": true
+        }
+      },
+      {
+        "id": 203,
+        "text": "No, continue with the shared review: explain both practical recommendations, not general model advice.",
+        "seconds_ago": 0,
+        "reply_to_previous_bot": true,
+        "reload": true,
+        "expect": {
+          "required_groups": [
+            [
+              "replay",
+              "transcript"
+            ],
+            [
+              "source identity",
+              "correct source",
+              "source attribution"
+            ]
+          ],
+          "forbidden": [
+            "buying new servers",
+            "send the link again",
+            "resend",
+            "paste the link",
+            "I need a little more context"
+          ],
+          "required_focal_urls": [
+            "https://replays.iana.org/shared-conversation"
+          ],
+          "verifier_pass": true,
+          "no_reference_classifier": true
+        }
+      }
+    ]
+  },
+  {
+    "name": "exact_source_amid_distractors",
+    "history": [
+      {
+        "id": 300,
+        "text": "Earlier we discussed server replacement: https://replays.iana.org/distractor",
+        "seconds_ago": 120,
+        "sender_id": 9992
+      },
+      {
+        "id": 301,
+        "text": "https://replays.iana.org/shared-conversation",
+        "seconds_ago": 60
+      }
+    ],
+    "turns": [
+      {
+        "id": 309,
+        "text": "Benthic, use the shared review I posted earlier to explain its two practical recommendations for Harbor News.",
+        "seconds_ago": 0,
+        "select_message_id": 301,
+        "expect": {
+          "required_groups": [
+            [
+              "replay",
+              "transcript"
+            ],
+            [
+              "source identity",
+              "correct source",
+              "source attribution"
+            ]
+          ],
+          "forbidden": [
+            "buying new servers",
+            "send the link again",
+            "resend",
+            "paste the link",
+            "I need a little more context"
+          ],
+          "required_focal_urls": [
+            "https://replays.iana.org/shared-conversation"
+          ],
+          "verifier_pass": true
+        }
+      }
+    ]
+  },
+  {
+    "name": "mixed_failure_first",
+    "history": [],
+    "turns": [
+      {
+        "id": 400,
+        "text": "Benthic, explain the shared review's two recommendations and compare them with the audit findings. Answer the supported parts if either page is unavailable.\nhttps://replays.iana.org/unavailable-audit\nhttps://replays.iana.org/shared-conversation",
+        "expect": {
+          "required_groups": [
+            [
+              "replay",
+              "transcript"
+            ],
+            [
+              "source identity",
+              "correct source",
+              "source attribution"
+            ],
+            [
+              "couldn't read",
+              "could not read",
+              "unavailable",
+              "unable to access",
+              "couldn't access"
+            ]
+          ],
+          "forbidden": [
+            "buying new servers",
+            "send the link again",
+            "resend",
+            "paste the link",
+            "I need a little more context"
+          ],
+          "required_focal_urls": [
+            "https://replays.iana.org/shared-conversation"
+          ],
+          "verifier_pass": true
+        }
+      }
+    ]
+  },
+  {
+    "name": "mixed_failure_last",
+    "history": [],
+    "turns": [
+      {
+        "id": 500,
+        "text": "Benthic, explain the shared review's two recommendations and compare them with the audit findings. Answer the supported parts if either page is unavailable.\nhttps://replays.iana.org/shared-conversation\nhttps://replays.iana.org/unavailable-audit",
+        "expect": {
+          "required_groups": [
+            [
+              "replay",
+              "transcript"
+            ],
+            [
+              "source identity",
+              "correct source",
+              "source attribution"
+            ],
+            [
+              "couldn't read",
+              "could not read",
+              "unavailable",
+              "unable to access",
+              "couldn't access"
+            ]
+          ],
+          "forbidden": [
+            "buying new servers",
+            "send the link again",
+            "resend",
+            "paste the link",
+            "I need a little more context"
+          ],
+          "required_focal_urls": [
+            "https://replays.iana.org/shared-conversation"
+          ],
+          "verifier_pass": true
+        }
+      }
+    ]
+  },
+  {
+    "name": "all_required_sources_unavailable",
+    "history": [
+      {
+        "id": 600,
+        "text": "Earlier hardware discussion: https://replays.iana.org/distractor",
+        "seconds_ago": 60
+      }
+    ],
+    "turns": [
+      {
+        "id": 601,
+        "text": "Benthic, summarize the audit findings from this exact page: https://replays.iana.org/unavailable-audit\nBackground only: https://replays.iana.org/distractor",
+        "expect": {
+          "required_groups": [
+            [
+              "couldn't",
+              "could not",
+              "unable"
+            ]
+          ],
+          "forbidden": [
+            "buying new servers",
+            "replaying complete",
+            "source identity",
+            "resend"
+          ],
+          "required_focal_urls": [],
+          "verifier_pass": false,
+          "terminal_failure": true
+        }
+      }
+    ]
+  }
+]

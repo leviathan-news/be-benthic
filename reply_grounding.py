@@ -35,6 +35,9 @@ from urllib.parse import (
 import uuid
 import xml.etree.ElementTree as ElementTree
 
+from task_context import TaskContext
+from ln_archive import project_archive
+
 
 _MAX_CLAIM_CHARS = 2_000
 _X_ROOT_HOSTS = ("x.com", "twitter.com")
@@ -42,6 +45,12 @@ _X_STATUS_PATH = re.compile(
     r"^/([A-Za-z0-9_]{1,50})/status/([0-9]+)"
     r"(?:/(?:photo|video)/[0-9]+)?/?$"
 )
+_YOUTUBE_VIDEO_ID_RE = re.compile(r"^[A-Za-z0-9_-]{11}$")
+_YOUTUBE_WATCH_HOSTS = frozenset({
+    "youtube.com", "www.youtube.com", "m.youtube.com",
+})
+_YOUTUBE_SHORT_HOSTS = frozenset({"youtu.be", "www.youtu.be"})
+_YOUTUBE_ROOT_HOSTS = ("youtube.com", "youtu.be")
 _XML_CONTENT_TYPES = {
     "application/atom+xml",
     "application/rss+xml",
@@ -52,6 +61,7 @@ _TEXT_CONTENT_TYPES = {
     "application/json",
     "application/xhtml+xml",
     "text/html",
+    "text/markdown",  # Read as bounded source text, without rendering or expanding links.
     "text/plain",
 } | _XML_CONTENT_TYPES
 _XML_DECLARATION_RE = re.compile(r"<!\s*(?:DOCTYPE|ENTITY)\b", re.I)
@@ -60,12 +70,54 @@ _NAT64_WELL_KNOWN_PREFIX = ipaddress.ip_network("64:ff9b::/96")
 _MAX_INLINE_STYLE_CHARS = 4_096
 _MAX_INLINE_DECLARATIONS = 64
 _MAX_CSS_VAR_DEPTH = 8
-_MAX_PAGE_STYLE_CHARS = 16_384
-_MAX_PAGE_STYLE_RULES = 128
+# Work bounds, not trust bounds (spec 2026-08-12): CSS past these limits is
+# accepted-unevaluated residual, the same class as external stylesheets.
+_MAX_PAGE_STYLE_CHARS = 65_536
+_MAX_PAGE_STYLE_RULES = 512
+_MAX_PAGE_STYLE_AT_DEPTH = 4
+
+# At-rules whose blocks never contain screen element style rules.
+_NON_ELEMENT_AT_RULES = {
+    "font-face", "keyframes", "-webkit-keyframes", "-moz-keyframes",
+    "-o-keyframes", "page", "counter-style", "property",
+    "font-feature-values", "font-palette-values",
+}
+
+# Curated always-hiding declarations beyond display/visibility, shared by
+# inline styles and page rules. Values compare exactly after whitespace
+# compaction and casefold; a var() in these properties is ignored (an
+# unresolvable --text color must not hide anything), unlike
+# display/visibility where unresolvable values over-hide.
+_CSS_HIDING_EXTRA_VALUES = {
+    "color": {"transparent"},
+    "opacity": {"0", "0.0", ".0", "0%"},
+    "font-size": {"0", "0px", "0em", "0rem", "0%"},
+}
+
+_CSS_CLASS_TOKEN_RE = re.compile(r"\.([-_A-Za-z0-9]+)")
+_CSS_ID_TOKEN_RE = re.compile(r"#([-_A-Za-z0-9]+)")
+_CSS_NOT_SEGMENT_RE = re.compile(r":not\(([^)]*)\)", re.I)
+_CSS_ATTR_SEGMENT_RE = re.compile(r"\[[^\]]*\]")
+_CSS_PSEUDO_SEGMENT_RE = re.compile(r"::?[-A-Za-z]+(?:\([^)]*\))?")
+_CSS_TAG_TOKEN_RE = re.compile(r"(?<![\w.#-])([A-Za-z][-A-Za-z0-9]*)")
+_CSS_AT_RULE_NAME_RE = re.compile(r"@([-A-Za-z]+)")
 _CSS_CUSTOM_PROPERTY = re.compile(r"--[-_A-Za-z0-9]+")
 _MAX_TWITTER_STDOUT_BYTES = 1_048_576
 _MAX_TWITTER_STDERR_BYTES = 65_536
 _TWITTER_PROCESS_SLOTS = threading.BoundedSemaphore(4)
+_TELEGRAM_PROCESS_SLOTS = threading.BoundedSemaphore(1)
+_YOUTUBE_PROCESS_SLOTS = threading.BoundedSemaphore(2)
+_YOUTUBE_LANGUAGE_CODE_RE = re.compile(
+    r"^[A-Za-z0-9]{1,16}(?:[-_][A-Za-z0-9]{1,16})*$"
+)
+_YOUTUBE_SUCCESS_KEYS = frozenset({
+    "ok", "video_id", "language", "language_code", "is_generated",
+    "truncated", "covered_seconds", "total_seconds", "caption_text",
+    "response_bytes",
+})
+_YOUTUBE_FAILURE_KEYS = frozenset({
+    "ok", "failure", "response_bytes",
+})
 _HTTP_URL_RE = re.compile(r"https?://[^\s<>\[\]{}\"']+", re.I)
 _BACKGROUND_LINE_RE = re.compile(
     r"^\s*background(?:\s+only)?\s*:\s*(https?://[^\s<>\[\]{}\"']+)\s*$",
@@ -79,6 +131,8 @@ _MARKET_TERM_RE = re.compile(
 )
 _EVM_ASSET_ID_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 _NETWORK_SLUG_RE = re.compile(r"^[a-z0-9](?:[a-z0-9_-]{0,62}[a-z0-9])?$")
+# "Unsupported claim" is ordinary editorial vocabulary. Its factual validity
+# belongs to the independent verifier, not this internal-language filter.
 _PUBLIC_GROUNDING_PROTOCOL_PATTERNS = (
     ("from this evidence", re.compile(r"\bfrom\s+this\s+evidence\b", re.I)),
     ("supplied evidence", re.compile(r"\b(?:the\s+)?supplied\s+evidence\b", re.I)),
@@ -88,7 +142,6 @@ _PUBLIC_GROUNDING_PROTOCOL_PATTERNS = (
     ("support matrix", re.compile(r"\bsupport[- ]matrix\b", re.I)),
     ("verification stage", re.compile(r"\bverification[- ]stage\b", re.I)),
     ("does not establish", re.compile(r"\bdoes\s+not\s+establish\b", re.I)),
-    ("unsupported claim", re.compile(r"\bunsupported\s+claims?\b", re.I)),
     ("verifier", re.compile(r"\bverifier\b", re.I)),
 )
 _PUBLIC_DNS_LABEL_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
@@ -126,8 +179,24 @@ def _is_x_host(host: str) -> bool:
     )
 
 
+def _is_youtube_host(host: str) -> bool:
+    """Match only YouTube roots and their dot-delimited subdomains."""
+    return any(
+        host == root or host.endswith("." + root)
+        for root in _YOUTUBE_ROOT_HOSTS
+    )
+
+
 class GroundingFailure(ValueError):
     """A bounded grounding contract is malformed or unsupported."""
+
+
+class YouTubeTranscriptUnavailable(GroundingFailure):
+    """The exact video has no safely usable public caption receipt."""
+
+
+class TelegramMessageUnavailable(GroundingFailure):
+    """An exact private message cannot be read within the current chat scope."""
 
 
 @dataclass(frozen=True)
@@ -135,14 +204,17 @@ class GroundingLimits:
     max_background_sources: int = 3
     max_focal_urls: int = 8
     max_source_requests: int = 10
-    max_source_bytes: int = 2_097_152
+    # Transport-only budgets (spec 2026-08-12): raised so large modern news
+    # pages fit; extraction stays capped at 8,000 chars per source and
+    # max_evidence_bytes overall.
+    max_source_bytes: int = 4_194_304
     # Total budget: 900s Sol, 30s provider fallback, and 30s trusted fetch.
     source_collection_timeout: int = 960
-    max_evidence_bytes: int = 24_000
+    max_evidence_bytes: int = 65_536
     fetch_timeout: int = 15
     trace_retention_days: int = 14
     photo_reference_max_age: int = 1_800
-    max_response_bytes: int = 1_048_576
+    max_response_bytes: int = 1_572_864
     max_redirects: int = 3
 
 
@@ -160,6 +232,17 @@ class EvidenceItem:
     url: str | None = None
     content_hash: str | None = None
     artifact_hash: str | None = None
+    reader: str | None = None
+    truncated: bool | None = None
+
+
+@dataclass(frozen=True)
+class SourceFailure:
+    """A trusted retrieval outcome, never factual evidence from the failed page."""
+
+    canonical_url: str
+    source_ref: str
+    failure_kind: str
 
 
 @dataclass(frozen=True)
@@ -172,6 +255,9 @@ class EvidenceBundle:
     focal_ids: tuple[str, ...]
     items: tuple[EvidenceItem, ...]
     background_source_urls: tuple[str, ...] = ()
+    source_failures: tuple[SourceFailure, ...] = ()
+    focal_source_urls: tuple[str, ...] = ()
+    task_context: TaskContext | None = None
 
     def __post_init__(self):
         if self.mode not in {"conversation", "grounded"}:
@@ -226,6 +312,9 @@ class VerificationVerdict:
     passed: bool
     unsupported_claims: tuple[str, ...]
     reason: str
+    # Runtime policy only. parse_verification keeps its exact three-key
+    # provider contract, so model output cannot select a publication policy.
+    repair_policy: Literal["source_claims"] | None = None
 
 
 @dataclass(frozen=True)
@@ -246,6 +335,9 @@ class FetchedSource:
     timestamp: str | None = None
     quoted: tuple["FetchedSource", ...] = field(default_factory=tuple)
     response_bytes: int = 0
+    evidence_byte_limit: int = 8_000
+    reader: str | None = None
+    truncated: bool | None = None
 
 
 ResearchRole = Literal["general", "identity", "market", "thesis"]
@@ -344,8 +436,89 @@ def _message_event_time(message):
     return canonical_event_time(value)
 
 
-def _clean_evidence_text(value, limit):
-    """Normalize and bound one evidence item's text independently."""
+def conversation_topic_id(message):
+    """Ordinary reply threads are not forum isolation boundaries.
+
+    Trusted Telegram ingress supplies is_forum=False when the optional flag is
+    absent. Unknown callers keep the narrower legacy scope until normalized.
+    """
+    if message.get("chat", {}).get("is_forum") is False:
+        return 0
+    return int(message.get("message_thread_id") or 0)
+
+
+def conversation_link_candidates(message, recent_messages, persisted_context):
+    """Return at most ten witnessed human link messages from the last 30 minutes."""
+    chat_id = int(message.get("chat", {}).get("id", 0))
+    current_id = int(message.get("message_id") or 0)
+    timestamp = _message_event_time(message)
+    if not timestamp:
+        return ()
+    current_time = datetime.fromisoformat(timestamp)
+    nonforum = message.get("chat", {}).get("is_forum") is False
+    rows = list(recent_messages)[-50:]
+    for row in persisted_context[-100:]:
+        if row.get("role", "incoming") != "incoming":
+            continue
+        rows.append({
+            "message_id": row.get("message_id"),
+            "chat": {"id": row.get("chat_id")},
+            "message_thread_id": row.get("topic_id"),
+            "from": {"id": row.get("sender_id"), "username": row.get("sender"), "is_bot": row.get("sender_is_bot")},
+            "event_time": row.get("timestamp"),
+            "text": row.get("text"),
+            "reply_to_message": {"message_id": row.get("reply_to_msg_id")},
+        })
+    candidates = {}
+    for row in rows:
+        row_id = row.get("message_id")
+        if (type(row_id) is not int or not 0 < row_id < current_id
+                or row.get("chat", {}).get("id") != chat_id
+                or row.get("from", {}).get("is_bot")
+                or (not nonforum and conversation_topic_id(row) != conversation_topic_id(message))):
+            continue
+        event_time = _message_event_time(row)
+        if not event_time:
+            continue
+        age = (current_time - datetime.fromisoformat(event_time)).total_seconds()
+        if not 0 <= age <= 1800:
+            continue
+        text = _clean_evidence_text(_message_text(row), 2000)
+        try:
+            focal, _ = _classified_message_urls(text)
+        except GroundingFailure:
+            # An invalid older label is ineligible; it must not abort the
+            # current request or make an unrelated candidate authoritative.
+            continue
+        if not focal:
+            continue
+        # Keep the freshest witnessed representation ahead of persisted text.
+        candidates.setdefault(row_id, {
+            "message_id": row_id,
+            "chat": dict(message.get("chat", {})),
+            "message_thread_id": conversation_topic_id(message) or None,
+            "from": dict(row.get("from", {})),
+            "event_time": event_time,
+            "text": text,
+            "reply_to_message_id": (row.get("reply_to_message") or {}).get("message_id"),
+        })
+    return tuple(candidates[key] for key in sorted(candidates)[-10:])
+
+
+def truncate_utf8(value: str, max_bytes: int) -> str:
+    """Bound normalized text by UTF-8 bytes without splitting a code point."""
+    if type(max_bytes) is not int or max_bytes < 0:
+        raise ValueError("max_bytes must be a non-negative integer")
+    encoded = value.encode("utf-8")
+    if len(encoded) <= max_bytes:
+        return value
+    # ``ignore`` removes only an incomplete code point at the final byte
+    # boundary; every complete character before that boundary is preserved.
+    return encoded[:max_bytes].decode("utf-8", errors="ignore")
+
+
+def _clean_evidence_text(value, byte_limit):
+    """Normalize and UTF-8-byte-bound one evidence item's text."""
     value = unicodedata.normalize("NFKC", str(value or ""))
     value = re.sub(r"\[photo#[0-9]+\]", "[photo omitted]", value)
     value = value.replace("<", "＜").replace(">", "＞")
@@ -354,7 +527,7 @@ def _clean_evidence_text(value, limit):
         char for char in value
         if char in "\n\t" or (ord(char) >= 32 and ord(char) != 127)
     )
-    return value.strip()[:limit]
+    return truncate_utf8(value.strip(), byte_limit)
 
 
 def _content_hash(value):
@@ -370,6 +543,12 @@ def _urls_in(value):
         if candidate and candidate not in found:
             found.append(candidate)
     return tuple(found)
+
+
+def telegram_linked_urls(text):
+    """Canonical focal links; the caller bounds and scopes message chaining."""
+    focal, _ = _classified_message_urls(text)
+    return tuple(dict.fromkeys(canonical_source_url(url) for url in focal))
 
 
 def _classified_message_urls(value):
@@ -414,11 +593,29 @@ def _validated_source_ref(value):
     return value
 
 
-def _evidence_item(evidence_id, kind, text, source_ref, **kwargs):
+def _evidence_item(
+        evidence_id, kind, text, source_ref, *, byte_limit=None, **kwargs):
     """Construct one normalized evidence item with a content digest."""
-    # Text-document media carries a deterministic 16K excerpt plus a short
-    # metadata header. Other evidence retains the established 8K item bound.
-    clean = _clean_evidence_text(text, 16_512 if kind == "media" else 8_000)
+    # Text-document media and exact YouTube caption receipts have separate
+    # bounded allowances. Every other evidence type retains the 8 KB limit.
+    if byte_limit is None:
+        byte_limit = 48_512 if kind == "media" else 8_000
+    if type(byte_limit) is not int or byte_limit not in {
+        8_000, 48_000, 48_512,
+    }:
+        raise GroundingFailure("invalid evidence byte limit")
+    if byte_limit == 48_000 and re.fullmatch(
+            r"youtube:[A-Za-z0-9_-]{11}", str(source_ref or "")) is None:
+        raise GroundingFailure(
+            "elevated evidence byte limit is not YouTube"
+        )
+    if byte_limit == 48_512 and kind != "media":
+        raise GroundingFailure(
+            "media evidence byte limit used by non-media"
+        )
+    clean = _clean_evidence_text(text, byte_limit)
+    if kwargs.get("truncated") is False and len(str(text).encode("utf-8")) > byte_limit:
+        kwargs["truncated"] = True
     return EvidenceItem(
         evidence_id=evidence_id,
         kind=kind,
@@ -438,10 +635,16 @@ def _fit_evidence(items, byte_limit):
     def size():
         return sum(len(item.text.encode("utf-8")) for item in values)
 
-    for kind in ("background_url", "conversation_message"):
+    # Runtime snapshots are useful claim support but cannot displace the
+    # selected document or current task that triggered this turn.
+    for kind in (
+        "background_url", "conversation_message", "runtime_receipt"
+    ):
         index = len(values) - 1
         while size() > byte_limit and index >= 0:
-            if values[index].kind == kind:
+            if (values[index].kind == kind
+                    and not values[index].source_ref.startswith((
+                        "runtime:source_failure:", "runtime:task_context:", "runtime:onchain:"))):
                 values.pop(index)
             index -= 1
     if size() > byte_limit:
@@ -458,7 +661,9 @@ def _background_source_type(url):
         host = (urlsplit(url).hostname or "").lower()
     except (TypeError, ValueError):
         return "http"
-    return "twitter" if _is_x_host(host) else "http"
+    if _is_x_host(host):
+        return "twitter"
+    return "youtube" if _is_youtube_host(host) else "http"
 
 
 def collect_evidence(
@@ -472,6 +677,8 @@ def collect_evidence(
     background_urls: Sequence[str] = (),
     media_items: Sequence[EvidenceItem] = (),
     runtime_receipts: Sequence[EvidenceItem] = (),
+    referenced_message: Mapping[str, object] | None = None,
+    task_context: TaskContext | None = None,
     allow_cross_chat_context: bool = False,
     limits: GroundingLimits | None = None,
     trace_id: str | None = None,
@@ -500,10 +707,61 @@ def collect_evidence(
             timestamp=_message_event_time(reply),
         ))
 
-    current_topic = int(message.get("message_thread_id") or 0)
+    reference = None
+    if task_context is not None:
+        if not isinstance(task_context, TaskContext) or not task_context.valid_for(message):
+            raise GroundingFailure("task reference is unavailable")
+        # Receipt restoration reread each original row and verified its sender,
+        # scope, age and hash. Repeat immutable bounds at collection. M0 stays
+        # authoritative; referenced requests only explain this continuation.
+        task_item_ids = {message_id: "M0"}
+        reference_index = 2
+        for witnessed in (*task_context.sources, *task_context.requests):
+            if witnessed.message_id in task_item_ids:
+                continue
+            evidence_id = f"R{reference_index}"
+            reference_index += 1
+            task_item_ids[witnessed.message_id] = evidence_id
+            items.append(_evidence_item(
+                evidence_id, "reply_message", witnessed.text,
+                f"telegram:{chat_id}:{witnessed.message_id}",
+                author=str(witnessed.sender_id), timestamp=witnessed.event_time,
+            ))
+        context_text = json.dumps({
+            "current_request": "M0",
+            "original_requested_action": task_item_ids[task_context.root_message_id],
+            "request_history": [task_item_ids[item.message_id] for item in task_context.requests],
+            "source_messages": [task_item_ids[item.message_id] for item in task_context.sources],
+            "continued_via_sent_reply": task_context.reply_message_id is not None,
+            "scope": "Original action, source identity and version constraints interpret this continuation only. M0 supersedes changed requirements. Source bodies must support the answer.",
+        }, ensure_ascii=False)
+        runtime_receipts = (*runtime_receipts, EvidenceItem(
+            "", "runtime_receipt", context_text,
+            "runtime:task_context:" + _content_hash(context_text)[:20],
+        ))
+    elif referenced_message is not None:
+        # Repeat eligibility at collection; a model-selected ID cannot supply
+        # its own text, chat, timestamp, or URL to the authenticated lookup.
+        reference = next((candidate for candidate in conversation_link_candidates(
+            message, recent_messages, persisted_context
+        ) if candidate["message_id"] == referenced_message.get("message_id")), None)
+        if reference is None:
+            raise GroundingFailure("referenced message is unavailable")
+        items.append(_evidence_item(
+            "R2", "reply_message", reference["text"], _telegram_ref(reference),
+            author=str(reference.get("from", {}).get("username") or "")[:64] or None,
+            timestamp=_message_event_time(reference),
+        ))
+
+    current_topic = conversation_topic_id(message)
     seen_context = {(chat_id, message_id, "incoming")}
     if isinstance(reply, dict):
         seen_context.add((chat_id, int(reply.get("message_id") or 0), "incoming"))
+    if reference is not None:
+        seen_context.add((chat_id, reference["message_id"], "incoming"))
+    if task_context is not None:
+        seen_context.update((chat_id, item.message_id, "incoming")
+                            for item in (*task_context.sources, *task_context.requests))
     context_rows = []
     for row in list(recent_messages)[-20:]:
         context_rows.append({
@@ -521,7 +779,10 @@ def collect_evidence(
     for row in context_rows:
         row_chat = int(row.get("chat_id") or chat_id)
         row_message = int(row.get("message_id") or 0)
-        row_topic = int(row.get("topic_id") or 0)
+        row_topic = (
+            0 if message.get("chat", {}).get("is_forum") is False and row_chat == chat_id
+            else int(row.get("topic_id") or 0)
+        )
         role = str(row.get("role") or "incoming")
         key = (row_chat, row_message, role)
         wrong_scope = (
@@ -544,12 +805,20 @@ def collect_evidence(
     focal_urls, explicit_background_urls = _classified_message_urls(current_text)
     focal_urls = list(focal_urls)
     explicit_background_urls = list(explicit_background_urls)
-    if isinstance(reply, dict):
+    if isinstance(reply, dict) and not reply.get("from", {}).get("is_bot"):
         reply_focal, reply_background = _classified_message_urls(
             _message_text(reply)
         )
         focal_urls.extend(reply_focal)
         explicit_background_urls.extend(reply_background)
+    if reference is not None:
+        reference_focal, _ = _classified_message_urls(reference["text"])
+        focal_urls.extend(reference_focal)
+    if task_context is not None:
+        for source_message in task_context.sources:
+            source_focal, source_background = _classified_message_urls(source_message.text)
+            focal_urls.extend(source_focal)
+            explicit_background_urls.extend(source_background)
 
     def canonical_unique(values):
         canonical = []
@@ -578,8 +847,25 @@ def collect_evidence(
     focal_ids = []
     source_refs = set()
     focal_index = 0
+    source_failures = []
+    first_failure = None
     for url in focal_urls:
-        source = url_fetcher(url, True)
+        try:
+            source = url_fetcher(url, True)
+        except GroundingFailure as exc:
+            # A link is a dependency of the claims about it, not of every
+            # independent part of the user's request. Keep successful sources.
+            if first_failure is None:
+                first_failure = exc
+            failure_kind = (
+                "telegram_message_unavailable" if isinstance(exc, TelegramMessageUnavailable)
+                else "youtube_captions_unavailable" if isinstance(exc, YouTubeTranscriptUnavailable)
+                else "source_unavailable"
+            )
+            source_failures.append(SourceFailure(
+                url, "web:" + hashlib.sha256(url.encode()).hexdigest()[:20], failure_kind,
+            ))
+            continue
         for candidate in (source, *source.quoted):
             candidate_ref = _validated_source_ref(candidate.source_ref)
             if candidate_ref in source_refs:
@@ -593,10 +879,23 @@ def collect_evidence(
                 "focal_url",
                 candidate.text,
                 candidate_ref,
+                byte_limit=candidate.evidence_byte_limit,
                 author=candidate.author,
                 timestamp=canonical_event_time(candidate.timestamp),
                 url=candidate.canonical_url,
+                reader=candidate.reader,
+                truncated=candidate.truncated,
             ))
+
+    from onchain_evidence import usable_receipt as usable_onchain_receipt
+    onchain_source_available = any(
+        usable_onchain_receipt(item, url=url)
+        for item in runtime_receipts for url in focal_urls
+    )
+    if focal_urls and not focal_ids and not onchain_source_available:
+        # Unrelated discovery must never stand in for an entirely unreadable
+        # requested source. Preserve the adapter-specific direct failure.
+        raise first_failure or GroundingFailure("focal source contains no evidence")
 
     background_index = 0
     for url in all_background_urls:
@@ -620,9 +919,12 @@ def collect_evidence(
                 "background_url",
                 candidate.text,
                 candidate_ref,
+                byte_limit=candidate.evidence_byte_limit,
                 author=candidate.author,
                 timestamp=canonical_event_time(candidate.timestamp),
                 url=candidate.canonical_url,
+                reader=candidate.reader,
+                truncated=candidate.truncated,
             ))
 
     for index, item in enumerate(media_items, 1):
@@ -638,7 +940,18 @@ def collect_evidence(
             url=item.url,
             artifact_hash=item.artifact_hash,
         ))
-    for index, item in enumerate(runtime_receipts, 1):
+    failure_receipts = []
+    for failure in source_failures:
+        receipt_text = json.dumps({
+            "requested_source": failure.canonical_url,
+            "retrieval_outcome": failure.failure_kind,
+            "scope": "This turn only. No content or facts were obtained from this source.",
+        }, ensure_ascii=False)
+        failure_receipts.append(EvidenceItem(
+            "", "runtime_receipt", receipt_text,
+            "runtime:source_failure:" + _content_hash(receipt_text)[:20],
+        ))
+    for index, item in enumerate((*runtime_receipts, *failure_receipts), 1):
         if not isinstance(item, EvidenceItem):
             raise GroundingFailure("invalid runtime receipt")
         items.append(_evidence_item(
@@ -659,7 +972,10 @@ def collect_evidence(
         mode=mode,
         focal_ids=tuple(focal_ids),
         items=fitted,
+        source_failures=tuple(source_failures),
+        focal_source_urls=tuple(focal_urls),
         background_source_urls=tuple(all_background_urls),
+        task_context=task_context,
     )
 
 
@@ -928,54 +1244,83 @@ def _parse_inline_style(value):
                 )
             continue
         normalized_name = name.casefold()
-        if normalized_name in {"display", "visibility"}:
+        if (
+            normalized_name in {"display", "visibility"}
+            or normalized_name in _CSS_HIDING_EXTRA_VALUES
+        ):
             _store_css_declaration(
                 standard, normalized_name, decoded_value, important
             )
-            continue
-        return None
+        # Other properties cannot hide via the modeled channels and are
+        # ignored (spec 2026-08-12): exotic hiding (offscreen text-indent,
+        # clip paths) is accepted residual, matching page-rule and
+        # external-CSS semantics. Undecodable declarations still return None
+        # above, which every caller treats as hiding.
     return standard, custom
 
 
-def _resolve_inline_css_value(value, custom, seen=(), depth=0):
-    """Resolve a simple same-attribute custom property under a depth bound."""
+def _resolve_inline_css_value(value, custom, seen=(), depth=0, external_custom=()):
+    """Resolve local properties and bounded fallbacks without guessing inheritance."""
     compact = "".join(value.split())
     match = re.fullmatch(
-        r"(?i:var)\((--[-_A-Za-z0-9]+)\)", compact
+        r"(?i:var)\((--[-_A-Za-z0-9]+)(?:,(.+))?\)", compact
     )
     if match is None:
         return None if "var(" in compact.casefold() else compact
     name = match.group(1)
-    if depth >= _MAX_CSS_VAR_DEPTH or name in seen or name not in custom:
+    if depth >= _MAX_CSS_VAR_DEPTH or name in seen:
         return None
+    if name in custom:
+        candidate = custom[name][0]
+        if candidate.strip().casefold() in {"initial", "inherit", "unset", "revert", "revert-layer"}:
+            # CSS-wide custom-property values can invalidate the variable or
+            # inherit hiding from outside this declaration. Do not resolve
+            # them as literal visible display values.
+            return None
+    else:
+        # A declaration elsewhere may be inherited. Its absence from this
+        # single rule does not justify using a visible fallback instead.
+        if name in external_custom or match.group(2) is None:
+            return None
+        candidate = match.group(2)
     return _resolve_inline_css_value(
-        custom[name][0], custom, seen + (name,), depth + 1
+        candidate, custom, seen + (name,), depth + 1, external_custom
     )
 
 
-def _inline_style_is_hidden(value):
-    """Evaluate bounded inline display and visibility declarations."""
+def _declarations_hide(standard, custom, external_custom=()):
+    """Evaluate watched declarations; True when any evaluably hides."""
+    for property_name, declaration in standard.items():
+        resolved = _resolve_inline_css_value(
+            declaration[0], custom, external_custom=external_custom
+        )
+        if property_name in ("display", "visibility"):
+            if resolved is None:
+                return True
+            normalized = resolved.casefold()
+            if property_name == "display" and normalized == "none":
+                return True
+            if property_name == "visibility" and normalized in {
+                "hidden", "collapse",
+            }:
+                return True
+            continue
+        if resolved is None:
+            continue
+        if resolved.casefold() in _CSS_HIDING_EXTRA_VALUES[property_name]:
+            return True
+    return False
+
+
+def _inline_style_is_hidden(value, external_custom=()):
+    """Evaluate bounded inline declarations with skip-unknown semantics."""
     if not value:
         return False
     parsed = _parse_inline_style(value)
     if parsed is None:
         return True
     standard, custom = parsed
-    for property_name in ("display", "visibility"):
-        declaration = standard.get(property_name)
-        if declaration is None:
-            continue
-        resolved = _resolve_inline_css_value(declaration[0], custom)
-        if resolved is None:
-            return True
-        normalized = resolved.casefold()
-        if property_name == "display" and normalized == "none":
-            return True
-        if property_name == "visibility" and normalized in {
-            "hidden", "collapse",
-        }:
-            return True
-    return False
+    return _declarations_hide(standard, custom, external_custom)
 
 
 def _screen_media_applies(value):
@@ -987,14 +1332,25 @@ def _screen_media_applies(value):
 
 
 def _html_attribute_map(attrs):
-    """Build a case-insensitive map only when every HTML attribute is unique."""
+    """Build a case-insensitive map where the first occurrence wins.
+
+    Browsers keep the first duplicate attribute; hide-relevant attributes are
+    additionally checked across EVERY occurrence by _VisibleTextParser so a
+    hiding duplicate can never be shadowed (spec 2026-08-12).
+    """
     values = {}
     for key, value in attrs:
         name = str(key).casefold()
-        if name in values:
-            raise GroundingFailure("duplicate HTML attribute")
-        values[name] = str(value or "")
+        if name not in values:
+            values[name] = str(value or "")
     return values
+
+
+def _attr_occurrences(attrs, name):
+    """Yield every raw occurrence of one case-insensitive HTML attribute."""
+    for key, value in attrs:
+        if str(key).casefold() == name:
+            yield str(value or "")
 
 
 class _PageStyleScanner(HTMLParser):
@@ -1006,10 +1362,15 @@ class _PageStyleScanner(HTMLParser):
         self._style_depth = 0
         self.parts = []
         self.external_screen_stylesheet = False
+        self.custom_properties = set()
 
     def handle_starttag(self, tag, attrs):
         tag = tag.casefold()
         values = _html_attribute_map(attrs)
+        for value in _attr_occurrences(attrs, "style"):
+            parsed = _parse_inline_style(value)
+            if parsed is not None:
+                self.custom_properties.update(parsed[1])
         if tag == "link":
             rel = {part.casefold() for part in values.get("rel", "").split()}
             if "stylesheet" in rel and _screen_media_applies(values.get("media", "")):
@@ -1034,59 +1395,234 @@ class _PageStyleScanner(HTMLParser):
             self.parts.append(data)
 
 
-def _page_visibility_rules(decoded):
-    """Return simple class/ID selectors hidden by evaluable inline page CSS."""
+def _strip_page_css_comments(value):
+    """Best-effort comment strip: an unterminated comment drops only its tail."""
+    value = value[:_MAX_PAGE_STYLE_CHARS]
+    pieces = []
+    cursor = 0
+    while cursor < len(value):
+        start = value.find("/*", cursor)
+        if start < 0:
+            pieces.append(value[cursor:])
+            break
+        pieces.append(value[cursor:start])
+        end = value.find("*/", start + 2)
+        if end < 0:
+            break
+        cursor = end + 2
+    return "".join(pieces)
+
+
+def _css_scan(css):
+    """Split one CSS level into (prelude, block|None) segments, quote-aware.
+
+    A stray close brace or an unterminated block/string abandons the rest of
+    the sheet: everything already split still applies, the tail is residual.
+    """
+    segments = []
+    prelude_start = 0
+    block_start = -1
+    depth = 0
+    quote = ""
+    index = 0
+    length = len(css)
+    while index < length:
+        char = css[index]
+        if quote:
+            if char == "\\":
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in "'\"":
+            quote = char
+            index += 1
+            continue
+        if char == "{":
+            if depth == 0:
+                block_start = index
+            depth += 1
+            index += 1
+            continue
+        if char == "}":
+            if depth == 0:
+                return segments
+            depth -= 1
+            if depth == 0:
+                segments.append((
+                    css[prelude_start:block_start],
+                    css[block_start + 1:index],
+                ))
+                prelude_start = index + 1
+            index += 1
+            continue
+        if char == ";" and depth == 0:
+            segments.append((css[prelude_start:index], None))
+            prelude_start = index + 1
+            index += 1
+            continue
+        index += 1
+    return segments
+
+
+def _media_never_canonical(prelude):
+    """True when no comma alternative can affect the canonical viewer.
+
+    The gate models what a light-scheme screen reader sees: print-only and
+    dark-scheme-only alternatives cannot affect that rendering, so their
+    blocks are skipped. Anything with a "not" (or otherwise ambiguous)
+    over-applies. Skipping dark branches is what keeps theme-duplicated DOM
+    readable — over-applying both scheme branches hides both page copies.
+    """
+    conditions = prelude.split("@media", 1)[-1]
+    for part in conditions.split(","):
+        tokens = set(re.findall(r"[a-z-]+", part.casefold()))
+        if "not" in tokens:
+            return False
+        print_only = "print" in tokens and not tokens & {"screen", "all"}
+        dark_only = (
+            "prefers-color-scheme" in tokens and "dark" in tokens
+        )
+        if not (print_only or dark_only):
+            return False
+    return True
+
+
+def _page_rule_hides(body, external_custom=()):
+    """Skip-unknown parse of one page rule body; True when it evaluably hides.
+
+    Shares inline-style semantics: unknown properties are ignored (a margin
+    reset must not hide a page); undecodable declarations and per-body caps
+    over-hide because they could conceal a display:none.
+    """
+    parsed = _parse_inline_style(body)
+    if parsed is None:
+        return True
+    standard, custom = parsed
+    return _declarations_hide(standard, custom, external_custom)
+
+
+def _add_selector_hide_targets(part, classes, ids, tags):
+    """Over-hide the SUBJECT compound one hiding selector part names.
+
+    Every element the real rule hides matches the rightmost compound, so
+    hiding all subject matches is a superset; ancestor/sibling context must
+    never become a target — root-level skin/theme classes appear as context
+    in ordinary hide rules and hiding them blanks the page (Wikipedia's
+    .skin--responsive, Blockworks' .dark-mode). :not(...) is deleted first —
+    its matches are a subset of the remainder, so keeping it would invert
+    over-hide into under-hide. Attribute and pseudo segments are spaced out
+    before the combinator split; any surviving fragment of the true subject
+    still matches a superset of it. Parts with no extractable component
+    (bare *, attribute-only shapes like the [hidden] reset idiom) are
+    residual; the native attribute checks in _VisibleTextParser already
+    cover [hidden].
+    """
+    part = _CSS_NOT_SEGMENT_RE.sub(" ", part)
+    part = _CSS_ATTR_SEGMENT_RE.sub(" ", part)
+    part = _CSS_PSEUDO_SEGMENT_RE.sub(" ", part)
+    compounds = [
+        compound
+        for compound in re.split(r"[\s>+~]+", part)
+        if compound
+    ]
+    if not compounds:
+        return
+    subject = compounds[-1]
+    found_classes = _CSS_CLASS_TOKEN_RE.findall(subject)
+    found_ids = _CSS_ID_TOKEN_RE.findall(subject)
+    if found_classes or found_ids:
+        classes.update(found_classes)
+        ids.update(found_ids)
+        return
+    tags.update(
+        token.casefold() for token in _CSS_TAG_TOKEN_RE.findall(subject)
+    )
+
+
+def _collect_hide_rules(css, classes, ids, tags, budget, depth=0, external_custom=()):
+    """Walk one CSS level, over-applying conditional blocks; returns budget.
+
+    None means the rule budget ran out — the remainder is residual and the
+    already-collected targets still apply.
+    """
+    if depth > _MAX_PAGE_STYLE_AT_DEPTH:
+        return budget
+    for prelude, body in _css_scan(css):
+        if body is None:
+            continue
+        if budget is None or budget <= 0:
+            return None
+        stripped_prelude = prelude.strip()
+        if stripped_prelude.startswith("@"):
+            match = _CSS_AT_RULE_NAME_RE.match(stripped_prelude)
+            name = match.group(1).casefold() if match else ""
+            if name in _NON_ELEMENT_AT_RULES:
+                continue
+            if name == "media" and _media_never_canonical(stripped_prelude):
+                continue
+            budget = _collect_hide_rules(
+                body, classes, ids, tags, budget, depth + 1, external_custom
+            )
+            continue
+        budget -= 1
+        if not _page_rule_hides(body, external_custom):
+            continue
+        for part in prelude.split(","):
+            _add_selector_hide_targets(part, classes, ids, tags)
+    return budget
+
+
+def _collect_css_custom_properties(css, names, budget, depth=0):
+    """Collect possible inherited definitions within the existing CSS work caps."""
+    if depth > _MAX_PAGE_STYLE_AT_DEPTH:
+        return budget
+    for prelude, body in _css_scan(css):
+        if body is None:
+            continue
+        if budget <= 0:
+            break
+        budget -= 1
+        if prelude.strip().startswith("@"):
+            budget = _collect_css_custom_properties(body, names, budget, depth + 1)
+        else:
+            parsed = _parse_inline_style(body)
+            if parsed is not None:
+                names.update(parsed[1])
+    return budget
+
+
+def _page_visibility_rules(decoded, *, custom_properties=None):
+    """Best-effort hide targets from evaluable inline page CSS (never raises).
+
+    Posture (spec 2026-08-12): unevaluated CSS — external stylesheets,
+    @import, tokenizer-abandoned or past-work-bound remainders — no longer
+    rejects the page; its hiding is accepted residual risk. Evaluation
+    over-hides on ambiguity, which can only lose visible text, never reveal
+    hidden text.
+    """
     scanner = _PageStyleScanner()
     scanner.feed(decoded)
     scanner.close()
-    if scanner.external_screen_stylesheet:
-        raise GroundingFailure("unevaluable visibility CSS")
-    css = "".join(scanner.parts)
-    without_comments = _strip_css_comments(css, _MAX_PAGE_STYLE_CHARS)
-    if without_comments is None:
-        raise GroundingFailure("unevaluable visibility CSS")
+    css = _strip_page_css_comments("".join(scanner.parts))
+    if custom_properties is None:
+        custom_properties = set()
+    custom_properties.update(scanner.custom_properties)
+    _collect_css_custom_properties(css, custom_properties, _MAX_PAGE_STYLE_RULES)
     hidden_classes = set()
     hidden_ids = set()
-    cursor = 0
-    rule_count = 0
-    for match in re.finditer(r"([^{}]+)\{([^{}]*)\}", without_comments):
-        if without_comments[cursor:match.start()].strip():
-            raise GroundingFailure("unevaluable visibility CSS")
-        cursor = match.end()
-        rule_count += 1
-        if rule_count > _MAX_PAGE_STYLE_RULES:
-            raise GroundingFailure("unevaluable visibility CSS")
-        parsed = _parse_inline_style(match.group(2))
-        if parsed is None:
-            raise GroundingFailure("unevaluable visibility CSS")
-        standard, custom = parsed
-        if not standard:
-            continue
-        hidden = False
-        for property_name, declaration in standard.items():
-            resolved = _resolve_inline_css_value(declaration[0], custom)
-            if resolved is None:
-                raise GroundingFailure("unevaluable visibility CSS")
-            normalized = resolved.casefold()
-            hidden = hidden or (
-                property_name == "display" and normalized == "none"
-            ) or (
-                property_name == "visibility"
-                and normalized in {"hidden", "collapse"}
-            )
-        selectors = [part.strip() for part in match.group(1).split(",")]
-        if not selectors or any(
-            re.fullmatch(r"[.#][-_A-Za-z0-9]+", selector) is None
-            for selector in selectors
-        ):
-            raise GroundingFailure("unevaluable visibility CSS")
-        if hidden:
-            for selector in selectors:
-                target = hidden_classes if selector.startswith(".") else hidden_ids
-                target.add(selector[1:])
-    if without_comments[cursor:].strip():
-        raise GroundingFailure("unevaluable visibility CSS")
-    return frozenset(hidden_classes), frozenset(hidden_ids)
+    hidden_tags = set()
+    _collect_hide_rules(
+        css, hidden_classes, hidden_ids, hidden_tags, _MAX_PAGE_STYLE_RULES,
+        external_custom=custom_properties,
+    )
+    return (
+        frozenset(hidden_classes),
+        frozenset(hidden_ids),
+        frozenset(hidden_tags),
+    )
 
 
 class _VisibleTextParser(HTMLParser):
@@ -1104,30 +1640,52 @@ class _VisibleTextParser(HTMLParser):
         "h5", "h6", "header", "hr", "li", "main", "p", "section", "tr",
     }
 
-    def __init__(self, *, hidden_classes=(), hidden_ids=()):
+    def __init__(self, *, hidden_classes=(), hidden_ids=(), hidden_tags=(),
+                 custom_properties=(), content_only=False, exclude_boilerplate=False):
         super().__init__(convert_charrefs=True)
         self._suppressed = []
         self.parts = []
         self.hidden_classes = frozenset(hidden_classes)
         self.hidden_ids = frozenset(hidden_ids)
+        self.hidden_tags = frozenset(hidden_tags)
+        self.custom_properties = frozenset(custom_properties)
+        self.content_only = content_only
+        self.exclude_boilerplate = exclude_boilerplate
+        self.has_content_root = False
+        self.has_visible_password = False
 
-    def _is_hidden(self, tag, values):
+    def _is_hidden(self, tag, values, attrs):
+        # Hide-relevant attributes consider EVERY duplicate occurrence: if any
+        # occurrence hides, the element hides (spec 2026-08-12 over-hide union).
         return (
             tag in self._HIDDEN_TAGS
+            or tag in self.hidden_tags
             or "hidden" in values
-            or values.get("aria-hidden", "").strip().casefold() == "true"
+            or any(
+                value.strip().casefold() == "true"
+                for value in _attr_occurrences(attrs, "aria-hidden")
+            )
             or "inert" in values
             or (tag == "dialog" and "open" not in values)
-            or values.get("id", "") in self.hidden_ids
             or any(
-                value in self.hidden_classes
-                for value in values.get("class", "").split()
+                value in self.hidden_ids
+                for value in _attr_occurrences(attrs, "id")
             )
-            or _inline_style_is_hidden(values.get("style", ""))
+            or any(
+                token in self.hidden_classes
+                for value in _attr_occurrences(attrs, "class")
+                for token in value.split()
+            )
+            or any(
+                _inline_style_is_hidden(value, self.custom_properties)
+                for value in _attr_occurrences(attrs, "style")
+            )
         )
 
     def handle_starttag(self, tag, attrs):
         tag = tag.lower()
+        if tag in {"article", "main"}:
+            self.has_content_root = True
         values = _html_attribute_map(attrs)
         parent_hidden = self._suppressed[-1][1] if self._suppressed else False
         parent_closed_details = (
@@ -1139,7 +1697,13 @@ class _VisibleTextParser(HTMLParser):
         closed_content = parent_closed_content or (
             parent_closed_details and tag != "summary"
         )
-        hidden = parent_hidden or closed_content or self._is_hidden(tag, values)
+        hidden = (
+            parent_hidden
+            or closed_content
+            or self._is_hidden(tag, values, attrs)
+        )
+        if tag == "input" and values.get("type", "").lower() == "password" and not hidden:
+            self.has_visible_password = True
         if tag in self._BREAK_TAGS and not hidden:
             self.parts.append("\n")
         if tag not in self._VOID_TAGS:
@@ -1170,6 +1734,11 @@ class _VisibleTextParser(HTMLParser):
             self.parts.append("\n")
 
     def handle_data(self, data):
+        if self.content_only and not any(row[0] in {"article", "main"} for row in self._suppressed):
+            return
+        if self.exclude_boilerplate and any(
+                row[0] in {"nav", "footer", "aside", "header"} for row in self._suppressed):
+            return
         if not self._suppressed or not self._suppressed[-1][1]:
             self.parts.append(data)
 
@@ -1232,7 +1801,7 @@ def _extract_xml_text(decoded):
     return _collapse_visible_text("\n".join(parts))[:8_000]
 
 
-def _extract_visible_text(body, content_type):
+def _extract_visible_text(body, content_type, *, content_only=False, exclude_boilerplate=False):
     """Return bounded text, excluding non-visible HTML content."""
     decoded = _decode_body(body, content_type)
     mime = content_type.split(";", 1)[0].strip().lower()
@@ -1240,13 +1809,22 @@ def _extract_visible_text(body, content_type):
         return _extract_xml_text(decoded)
     if mime not in {"text/html", "application/xhtml+xml"}:
         return _collapse_visible_text(decoded)[:8_000]
-    hidden_classes, hidden_ids = _page_visibility_rules(decoded)
+    custom_properties = set()
+    hidden_classes, hidden_ids, hidden_tags = _page_visibility_rules(
+        decoded, custom_properties=custom_properties
+    )
     parser = _VisibleTextParser(
         hidden_classes=hidden_classes,
         hidden_ids=hidden_ids,
+        hidden_tags=hidden_tags,
+        custom_properties=custom_properties,
+        content_only=content_only,
+        exclude_boilerplate=exclude_boilerplate,
     )
     parser.feed(decoded)
     parser.close()
+    if parser.has_visible_password:
+        raise GroundingFailure("source requires sign-in")
     visible = _collapse_visible_text("".join(parser.parts))
     return visible[:8_000]
 
@@ -1301,9 +1879,59 @@ def _validated_url(value):
     return canonical, scheme, host, port, target
 
 
+def parse_youtube_video_url(value):
+    """Bind one supported public YouTube URL to its exact video identity."""
+    if not isinstance(value, str):
+        return None
+    try:
+        original = urlsplit(value)
+        canonical, scheme, host, _, _ = _validated_url(value)
+    except (TypeError, ValueError, GroundingFailure):
+        return None
+    # A literal fragment delimiter is rejected even when its value is empty.
+    if scheme != "https" or "#" in value or original.fragment:
+        return None
+    parsed = urlsplit(canonical)
+    video_id = None
+    if host in _YOUTUBE_WATCH_HOSTS and parsed.path == "/watch":
+        values = [
+            item
+            for key, item in parse_qsl(
+                parsed.query, keep_blank_values=True
+            )
+            if key == "v"
+        ]
+        if len(values) != 1:
+            return None
+        video_id = values[0]
+    elif host in _YOUTUBE_WATCH_HOSTS:
+        match = re.fullmatch(
+            r"/shorts/([A-Za-z0-9_-]{11})/?", parsed.path
+        )
+        video_id = match.group(1) if match else None
+    elif host in _YOUTUBE_SHORT_HOSTS:
+        match = re.fullmatch(
+            r"/([A-Za-z0-9_-]{11})/?", parsed.path
+        )
+        video_id = match.group(1) if match else None
+    if (
+        video_id is None
+        or _YOUTUBE_VIDEO_ID_RE.fullmatch(video_id) is None
+    ):
+        return None
+    return video_id, "https://www.youtube.com/watch?v=" + video_id
+
+
 def canonical_source_url(value):
     """Canonicalize a source URL and strictly dispatch X status identities."""
+    if is_private_telegram_url(value):
+        return parse_telegram_message_url(value)[0]
+    youtube = parse_youtube_video_url(value)
+    if youtube is not None:
+        return youtube[1]
     canonical, _, host, _, _ = _validated_url(value)
+    if _is_youtube_host(host):
+        raise GroundingFailure("unsupported YouTube URL")
     if not _is_x_host(host):
         return canonical
     parsed = urlsplit(canonical)
@@ -1314,6 +1942,41 @@ def canonical_source_url(value):
 
 
 _canonical_source_url = canonical_source_url
+
+
+def is_private_telegram_url(value):
+    try:
+        parsed = urlsplit(value)
+        return (
+            (parsed.hostname or "").lower().rstrip(".")
+            in {"t.me", "www.t.me", "telegram.me", "www.telegram.me"}
+            and parsed.path.startswith("/c/")
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def parse_telegram_message_url(value):
+    """Accept exact HTTPS private-message links, optionally naming a forum topic."""
+    if not is_private_telegram_url(value):
+        raise TelegramMessageUnavailable("unsupported Telegram message link")
+    try:
+        canonical, scheme, _, _, _ = _validated_url(value)
+        parsed = urlsplit(canonical)
+        if scheme != "https" or "?" in value or "#" in value:
+            raise ValueError("unsupported link parameters")
+        match = re.fullmatch(r"/c/([1-9][0-9]{0,12})/(?:([1-9][0-9]{0,9})/)?([1-9][0-9]{0,9})/?", parsed.path)
+        if match is None:
+            raise ValueError("unsupported link path")
+        chat_id = -(1_000_000_000_000 + int(match.group(1)))
+        topic_id = int(match.group(2) or 0)
+        message_id = int(match.group(3))
+        if max(topic_id, message_id) > (1 << 31) - 1:
+            raise ValueError("message id out of range")
+        canonical = "https://t.me" + parsed.path.rstrip("/")
+        return canonical, chat_id, topic_id, message_id
+    except (TypeError, ValueError):
+        raise TelegramMessageUnavailable("unsupported Telegram message link") from None
 
 
 def _host_header(host, scheme, port):
@@ -1420,6 +2083,15 @@ def _validated_content_length(response, max_bytes):
     return declared
 
 
+@dataclass(frozen=True)
+class HttpResource:
+    """Bytes obtained through the same pinned, bounded transport as evidence."""
+
+    canonical_url: str
+    body: bytes
+    content_type: str
+
+
 class SafeHttpFetcher:
     """Fetch text through an injected, DNS-pinned, bounded HTTP transport."""
 
@@ -1430,13 +2102,95 @@ class SafeHttpFetcher:
         resolver=socket.getaddrinfo,
         connection_factory=_default_connection_factory,
         response_byte_consumer=None,
+        renderer=None,
+        resource_request_consumer=None,
     ):
         self.limits = limits or GroundingLimits()
         self.resolver = resolver
         self.connection_factory = connection_factory
         self.response_byte_consumer = response_byte_consumer
+        self.renderer = renderer
+        self.resource_request_consumer = resource_request_consumer
 
     def fetch(self, url, *, max_response_bytes=None):
+        deadline = min(
+            time.monotonic() + self.limits.fetch_timeout,
+            getattr(self, "collection_deadline", float("inf")),
+        )
+        budget = min(self.limits.max_source_bytes, max_response_bytes or self.limits.max_source_bytes)
+        consumed = 0
+        previous_consumer = self.response_byte_consumer
+        consumption_lock = threading.Lock()
+
+        def consume(amount):
+            nonlocal consumed
+            # Keep this capture's debit independent of a later source even
+            # when an aborted transport finishes draining asynchronously.
+            with consumption_lock:
+                consumed += amount
+                if previous_consumer is not None:
+                    previous_consumer(amount)
+
+        self.response_byte_consumer = consume
+        try:
+            resource = self.fetch_resource(
+                url, max_response_bytes=budget if max_response_bytes is None else max_response_bytes,
+                deadline=deadline,
+            )
+            decoded = _decode_body(resource.body, resource.content_type)
+            projected = compact_machine_source_text(resource.canonical_url, decoded)
+            text = projected if projected != decoded else _extract_visible_text(resource.body, resource.content_type)
+            reader = "http"
+            truncated = len(text) >= 8_000
+            mime = resource.content_type.split(";", 1)[0].strip().lower()
+            needs_render = not text
+            if mime in {"text/html", "application/xhtml+xml"}:
+                has_content_root = re.search(r"<(?:article|main)(?:\s|>)", decoded, re.I) is not None
+                if has_content_root:
+                    content = _extract_visible_text(resource.body, resource.content_type, content_only=True)
+                    # Navigation does not prove the requested article loaded.
+                    # Keep article text ahead of header/footer boilerplate.
+                    if content:
+                        text = content
+                    needs_render = not content or (len(content) < 160 and "<script" in decoded.lower())
+                else:
+                    text = _extract_visible_text(resource.body, resource.content_type, exclude_boilerplate=True)
+                    needs_render = not text or (len(text) < 160 and "<script" in decoded.lower())
+            if (self.renderer is not None and mime in {"text/html", "application/xhtml+xml"}
+                    and needs_render):
+                def fetch_resource(resource_url, *, accepted_content_types):
+                    if self.resource_request_consumer is not None:
+                        self.resource_request_consumer()
+                    with consumption_lock:
+                        remaining = budget - consumed
+                    if remaining <= 0:
+                        raise GroundingFailure("source byte budget exceeded")
+                    return self.fetch_resource(
+                        resource_url, max_response_bytes=remaining,
+                        accepted_content_types=accepted_content_types, deadline=deadline,
+                    )
+
+                rendered = self.renderer.render(
+                    resource, fetch_resource=fetch_resource, deadline=deadline,
+                    max_response_bytes=budget,
+                )
+                text, reader, truncated = rendered.text, "browser", rendered.truncated
+            elif reader == "http":
+                truncated = len(text.encode("utf-8")) >= 8_000
+            if not text:
+                raise GroundingFailure("response contains no visible text")
+            _remaining_fetch_time(deadline)
+            return FetchedSource(
+                canonical_url=resource.canonical_url,
+                source_ref="web:" + hashlib.sha256(resource.canonical_url.encode()).hexdigest()[:20],
+                text=text, response_bytes=consumed, reader=reader, truncated=truncated,
+            )
+        finally:
+            self.response_byte_consumer = previous_consumer
+
+    def fetch_resource(self, url, *, max_response_bytes=None,
+                       accepted_content_types=None, deadline=None):
+        """Fetch public bytes without granting browser requests any extra authority."""
         response_limit = self.limits.max_response_bytes
         if max_response_bytes is not None:
             if type(max_response_bytes) is not int or max_response_bytes <= 0:
@@ -1444,12 +2198,19 @@ class SafeHttpFetcher:
             response_limit = min(response_limit, max_response_bytes)
         current = url
         redirect_from_scheme = None
-        deadline = time.monotonic() + self.limits.fetch_timeout
+        deadline = min(time.monotonic() + self.limits.fetch_timeout,
+                       float("inf") if deadline is None else deadline)
         collection_deadline = getattr(self, "collection_deadline", None)
         if collection_deadline is not None:
             deadline = min(deadline, float(collection_deadline))
         for redirect_count in range(self.limits.max_redirects + 1):
             canonical, scheme, host, port, target = _validated_url(current)
+            if is_private_telegram_url(canonical):
+                raise TelegramMessageUnavailable("Telegram message needs authenticated lookup")
+            if _is_youtube_host(host):
+                raise GroundingFailure(
+                    "YouTube URLs require the canonical caption fetcher"
+                )
             if _is_x_host(host):
                 raise GroundingFailure(
                     "X/Twitter URLs require the canonical X fetcher"
@@ -1495,7 +2256,7 @@ class SafeHttpFetcher:
                     "Accept": (
                         "text/html, application/xhtml+xml, application/json, "
                         "application/rss+xml, application/atom+xml, "
-                        "application/xml, text/xml, text/plain;q=0.9"
+                        "application/xml, text/xml, text/markdown;q=0.9, text/plain;q=0.9"
                     ),
                     "Accept-Encoding": "identity",
                     "Connection": "close",
@@ -1525,7 +2286,7 @@ class SafeHttpFetcher:
                     raise GroundingFailure("encoded response rejected")
                 content_type = str(response.getheader("content-type", ""))
                 mime = content_type.split(";", 1)[0].strip().lower()
-                if mime not in _TEXT_CONTENT_TYPES:
+                if mime not in (_TEXT_CONTENT_TYPES if accepted_content_types is None else accepted_content_types):
                     raise GroundingFailure("unsafe content type")
                 _validated_content_length(
                     response, response_limit
@@ -1537,24 +2298,7 @@ class SafeHttpFetcher:
                     response_limit,
                     self.response_byte_consumer,
                 )
-                decoded = _decode_body(body, content_type)
-                projected = compact_machine_source_text(canonical, decoded)
-                text = (
-                    projected
-                    if projected != decoded
-                    else _extract_visible_text(body, content_type)
-                )
-                if not text:
-                    raise GroundingFailure("response contains no visible text")
-                source_hash = hashlib.sha256(
-                    canonical.encode("utf-8")
-                ).hexdigest()[:20]
-                return FetchedSource(
-                    canonical_url=canonical,
-                    source_ref=f"web:{source_hash}",
-                    text=text,
-                    response_bytes=len(body),
-                )
+                return HttpResource(canonical, body, content_type)
             except GroundingFailure:
                 raise
             except (OSError, ssl.SSLError, http.client.HTTPException) as exc:
@@ -1627,8 +2371,9 @@ def _close_twitter_pipe(stream):
             pass
 
 
-def _defer_twitter_reap(process, readers, streams):
-    """Reap and close one child in a daemon while retaining its bounded slot."""
+def _defer_source_process_reap(
+        process, readers, streams, process_slots):
+    """Reap one killed source child before returning its owned slot."""
     def reap():
         reaped = False
         try:
@@ -1653,7 +2398,7 @@ def _defer_twitter_reap(process, readers, streams):
                         pass
             finally:
                 if reaped:
-                    _TWITTER_PROCESS_SLOTS.release()
+                    process_slots.release()
 
     worker = threading.Thread(target=reap, daemon=True)
     try:
@@ -1662,6 +2407,534 @@ def _defer_twitter_reap(process, readers, streams):
         # Keep the already-acquired slot quarantined if no reaper can start.
         return False
     return True
+
+
+def _defer_twitter_reap(process, readers, streams):
+    """Retain the Twitter-specific cleanup interface for existing callers."""
+    return _defer_source_process_reap(
+        process, readers, streams, _TWITTER_PROCESS_SLOTS
+    )
+
+
+def _run_bounded_source_process(
+        argv, deadline, max_stdout_bytes, *, process_slots,
+        source_label, response_byte_consumer=None, env=None):
+    """Run one trusted source helper with bounded pipes and confirmed reaping."""
+    if type(max_stdout_bytes) is not int or max_stdout_bytes <= 0:
+        raise GroundingFailure("invalid source output byte limit")
+    if (
+        not isinstance(source_label, str)
+        or not source_label
+        or len(source_label) > 64
+        or any(not char.isprintable() for char in source_label)
+    ):
+        raise GroundingFailure("invalid source process label")
+
+    def remaining_time():
+        return max(0.0, float(deadline) - time.monotonic())
+
+    if remaining_time() <= 0:
+        raise GroundingFailure(f"{source_label} timed out")
+    acquired = process_slots.acquire(timeout=remaining_time())
+    if not acquired:
+        raise GroundingFailure(f"{source_label} process slots saturated")
+    try:
+        process = subprocess.Popen(
+            argv,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            **({"env": env, "stdin": subprocess.DEVNULL} if env is not None else {}),
+        )
+    except Exception as exc:
+        process_slots.release()
+        raise GroundingFailure(f"{source_label} failed to start") from exc
+
+    stdout_chunks = []
+    stderr_chunks = []
+    stdout_size = 0
+    stderr_size = 0
+    stdout_overflow = threading.Event()
+    reader_errors = []
+    byte_errors = []
+
+    def stop_process():
+        try:
+            process.terminate()
+        except OSError:
+            pass
+
+    def drain(stream, chunks, limit, *, stdout):
+        nonlocal stdout_size, stderr_size
+        try:
+            while True:
+                if remaining_time() <= 0:
+                    return
+                chunk = stream.read(64 * 1024)
+                if not chunk:
+                    return
+                if not isinstance(chunk, bytes):
+                    reader_errors.append("malformed subprocess output")
+                    stop_process()
+                    return
+                if stdout and response_byte_consumer is not None:
+                    try:
+                        response_byte_consumer(len(chunk))
+                    except GroundingFailure as exc:
+                        byte_errors.append(exc)
+                        stop_process()
+                        return
+                    except Exception:
+                        byte_errors.append(GroundingFailure(
+                            f"{source_label} response byte accounting failed"
+                        ))
+                        stop_process()
+                        return
+                size = stdout_size if stdout else stderr_size
+                remaining = max(0, limit - size)
+                if remaining:
+                    chunks.append(chunk[:remaining])
+                size += len(chunk)
+                if stdout:
+                    stdout_size = size
+                    if size > limit:
+                        stdout_overflow.set()
+                        stop_process()
+                else:
+                    stderr_size = size
+        except Exception:
+            reader_errors.append("subprocess output drain failed")
+            stop_process()
+
+    readers = (
+        threading.Thread(
+            target=drain,
+            args=(process.stdout, stdout_chunks, max_stdout_bytes),
+            kwargs={"stdout": True},
+            daemon=True,
+        ),
+        threading.Thread(
+            target=drain,
+            args=(process.stderr, stderr_chunks, _MAX_TWITTER_STDERR_BYTES),
+            kwargs={"stdout": False},
+            daemon=True,
+        ),
+    )
+    returncode = None
+    timed_out = False
+    slot_deferred = False
+    try:
+        for reader in readers:
+            reader.start()
+        remaining = remaining_time()
+        if remaining <= 0:
+            timed_out = True
+        else:
+            try:
+                returncode = process.wait(timeout=remaining)
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        if timed_out:
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                returncode = process.wait(timeout=0)
+            except subprocess.TimeoutExpired:
+                slot_deferred = True
+                _defer_source_process_reap(
+                    process,
+                    readers,
+                    (process.stdout, process.stderr),
+                    process_slots,
+                )
+        for reader in readers:
+            remaining = remaining_time()
+            if remaining <= 0:
+                break
+            reader.join(timeout=remaining)
+        if timed_out or returncode is None:
+            raise GroundingFailure(f"{source_label} timed out")
+        if byte_errors:
+            raise byte_errors[0]
+        if any(reader.is_alive() for reader in readers) or reader_errors:
+            raise GroundingFailure(f"{source_label} output is malformed")
+        if stdout_overflow.is_set():
+            raise GroundingFailure(f"{source_label} output too large")
+        if returncode:
+            raise GroundingFailure(f"{source_label} failed")
+        try:
+            return b"".join(stdout_chunks).decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise GroundingFailure(
+                f"{source_label} output is malformed"
+            ) from exc
+    finally:
+        if not slot_deferred:
+            if returncode is None:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                try:
+                    returncode = process.wait(timeout=0)
+                except subprocess.TimeoutExpired:
+                    slot_deferred = True
+                    _defer_source_process_reap(
+                        process,
+                        readers,
+                        (process.stdout, process.stderr),
+                        process_slots,
+                    )
+            if not slot_deferred and any(
+                    reader.is_alive() for reader in readers
+            ):
+                slot_deferred = True
+                _defer_source_process_reap(
+                    process,
+                    readers,
+                    (process.stdout, process.stderr),
+                    process_slots,
+                )
+            if not slot_deferred:
+                _close_twitter_pipe(process.stdout)
+                _close_twitter_pipe(process.stderr)
+                process_slots.release()
+
+
+def _parse_youtube_caption_receipt(payload, video_id, *, reservation):
+    """Validate the exact tagged-union receipt emitted by the caption helper."""
+    if (
+        not isinstance(payload, dict)
+        or not isinstance(video_id, str)
+        or _YOUTUBE_VIDEO_ID_RE.fullmatch(video_id) is None
+        or type(reservation) is not int
+        or not 1 <= reservation <= 2_097_152
+    ):
+        raise GroundingFailure("invalid YouTube caption receipt")
+    keys = frozenset(payload)
+    if keys not in {_YOUTUBE_SUCCESS_KEYS, _YOUTUBE_FAILURE_KEYS}:
+        raise GroundingFailure("invalid YouTube caption receipt")
+    response_bytes = payload.get("response_bytes")
+    if (
+        type(response_bytes) is not int
+        or not 0 <= response_bytes <= reservation
+    ):
+        raise GroundingFailure("invalid YouTube caption receipt")
+    if keys == _YOUTUBE_FAILURE_KEYS:
+        if (
+            payload.get("ok") is not False
+            or payload.get("failure") != "captions_unavailable"
+        ):
+            raise GroundingFailure("invalid YouTube caption receipt")
+        return payload
+
+    if payload.get("ok") is not True or payload.get("video_id") != video_id:
+        raise GroundingFailure("invalid YouTube caption receipt")
+    language = payload.get("language")
+    language_code = payload.get("language_code")
+    if (
+        not isinstance(language, str)
+        or not language
+        or language != language.strip()
+        or len(language.encode("utf-8")) > 128
+        or any(not char.isprintable() for char in language)
+        or not isinstance(language_code, str)
+        or _YOUTUBE_LANGUAGE_CODE_RE.fullmatch(language_code) is None
+    ):
+        raise GroundingFailure("invalid YouTube caption receipt")
+    if (
+        type(payload.get("is_generated")) is not bool
+        or type(payload.get("truncated")) is not bool
+    ):
+        raise GroundingFailure("invalid YouTube caption receipt")
+    covered = payload.get("covered_seconds")
+    total = payload.get("total_seconds")
+    if (
+        type(covered) not in {int, float}
+        or type(total) not in {int, float}
+        or not math.isfinite(covered)
+        or not math.isfinite(total)
+        or covered < 0
+        or total < 0
+        or covered > total
+        or (payload.get("truncated") is False and covered != total)
+    ):
+        raise GroundingFailure("invalid YouTube caption receipt")
+    caption_text = payload.get("caption_text")
+    if (
+        not isinstance(caption_text, str)
+        or not caption_text
+        or caption_text != caption_text.strip()
+        or len(caption_text.encode("utf-8")) > 47_000
+        or any(
+            (ord(char) < 32 and char != "\n") or ord(char) == 127
+            for char in caption_text
+        )
+    ):
+        raise GroundingFailure("invalid YouTube caption receipt")
+    return payload
+
+
+def _youtube_json_object(raw):
+    """Parse one JSON object while rejecting duplicate member names."""
+    if not isinstance(raw, str) or len(raw.encode("utf-8")) > 65_536:
+        raise GroundingFailure("invalid YouTube caption receipt")
+
+    def strict_object(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise GroundingFailure("invalid YouTube caption receipt")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(raw, object_pairs_hook=strict_object)
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise GroundingFailure("invalid YouTube caption receipt") from exc
+    if not isinstance(payload, dict):
+        raise GroundingFailure("invalid YouTube caption receipt")
+    return payload
+
+
+class TelegramMessageFetcher:
+    """Read one exact message through the installed, trusted Telegram helper.
+
+    The caller supplies the ingress chat/topic, never a model-selected scope.
+    The helper's exact ID range and topic filter constrain the authenticated
+    request; the response ID is checked again before any text is admitted.
+    """
+
+    def __init__(self, *, python, script, runner=None, timeout=15):
+        self.python = python
+        self.script = script
+        self.runner = runner
+        self.timeout = min(15.0, max(0.001, float(timeout)))
+        self.collection_deadline = None
+        self.response_byte_consumer = None
+
+    def fetch(self, url, *, scope, max_response_bytes=65_536):
+        canonical, chat_id, link_topic, message_id = parse_telegram_message_url(url)
+        if (
+            not isinstance(scope, tuple) or len(scope) != 2
+            or type(scope[0]) is not int or type(scope[1]) is not int
+            or scope[0] != chat_id or not 0 <= scope[1] < (1 << 31)
+            or (link_topic and link_topic != scope[1])
+        ):
+            raise TelegramMessageUnavailable("Telegram message outside current chat or topic")
+        if type(max_response_bytes) is not int or max_response_bytes <= 0:
+            raise TelegramMessageUnavailable("Telegram message byte budget exhausted")
+        output_limit = min(65_536, max_response_bytes)
+        deadline = time.monotonic() + self.timeout
+        if self.collection_deadline is not None:
+            deadline = min(deadline, self.collection_deadline)
+        argv = [self.python, self.script, "messages", str(chat_id),
+                "--min-id", str(message_id - 1), "--max-id", str(message_id + 1),
+                "--limit", "1"]
+        if scope[1]:
+            argv.extend(["--topic", str(scope[1])])
+        try:
+            remaining = _remaining_fetch_time(deadline)
+            if self.runner is None:
+                raw = _run_bounded_source_process(
+                    argv, deadline, output_limit,
+                    process_slots=_TELEGRAM_PROCESS_SLOTS,
+                    source_label="telegram message",
+                    response_byte_consumer=self.response_byte_consumer,
+                    env={"HOME": str(Path.home()), "PATH": os.defpath,
+                         "LANG": "C.UTF-8", "PYTHONUTF8": "1"},
+                )
+            else:
+                raw = self.runner(argv, remaining)
+                if self.response_byte_consumer is not None:
+                    self.response_byte_consumer(len(raw.encode("utf-8")))
+            if not isinstance(raw, str) or len(raw.encode("utf-8")) > output_limit:
+                raise ValueError("invalid helper output")
+            rows = json.loads(raw)
+            if not isinstance(rows, list) or len(rows) != 1 or not isinstance(rows[0], dict):
+                raise ValueError("exact message missing")
+            row = rows[0]
+            text = row.get("text")
+            timestamp = canonical_event_time(row.get("date"))
+            if (
+                type(row.get("id")) is not int or row["id"] != message_id
+                or not isinstance(text, str) or not text.strip()
+                or len(text.encode("utf-8")) > 8_000
+                or type(row.get("sender_id")) is not int
+                or not row["sender_id"] or timestamp is None
+            ):
+                raise ValueError("invalid message receipt")
+            _remaining_fetch_time(deadline)
+        except (ValueError, TypeError, OSError, AttributeError):
+            # Helper stderr and exception text can contain session details.
+            raise TelegramMessageUnavailable("Telegram message lookup unavailable") from None
+        return FetchedSource(
+            canonical_url=canonical,
+            source_ref="web:" + hashlib.sha256(canonical.encode()).hexdigest()[:20],
+            text=text.strip(), author=str(row["sender_id"]), timestamp=timestamp,
+            response_bytes=len(raw.encode("utf-8")),
+        )
+
+
+def resolve_telegram_fetcher(*, timeout=15):
+    """Use operator-configured or installed explorer paths, never paths from message text.
+
+    Order mirrors ln-agent.py: TELEGRAM_CLIENT_SCRIPT/TELEGRAM_CLIENT_PYTHON,
+    then the repo-bundled skill with this repo's .venv, then user-level skill
+    installs with their sibling .venv.
+    """
+    base = Path(__file__).resolve().parent
+    repo_python = Path(os.environ.get("TELEGRAM_CLIENT_PYTHON", str(base / ".venv/bin/python3")))
+    pairs = []
+    override = os.environ.get("TELEGRAM_CLIENT_SCRIPT", "").strip()
+    if override:
+        pairs.append((Path(override).expanduser(), repo_python.expanduser()))
+    pairs.append((base / "skills/telegram-explorer/scripts/telegram_client.py",
+                  repo_python.expanduser()))
+    for script in (
+        Path.home() / ".agents/skills/telegram-explorer/scripts/telegram_client.py",
+        Path.home() / ".codex/skills/telegram-explorer/scripts/telegram_client.py",
+    ):
+        pairs.append((script, script.parent / ".venv/bin/python3"))
+    for script, python in pairs:
+        if script.is_file() and python.is_file():
+            return TelegramMessageFetcher(python=str(python), script=str(script), timeout=timeout)
+    raise TelegramMessageUnavailable("Telegram message helper unavailable")
+
+
+class YouTubeTranscriptFetcher:
+    """Run the trusted caption helper and return exact-video evidence."""
+
+    def __init__(
+            self, *, python, script, runner=None, timeout=15,
+            response_byte_consumer=None):
+        if (
+            not isinstance(python, str)
+            or not python
+            or not isinstance(script, str)
+            or not script
+            or type(timeout) not in {int, float}
+            or not math.isfinite(timeout)
+            or not 0 < timeout <= 30
+        ):
+            raise GroundingFailure("invalid YouTube caption fetcher")
+        self.python = python
+        self.script = script
+        self.runner = runner
+        self.timeout = float(timeout)
+        self.collection_deadline = None
+        self.response_byte_consumer = response_byte_consumer
+
+    def _consume(self, amount):
+        """Charge trusted network bytes to the caller's shared turn ledger."""
+        if self.response_byte_consumer is None:
+            return
+        self.response_byte_consumer(amount)
+
+    def _fail_unaccounted(self, reservation):
+        """Spend a full reservation after an untrustworthy child outcome."""
+        try:
+            self._consume(reservation)
+        except Exception:
+            pass
+        raise YouTubeTranscriptUnavailable(
+            "public YouTube captions are unavailable"
+        ) from None
+
+    def fetch(self, url, *, max_response_bytes=None):
+        """Fetch one supported video's public captions under fixed bounds."""
+        parsed = parse_youtube_video_url(url)
+        if parsed is None:
+            raise YouTubeTranscriptUnavailable(
+                "public YouTube captions are unavailable"
+            )
+        video_id, canonical = parsed
+        reservation = (
+            2_097_152
+            if max_response_bytes is None
+            else max_response_bytes
+        )
+        if (
+            type(reservation) is not int
+            or not 1 <= reservation <= 2_097_152
+        ):
+            raise YouTubeTranscriptUnavailable(
+                "public YouTube captions are unavailable"
+            )
+        now = time.monotonic()
+        deadline = now + self.timeout
+        if self.collection_deadline is not None:
+            try:
+                deadline = min(deadline, float(self.collection_deadline))
+            except (TypeError, ValueError, OverflowError):
+                raise YouTubeTranscriptUnavailable(
+                    "public YouTube captions are unavailable"
+                ) from None
+        remaining = deadline - time.monotonic()
+        if not math.isfinite(remaining) or remaining <= 0:
+            raise YouTubeTranscriptUnavailable(
+                "public YouTube captions are unavailable"
+            )
+        argv = [
+            self.python,
+            self.script,
+            "--video-id",
+            video_id,
+            "--timeout-seconds",
+            f"{remaining:.6f}",
+            "--max-response-bytes",
+            str(reservation),
+            "--max-caption-bytes",
+            "47000",
+        ]
+        try:
+            raw = (
+                self.runner(argv, deadline, 65_536)
+                if self.runner is not None
+                else _run_bounded_source_process(
+                    argv,
+                    deadline,
+                    65_536,
+                    process_slots=_YOUTUBE_PROCESS_SLOTS,
+                    source_label="youtube caption helper",
+                )
+            )
+            payload = _parse_youtube_caption_receipt(
+                _youtube_json_object(raw),
+                video_id,
+                reservation=reservation,
+            )
+        except Exception:
+            self._fail_unaccounted(reservation)
+
+        try:
+            self._consume(payload["response_bytes"])
+        except Exception:
+            raise YouTubeTranscriptUnavailable(
+                "public YouTube captions are unavailable"
+            ) from None
+        if payload["ok"] is not True:
+            raise YouTubeTranscriptUnavailable(
+                "public YouTube captions are unavailable"
+            )
+        header = (
+            "[YouTube public captions: "
+            f"language={payload['language_code']}; "
+            f"generated={'true' if payload['is_generated'] else 'false'}; "
+            f"truncated={'true' if payload['truncated'] else 'false'}; "
+            f"covered_seconds={payload['covered_seconds']:.3f}; "
+            f"total_seconds={payload['total_seconds']:.3f}]"
+        )
+        return FetchedSource(
+            canonical_url=canonical,
+            source_ref=f"youtube:{video_id}",
+            text=truncate_utf8(
+                header + "\n" + payload["caption_text"], 48_000
+            ),
+            response_bytes=payload["response_bytes"],
+            evidence_byte_limit=48_000,
+        )
 
 
 class TwitterFocalFetcher:
@@ -1681,171 +2954,14 @@ class TwitterFocalFetcher:
             argv, deadline, max_stdout_bytes,
             response_byte_consumer=None):
         """Drain a trusted explorer subprocess within one absolute deadline."""
-        if type(max_stdout_bytes) is not int or max_stdout_bytes <= 0:
-            raise GroundingFailure("invalid twitter output byte limit")
-
-        def remaining_time():
-            return max(0.0, float(deadline) - time.monotonic())
-
-        if remaining_time() <= 0:
-            raise GroundingFailure("twitter explorer timed out")
-        acquired = _TWITTER_PROCESS_SLOTS.acquire(timeout=remaining_time())
-        if not acquired:
-            raise GroundingFailure("twitter explorer process slots saturated")
-        try:
-            process = subprocess.Popen(
-                argv,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-            )
-        except Exception as exc:
-            _TWITTER_PROCESS_SLOTS.release()
-            raise GroundingFailure("twitter explorer failed to start") from exc
-
-        stdout_chunks = []
-        stderr_chunks = []
-        stdout_size = 0
-        stderr_size = 0
-        stdout_overflow = threading.Event()
-        reader_errors = []
-        byte_errors = []
-
-        def stop_process():
-            try:
-                process.terminate()
-            except OSError:
-                pass
-
-        def drain(stream, chunks, limit, *, stdout):
-            nonlocal stdout_size, stderr_size
-            try:
-                while True:
-                    if remaining_time() <= 0:
-                        return
-                    chunk = stream.read(64 * 1024)
-                    if not chunk:
-                        return
-                    if not isinstance(chunk, bytes):
-                        reader_errors.append("malformed subprocess output")
-                        stop_process()
-                        return
-                    if stdout and response_byte_consumer is not None:
-                        try:
-                            response_byte_consumer(len(chunk))
-                        except GroundingFailure as exc:
-                            byte_errors.append(exc)
-                            stop_process()
-                            return
-                        except Exception:
-                            byte_errors.append(GroundingFailure(
-                                "twitter response byte accounting failed"
-                            ))
-                            stop_process()
-                            return
-                    size = stdout_size if stdout else stderr_size
-                    remaining = max(0, limit - size)
-                    if remaining:
-                        chunks.append(chunk[:remaining])
-                    size += len(chunk)
-                    if stdout:
-                        stdout_size = size
-                        if size > limit:
-                            stdout_overflow.set()
-                            stop_process()
-                    else:
-                        stderr_size = size
-            except Exception:
-                reader_errors.append("subprocess output drain failed")
-                stop_process()
-
-        readers = (
-            threading.Thread(
-                target=drain,
-                args=(process.stdout, stdout_chunks, max_stdout_bytes),
-                kwargs={"stdout": True},
-                daemon=True,
-            ),
-            threading.Thread(
-                target=drain,
-                args=(process.stderr, stderr_chunks, _MAX_TWITTER_STDERR_BYTES),
-                kwargs={"stdout": False},
-                daemon=True,
-            ),
+        return _run_bounded_source_process(
+            argv,
+            deadline,
+            max_stdout_bytes,
+            process_slots=_TWITTER_PROCESS_SLOTS,
+            source_label="twitter explorer",
+            response_byte_consumer=response_byte_consumer,
         )
-        returncode = None
-        timed_out = False
-        slot_deferred = False
-        try:
-            for reader in readers:
-                reader.start()
-            remaining = remaining_time()
-            if remaining <= 0:
-                timed_out = True
-            else:
-                try:
-                    returncode = process.wait(timeout=remaining)
-                except subprocess.TimeoutExpired:
-                    timed_out = True
-            if timed_out:
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-                try:
-                    returncode = process.wait(timeout=0)
-                except subprocess.TimeoutExpired:
-                    slot_deferred = True
-                    _defer_twitter_reap(
-                        process, readers, (process.stdout, process.stderr)
-                    )
-            for reader in readers:
-                remaining = remaining_time()
-                if remaining <= 0:
-                    break
-                reader.join(timeout=remaining)
-            if timed_out or returncode is None:
-                raise GroundingFailure("twitter explorer timed out")
-            if byte_errors:
-                raise byte_errors[0]
-            if any(reader.is_alive() for reader in readers) or reader_errors:
-                raise GroundingFailure("twitter explorer output is malformed")
-            if stdout_overflow.is_set():
-                raise GroundingFailure("twitter explorer output too large")
-            if returncode:
-                raise GroundingFailure("twitter explorer failed")
-            try:
-                return b"".join(stdout_chunks).decode("utf-8")
-            except UnicodeDecodeError as exc:
-                raise GroundingFailure(
-                    "twitter explorer output is malformed"
-                ) from exc
-        finally:
-            if not slot_deferred:
-                if returncode is None:
-                    try:
-                        process.kill()
-                    except OSError:
-                        pass
-                    try:
-                        returncode = process.wait(timeout=0)
-                    except subprocess.TimeoutExpired:
-                        slot_deferred = True
-                        _defer_twitter_reap(
-                            process,
-                            readers,
-                            (process.stdout, process.stderr),
-                        )
-                if not slot_deferred and any(
-                        reader.is_alive() for reader in readers
-                ):
-                    slot_deferred = True
-                    _defer_twitter_reap(
-                        process, readers, (process.stdout, process.stderr)
-                    )
-                if not slot_deferred:
-                    _close_twitter_pipe(process.stdout)
-                    _close_twitter_pipe(process.stderr)
-                    _TWITTER_PROCESS_SLOTS.release()
 
     def fetch(self, url, *, max_response_bytes=None):
         output_limit = _MAX_TWITTER_STDOUT_BYTES
@@ -2062,8 +3178,10 @@ def parse_verification(raw: str) -> VerificationVerdict:
         raise GroundingFailure("invalid verifier reason")
     if passed and unsupported:
         raise GroundingFailure("passing verdict contains unsupported claims")
-    if not passed and not unsupported:
-        raise GroundingFailure("failing verdict must identify a claim")
+    # A true but non-responsive answer can fail without an unsupported fact.
+    # This remains a veto, never publication approval; repair is reverified.
+    if not passed and not unsupported and not reason.strip():
+        raise GroundingFailure("failing verdict must identify an objection")
     return VerificationVerdict(
         passed,
         unsupported,
@@ -2104,8 +3222,6 @@ def naturalize_public_grounding_protocol(text: str) -> str:
         (r"\bsupplied\s+evidence\b", "sources I checked"),
         (r"\bthe\s+supplied\b", "the checked"),
         (r"\bthe\s+verifier\b", "my checks"),
-        (r"\ban\s+unsupported\s+claim\b", "a statement I could not verify"),
-        (r"\bunsupported\s+claim\b", "statement I could not verify"),
         (r"\bdoes\s+not\s+establish\b", "did not let me verify"),
     ):
         natural = substitute(natural, pattern, replacement)
@@ -2206,14 +3322,20 @@ def _gecko_market_metric_count(attributes: Mapping) -> int:
 
 
 def compact_machine_source_text(url: str, text: str) -> str:
-    """Project exact Gecko pool lists into bounded, valid evidence JSON.
+    """Project supported archive and pool lists into bounded evidence JSON.
 
     The transport byte ledger still charges the complete response. Projection
-    only removes unrelated pool rows and fields before the evidence-item cap can
-    cut JSON mid-object; contract binding is rechecked by the trusted adapter.
+    removes bulky fields before the evidence-item cap can cut JSON mid-object.
+    Archive periods are checked here; token binding is rechecked by its adapter.
     """
     if not isinstance(text, str):
         return text
+    try:
+        archive = project_archive(url, text)
+    except (TypeError, ValueError, KeyError) as exc:
+        raise GroundingFailure("invalid LN archive evidence") from exc
+    if archive is not None:
+        return archive
     try:
         parsed = urlsplit(url)
     except (TypeError, ValueError):
